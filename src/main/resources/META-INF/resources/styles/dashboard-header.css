@@ -1,0 +1,80 @@
+/* Dashboard header bar styles to match dashboard-mockup.html */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #fff;
+  border-bottom: 1px solid #E6E8F0;
+  box-shadow: 0 1px 4px 0 rgba(16,24,40,.03);
+  min-height: 72px;
+  font-size: 1.18rem;
+}
+.appbar .brand {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font-size: 1.35rem;
+  font-weight: 800;
+}
+.appbar .logo {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg,#22c55e,#60f0a5);
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 900;
+  font-size: 1.45rem;
+}
+.appbar .tabs {
+  display: flex;
+  gap: 28px;
+  align-items: center;
+  font-size: 1.15rem;
+}
+.appbar .tab {
+  color: #222;
+  text-decoration: none;
+  font-weight: 600;
+  padding: 8px 22px;
+  border-radius: 8px;
+  transition: background .15s;
+  font-size: 1.08em;
+}
+.appbar .tab.active {
+  background: #e6fff2;
+  color: #16a34a;
+  font-weight: 800;
+}
+.appbar .tab:hover {
+  background: #f0fdf4;
+}
+.appbar .hud {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  font-size: 1.08em;
+  margin-left: auto;
+  justify-content: flex-end;
+}
+.appbar .badge {
+  background: #f3f4f6;
+  color: #222;
+  border-radius: 8px;
+  padding: 6px 18px;
+  font-size: 1.08em;
+  font-weight: 600;
+  border: 1px solid #e6e8f0;
+  display: inline-block;
+}
+.appbar .badge.ok {
+  background: #e6fff2;
+  color: #16a34a;
+  border-color: #bbf7d0;
+}
+.appbar .badge.warn {
+  background: #fffbe6;
+  color: #b45309;
+  border-color: #fde68a;
+}

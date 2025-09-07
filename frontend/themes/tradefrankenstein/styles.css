@@ -1,0 +1,144 @@
+/* TradeFrankenstein theme tweaks */
+:root {
+  --bg: #F7F9FB;
+  --surface: #FFFFFF;
+  --text: #0B1221;
+  --muted: #6B7280;
+  --brand: #20C06A;
+  --brand-600: #18A557;
+  --brand-200: #CFF6E1;
+  --success: #16A34A;
+  --danger: #EF4444;
+  --warning: #F59E0B;
+  --info: #06B6D4;
+  --radius-card: 12px;
+  --radius-input: 8px;
+  --shadow-card: 0 8px 24px rgba(16,24,40,.06);
+  --border: #E6E8F0;
+  --grid-gap: 24px;
+  --container: 1280px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+/* Card styles */
+.tf-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 0;
+}
+
+.tf-card .tf-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 16px 0 16px;
+}
+
+.tf-card .tf-card-content {
+  padding: 16px;
+}
+
+/* Grid styles */
+.tf-dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: var(--grid-gap);
+}
+@media (max-width: 1024px) {
+  .tf-dashboard-grid {
+    grid-template-columns: repeat(6, 1fr);
+  }
+}
+@media (max-width: 640px) {
+  .tf-dashboard-grid {
+    grid-template-columns: repeat(1, 1fr);
+  }
+}
+.tf-span-3 { grid-column: span 3; }
+.tf-span-4 { grid-column: span 4; }
+.tf-span-6 { grid-column: span 6; }
+.tf-span-8 { grid-column: span 8; }
+.tf-span-12 { grid-column: span 12; }
+
+/* Badge styles */
+.tf-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-weight: 600;
+  display: inline-block;
+}
+.tf-badge.ok {
+  color: var(--brand-600);
+  border-color: var(--brand-200);
+}
+.tf-badge.warn {
+  color: #b45309;
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+.tf-badge.err {
+  color: #b91c1c;
+  border-color: #fecaca;
+  background: #fff1f2;
+}
+
+/* Pill styles */
+.tf-pill {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-block;
+}
+.tf-pill.buy {
+  background: #eafff2;
+  color: #065f46;
+  border: 1px solid #bbf7d0;
+}
+.tf-pill.sell {
+  background: #fff1f2;
+  color: #7f1d1d;
+  border: 1px solid #fecaca;
+}
+
+/* Progress bar styles */
+.tf-progress {
+  height: 10px;
+  background: #eef2f7;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.tf-progress-inner {
+  display: block;
+  height: 100%;
+  background: var(--brand);
+  width: 40%;
+}
+
+/* Responsive container */
+.tf-container {
+  max-width: var(--container);
+  margin: 0 auto;
+  padding: 24px;
+}
+
+/* TradeFrankenstein theme tweaks */
+:root {
+  --tf-surface: rgba(20,24,28,0.72);
+}
+
+.badge[theme*="primary"] {
+  /* give LIVE badge a subtle glow */
+  box-shadow: 0 0 8px rgba(57,255,20,0.45);
+}

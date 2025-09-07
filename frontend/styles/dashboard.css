@@ -1,0 +1,145 @@
+/* ========= Design tokens ========= */
+:root{
+  /* Layout */
+  --container: 1280px;          /* max page width */
+  --grid-gap: 24px;             /* gap between grid cells */
+  --pad-x: 24px;                /* page horizontal padding */
+
+  /* Colors */
+  --bg: #F7F9FB;
+  --surface: #FFFFFF;
+  --text: #0B1221;
+  --muted: #6B7280;
+  --border: #E6E8F0;
+
+  /* Brand */
+  --brand: #20C06A;             /* confidence bar green */
+  --brand-600: #18A557;
+  --brand-200: #CFF6E1;
+
+  /* Card */
+  --radius-card: 12px;
+  --shadow-card: 0 8px 24px rgba(16,24,40,.06);
+}
+
+/* ========= Page scaffold ========= */
+.view-dashboard{
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ========= Sticky App Header ========= */
+.tf-header{
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+body, .view-dashboard { overflow: visible;};
+
+/* Full-bleed controls row under header (if present) */
+.controls-row{
+  position: sticky;
+  width: 100%;
+  padding: 16px var(--pad-x);
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+
+/* ========= Centered container ========= */
+.tf-container{
+  width: 100%;
+  max-width: var(--container);
+  margin: 0 auto;
+  padding: 24px var(--pad-x) 48px;
+  box-sizing: border-box;
+}
+
+/* ========= 12-column grid ========= */
+.tf-grid{
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0,1fr));
+  gap: var(--grid-gap);
+}
+.tf-cell{ min-width: 0; box-sizing: border-box; }
+
+/* Span helpers (match HTML’s span-N) */
+.span-12{ grid-column: span 12; }
+.span-8 { grid-column: span 8; }
+.span-6 { grid-column: span 6; }
+.span-4 { grid-column: span 4; }
+.span-3 { grid-column: span 3; }
+
+/* ========= Card base (optional utility) ========= */
+.card{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+.card .hd{ padding: 16px 16px 0; display:flex; align-items:center; justify-content:space-between; }
+.card .content{ padding: 16px; }
+
+/* ========= Regime/Decision helpers (match HTML) ========= */
+.tf-chip{
+  display:inline-flex; gap:8px; align-items:center;
+  padding:8px 12px; border-radius:999px;
+  border:1px solid var(--border); background:var(--surface);
+  font-weight:700; color:var(--text);
+}
+.tf-chip .dot{ width:10px; height:10px; border-radius:999px; background:#9CA3AF; }
+
+.tf-progress{
+  width:140px; height:10px; border-radius:999px;
+  border:1px solid var(--border); background:#EEF2F7; overflow:hidden;
+}
+.tf-progress > .fill{ display:block; height:100%; width:62%; background:var(--brand); } /* 62% as per HTML */
+
+.tf-badge{
+  display:inline-block; border:1px solid var(--border);
+  border-radius:999px; padding:6px 10px;
+  background:var(--surface); color:#6B7280;
+  font-weight:600; font-size:12px;
+}
+
+/* Optional ring helper (use with inline --pct if you prefer) */
+.tf-ring{
+  position:relative; width:84px; height:84px; border-radius:50%;
+  background:
+    radial-gradient(farthest-side, #fff 70%, transparent 72%) top/100% 100%,
+    conic-gradient(var(--brand) var(--pct,72)%, #e5e7eb 0);
+}
+.tf-ring .val{
+  position:absolute; inset:0; display:grid; place-items:center;
+  font-weight:800; color:var(--text);
+}
+
+/* ========= Breakpoints ========= */
+@media (max-width: 1024px){
+  .tf-grid{ grid-template-columns: repeat(6, minmax(0,1fr)); }
+}
+@media (max-width: 640px){
+  .tf-grid{ grid-template-columns: repeat(1, minmax(0,1fr)); }
+  .tf-container, .controls-row{ padding-left: 12px; padding-right: 12px; }
+}
+
+/* 1) Flexbox gap fallback (for very old Safari) */
+@supports not (gap: 12px) {
+  .controls-row { margin-right: -12px; }
+  .controls-row > * { margin-right: 12px; }
+}
+
+/* 2) conic-gradient fallback for the ring */
+@supports not (background: conic-gradient(#000 0 100%)) {
+  .tf-ring {
+    background: radial-gradient(farthest-side, #fff 70%, transparent 72%), #e5e7eb;
+  }
+  /* Optional: show the value as text only when sweep is unavailable */
+}
