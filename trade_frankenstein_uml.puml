@@ -1,0 +1,238 @@
+@startuml TradefrankensteinUML
+
+' Main entities
+package "com.trade.frankenstein.trader.model.entity" {
+  class TradeEntity {
+    -Long id
+    -String publicId
+    -String brokerTradeId
+    -String instrumentSymbol
+    -OrderSide side
+    -BigDecimal entryPrice
+    -BigDecimal exitPrice
+    -Integer quantity
+    -TradeStatus status
+    -Instant filledAt
+    -Instant closedAt
+    -BigDecimal realizedPnl
+    -Instant createdAt
+    -Instant updatedAt
+  }
+
+  class OrderEntity {
+    -Long id
+    -String publicId
+    -String brokerOrderId
+    -String instrumentSymbol
+    -OrderSide side
+    -OrderType type
+    -BigDecimal price
+    -Integer quantity
+    -OrderStatus status
+    -Instant createdAt
+    -Instant updatedAt
+  }
+
+  class InstrumentEntity {
+    -Long id
+    -String symbol
+    -InstrumentType type
+    -Integer lotSize
+    -Long instrumentToken
+  }
+
+  class AdviceEntity {
+    -Long id
+    -String publicId
+    -String instrumentSymbol
+    -OrderSide side
+    -OrderType orderType
+    -int confidence
+    -int techScore
+    -int newsScore
+    -AdviceStatus status
+    -String reason
+    -String orderPublicId
+    -StrategyName strategy
+    -Instant createdAt
+  }
+
+  class RiskLimitSnapshotEntity {
+    ' Risk management related fields
+  }
+
+  class MarketSentimentSnapshotEntity {
+    ' Market sentiment related fields
+  }
+
+  class MarketRegimeSnapshotEntity {
+    ' Market regime related fields
+  }
+}
+
+' Model objects
+package "com.trade.frankenstein.trader.model" {
+  class Advice {
+    -String id
+    -String time
+    -String instrument
+    -String side
+    -int confidence
+    -int tech
+    -int news
+    -String status
+    -String reason
+    -String orderId
+    -Boolean canExecute
+    -String blockedReason
+    -AdviceStatus adviceStatus
+  }
+}
+
+package "com.trade.frankenstein.trader.model.upstox" {
+  class UpstoxOrder
+  class UpstoxPosition
+  class UpstoxTrade
+  class UpstoxHolding
+  class PortfolioSnapshot
+  class PlaceOrderRequest
+  class PlaceOrderResponse
+  class ModifyOrderRequest
+  class ModifyOrderResponse
+  class MarketHoliday
+}
+
+' Services
+package "com.trade.frankenstein.trader.service" {
+  package "com.trade.frankenstein.trader.service.trades" {
+    class TradesService {
+      +processTrades()
+      +getTrades()
+      +getRecentTrades()
+    }
+  }
+
+  package "com.trade.frankenstein.trader.service.orders" {
+    class OrdersService
+  }
+
+  package "com.trade.frankenstein.trader.service.advice" {
+    class AdviceService
+  }
+
+  package "com.trade.frankenstein.trader.service.market" {
+    class MarketDataService
+    class OptionChainService
+    class SymbolTokenResolver
+  }
+
+  package "com.trade.frankenstein.trader.service.portfolio" {
+    class PortfolioService
+  }
+
+  package "com.trade.frankenstein.trader.service.risk" {
+    class RiskService
+    class OrderValidator
+  }
+
+  package "com.trade.frankenstein.trader.service.decision" {
+    class DecisionService
+  }
+
+  package "com.trade.frankenstein.trader.service.execution" {
+    class EngineService
+  }
+
+  package "com.trade.frankenstein.trader.service.signals" {
+    class MarketSignalsService
+  }
+
+  package "com.trade.frankenstein.trader.service.sentiment" {
+    class SentimentService
+  }
+
+  package "com.trade.frankenstein.trader.service.broker" {
+    interface IBrokerClient
+    class BrokerRouter
+    class MockBrokerClient
+  }
+
+  package "com.trade.frankenstein.trader.service.streaming" {
+    class StreamGateway
+  }
+
+  package "com.trade.frankenstein.trader.service.upstox" {
+    class UpstoxClient
+    class UpstoxSessionService
+    class UpstoxAuthClient
+  }
+}
+
+' Controllers
+package "com.trade.frankenstein.trader.web" {
+  class AdviceController
+  class DecisionController
+  class EngineController
+  class MarketDataController
+  class OptionChainController
+  class OrdersController
+  class PortfolioController
+  class StreamController
+  class TradesController
+  class UpstoxWebhookController
+}
+
+' UI
+package "com.trade.frankenstein.trader.ui" {
+  class LoginView
+  class DashboardView
+
+  package "com.trade.frankenstein.trader.ui.sections" {
+    class ExecutionAdvicesCard
+    class RecentTradesCard
+    class MarketSentimentCard
+    class RegimeDecisionCard
+    class RiskPanelCard
+  }
+
+  package "com.trade.frankenstein.trader.ui.header" {
+    class AppHeader
+    class ControlsBar
+  }
+}
+
+' Relationships
+TradeEntity "*" -- "1" OrderEntity: belongs to
+TradeEntity "*" -- "1" InstrumentEntity: references
+OrderEntity "*" -- "1" InstrumentEntity: references
+OrderEntity "*" -- "0..1" AdviceEntity: may come from
+AdviceEntity "*" -- "1" InstrumentEntity: references
+
+TradesService --> TradeEntity: manages
+OrdersService --> OrderEntity: manages
+AdviceService --> AdviceEntity: manages
+PortfolioService --> UpstoxPosition: manages
+PortfolioService --> UpstoxHolding: manages
+MarketDataService --> InstrumentEntity: uses
+
+BrokerRouter --> IBrokerClient: routes to
+MockBrokerClient ..|> IBrokerClient: implements
+UpstoxClient ..|> IBrokerClient: implements
+
+AdviceController --> AdviceService: uses
+TradesController --> TradesService: uses
+OrdersController --> OrdersService: uses
+PortfolioController --> PortfolioService: uses
+MarketDataController --> MarketDataService: uses
+OptionChainController --> OptionChainService: uses
+DecisionController --> DecisionService: uses
+EngineController --> EngineService: uses
+
+DashboardView --> ExecutionAdvicesCard: contains
+DashboardView --> RecentTradesCard: contains
+DashboardView --> MarketSentimentCard: contains
+DashboardView --> RegimeDecisionCard: contains
+DashboardView --> RiskPanelCard: contains
+DashboardView --> AppHeader: contains
+
+@enduml

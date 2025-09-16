@@ -1,14 +1,34 @@
 package com.trade.frankenstein.trader.model.upstox;
 
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
 import java.util.List;
 
-public final class PlaceOrderResponse {
+@Data
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+public class PlaceOrderResponse {
 
-    public final List<String> orderIds;
-    public final Integer latencyMs;
+    private String status;
+    private PlaceOrderData data;
+    private PlaceOrderMetadata metadata;
 
-    public PlaceOrderResponse(List<String> orderIds, Integer latencyMs) {
-        this.orderIds = orderIds == null ? List.of() : List.copyOf(orderIds);
-        this.latencyMs = latencyMs;
+    @Data
+    @AllArgsConstructor
+    @NoArgsConstructor
+    public class PlaceOrderData {
+        private List<String> order_ids;
     }
+
+    @Data
+    @AllArgsConstructor
+    @NoArgsConstructor
+    public class PlaceOrderMetadata {
+        private int latency;
+    }
+
 }

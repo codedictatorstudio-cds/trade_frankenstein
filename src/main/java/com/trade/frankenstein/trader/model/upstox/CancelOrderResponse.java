@@ -1,17 +1,27 @@
 package com.trade.frankenstein.trader.model.upstox;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 @Data
 @Builder
-public final class CancelOrderResponse {
+@AllArgsConstructor
+@NoArgsConstructor
+public class CancelOrderResponse {
 
-    public final String orderId;
-    public final Integer latencyMs;
+    private String status;
+    private PlaceOrderData data;
+    private PlaceOrderMetadata metadata;
 
-    public CancelOrderResponse(String orderId, Integer latencyMs) {
-        this.orderId = orderId;
-        this.latencyMs = latencyMs;
+    @Data
+    public class PlaceOrderData {
+        private String order_id;
+    }
+
+    @Data
+    public class PlaceOrderMetadata {
+        private int latency;
     }
 }

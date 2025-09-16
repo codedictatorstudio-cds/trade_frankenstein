@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Trade Frankenstein UML Diagram</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: white;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            border-radius: 5px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .diagram {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .instructions {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f0f8ff;
+            border-left: 5px solid #4682b4;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Trade Frankenstein UML Diagram</h1>
+
+        <div class="instructions">
+            <h2>Visualization Instructions:</h2>
+            <p>This page uses the PlantUML online server to render your UML diagram. The diagram below should load automatically.</p>
+            <p>If the diagram doesn't appear or you want to use alternative methods:</p>
+            <ul>
+                <li>Visit <a href="https://www.plantuml.com/plantuml/uml/" target="_blank">PlantUML Online Server</a> and paste the content of your <code>trade_frankenstein_uml.puml</code> file</li>
+                <li>Install a PlantUML plugin for your IDE (IntelliJ, VS Code, or Eclipse)</li>
+                <li>Use the PlantUML command-line tool with Java</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+            <img id="umlDiagram" alt="UML Diagram Loading...">
+        </div>
+
+        <div class="instructions">
+            <h3>Notes:</h3>
+            <p>The diagram shows the main components of your Trade Frankenstein project including:</p>
+            <ul>
+                <li>Entity classes (TradeEntity, OrderEntity, etc.)</li>
+                <li>Service layer components</li>
+                <li>Controllers</li>
+                <li>UI components</li>
+                <li>Relationships between these components</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // Function to encode PlantUML content for the server
+        function encode64(data) {
+            let r = "";
+            for (let i = 0; i < data.length; i += 3) {
+                if (i + 2 === data.length) {
+                    r += append3bytes(data.charCodeAt(i), data.charCodeAt(i + 1), 0);
+                } else if (i + 1 === data.length) {
+                    r += append3bytes(data.charCodeAt(i), 0, 0);
+                } else {
+                    r += append3bytes(data.charCodeAt(i), data.charCodeAt(i + 1), data.charCodeAt(i + 2));
+                }
+            }
+            return r;
+        }
+
+        function append3bytes(b1, b2, b3) {
+            const c1 = b1 >> 2;
+            const c2 = ((b1 & 0x3) << 4) | (b2 >> 4);
+            const c3 = ((b2 & 0xF) << 2) | (b3 >> 6);
+            const c4 = b3 & 0x3F;
+            let r = "";
+            r += encode6bit(c1 & 0x3F);
+            r += encode6bit(c2 & 0x3F);
+            r += encode6bit(c3 & 0x3F);
+            r += encode6bit(c4 & 0x3F);
+            return r;
+        }
+
+        function encode6bit(b) {
+            if (b < 10) {
+                return String.fromCharCode(48 + b);
+            }
+            b -= 10;
+            if (b < 26) {
+                return String.fromCharCode(65 + b);
+            }
+            b -= 26;
+            if (b < 26) {
+                return String.fromCharCode(97 + b);
+            }
+            b -= 26;
+            if (b === 0) {
+                return '-';
+            }
+            if (b === 1) {
+                return '_';
+            }
+            return '?';
+        }
+
+        // Fetch the PlantUML file content and render the diagram
+        fetch('trade_frankenstein_uml.puml')
+            .then(response => response.text())
+            .then(data => {
+                // Remove the first line if it's a filepath comment
+                const lines = data.split('\n');
+                if (lines[0].startsWith('// filepath:')) {
+                    data = lines.slice(1).join('\n');
+                }
+
+                // Encode the PlantUML content for the server
+                const encoded = encode64(deflate(data));
+
+                // Set the image source to the PlantUML server with the encoded content
+                document.getElementById('umlDiagram').src = `https://www.plantuml.com/plantuml/img/${encoded}`;
+            })
+            .catch(error => {
+                console.error('Error loading UML file:', error);
+                document.getElementById('umlDiagram').alt = 'Error loading UML diagram. Please check console for details.';
+            });
+    </script>
+
+    <!-- Include the deflate.js library for encoding PlantUML content -->
+    <script src="https://cdn.jsdelivr.net/npm/pako@2.0.4/dist/pako_deflate.min.js"></script>
+    <script>
+        function deflate(s) {
+            let utf8 = unescape(encodeURIComponent(s));
+            let compressed = pako.deflate(utf8, { level: 9 });
+            let b64 = btoa(String.fromCharCode.apply(null, compressed));
+            return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+    </script>
+</body>
+</html>

@@ -8,6 +8,6 @@ public enum MarketRegime {
     LOW_VOLATILITY,
     NEWS_DRIVEN,
     EVENT_DRIVEN,
-    UNKNOWN
+    NEUTRAL, UNKNOWN
 }
 

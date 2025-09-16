@@ -1,22 +1,31 @@
 package com.trade.frankenstein.trader.ui;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
+import com.trade.frankenstein.trader.ui.bridge.EngineApiClient;
+import com.trade.frankenstein.trader.ui.bridge.SseBridge;
 import com.trade.frankenstein.trader.ui.header.AppHeader;
 import com.trade.frankenstein.trader.ui.header.ControlsBar;
 import com.trade.frankenstein.trader.ui.sections.*;
+import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.Component;
 import com.vaadin.flow.component.dependency.CssImport;
 import com.vaadin.flow.component.html.Div;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
-import com.vaadin.flow.router.PageTitle;
-import com.vaadin.flow.router.Route;
+import com.vaadin.flow.router.*;
+
+import java.util.Collections;
 
 @PageTitle("TradeFrankenstein – Dashboard")
 @Route("dashboard")
 @CssImport("./styles/dashboard.css")
-public class DashboardView extends VerticalLayout {
+public class DashboardView extends VerticalLayout implements BeforeEnterObserver {
 
     public DashboardView() {
+
+        Component SseBridge = new SseBridge();
+        add(SseBridge);
+
         // Base layout
         setSizeFull();
         setPadding(false);
@@ -25,7 +34,7 @@ public class DashboardView extends VerticalLayout {
         addClassName("view-dashboard");
 
         // ===== 1/21: App Header (sticky via CSS) =====
-        AppHeader header = new AppHeader();
+        AppHeader header = new AppHeader(new EngineApiClient());
         header.setWidthFull();
         header.setSizeFull();
         header.setHeightFull();
@@ -64,13 +73,9 @@ public class DashboardView extends VerticalLayout {
         // ===== 19 content sections (total = 21 including header + controls) =====
 
         // Row A
-        addToGrid(grid, new RegimeDecisionCard(), 6);
+        RegimeDecisionCard regimeCard = new RegimeDecisionCard();
+        addToGrid(grid, regimeCard, 6);
         RiskPanelCard riskCard = new RiskPanelCard();
-        riskCard.setBudgetLeft(8420);  // ₹ 8,420
-        riskCard.setLots(4, 6);         // "4 / 6"
-        riskCard.setDailyLossPercent(37.5);         // 37%
-        riskCard.setOrdersPerMinutePercent(22);     // 22%
-
         addToGrid(grid, riskCard, 6);
 
 
@@ -78,13 +83,59 @@ public class DashboardView extends VerticalLayout {
         addToGrid(grid, new ExecutionAdvicesCard(), 12);
 
         // Row D
-        addToGrid(grid, new RecentTradesCard(), 12);
+        addToGrid(grid, new RecentTradesCard(), 8);
 
         // Row E
         addToGrid(grid, new MarketSentimentCard(), 4);
 
 
     }
+
+    private SseBridge sse;
+
+//    public DashboardView() {
+//        setPadding(true);
+//        setSpacing(true);
+//        setSizeFull();
+//
+//        AppHeader header = new AppHeader();
+//        ControlsBar controls = new ControlsBar();
+//
+//        // Cards (layout preserved)
+//        RegimeDecisionCard decision = new RegimeDecisionCard();
+//        RiskPanelCard risk = new RiskPanelCard();
+//        ExecutionAdvicesCard adv = new ExecutionAdvicesCard();
+//        RecentTradesCard trades = new RecentTradesCard();
+//        MarketSentimentCard sentiment = new MarketSentimentCard();
+//
+//        FlexLayout grid = new FlexLayout(decision, risk, adv, trades, sentiment);
+//        grid.setWidthFull();
+//        grid.getStyle().set("gap", "16px");
+//        grid.setFlexWrap(FlexLayout.FlexWrap.WRAP);
+//        decision.setWidth("100%");
+//        risk.setWidth("100%");
+//        sentiment.setWidth("100%");
+//        adv.setWidth("100%");
+//        trades.setWidth("100%");
+//
+//        add(header, controls, grid);
+//    }
+
+    @Override
+    protected void onAttach(AttachEvent attachEvent) {
+        // Single SSE bridge for the whole UI
+        if (sse == null) {
+            sse = new SseBridge().topics(
+                    "decision.quality",
+                    "risk.summary", "risk.circuit",
+                    "advice.new", "advice.updated",
+                    "trade.created", "trade.updated",
+                    "sentiment.update"
+            );
+            add(sse); // invisible; lives in the UI
+        }
+    }
+
 
     /**
      * Wrap a component with a div that spans N columns (1..12).
@@ -98,6 +149,20 @@ public class DashboardView extends VerticalLayout {
         cell.getStyle().set("min-height", "var(--account-summary-min-h, 260px)");
         cell.addClassName("tf-cell");
         grid.add(cell);
+    }
+
+    @Override
+    public void beforeEnter(BeforeEnterEvent event) {
+        Location location = event.getLocation();
+        QueryParameters queryParameters = location.getQueryParameters();
+
+        // Capture specific parameters (existing functionality)
+        String code = queryParameters.getParameters().getOrDefault("code", Collections.singletonList("")).get(0);
+        if (code != null && !code.isEmpty() && !code.isBlank()) {
+            System.out.println( "OAuth code received: " + code);
+            AuthCodeHolder holder = AuthCodeHolder.getInstance();
+            holder.set(code);
+        }
     }
 
 }

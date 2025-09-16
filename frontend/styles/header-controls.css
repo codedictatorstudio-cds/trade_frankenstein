@@ -1,0 +1,128 @@
+/* header-controls.css — v5 strict alignment + premium styling */
+
+.controls-bar,
+vaadin-horizontal-layout.controls-bar {
+  /* Grid ensures perfect column/row alignment */
+  display: grid !important;
+  grid-template-columns: minmax(280px,1fr) minmax(260px,0.9fr) minmax(360px,1.15fr) minmax(420px,1.25fr) !important;
+  grid-auto-rows: 64px !important;
+  align-items: stretch !important;
+  gap: 16px !important;
+
+  /* Canvas look */
+  width: 100% !important;
+  padding: 16px 24px !important;
+  box-sizing: border-box !important;
+  background: linear-gradient(120deg, rgba(255,255,255,0.88) 60%, rgba(32,192,106,0.10) 100%) !important;
+  backdrop-filter: blur(16px) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+  border-bottom: 1.5px solid #e0e7ef !important;
+  box-shadow: 0 8px 32px rgba(16,24,40,0.12) !important;
+  border-radius: 18px 18px 0 0 !important;
+}
+
+/* Every section card = same height + centered content */
+.controls-bar > .compact-group,
+.controls-bar > .grow-group,
+.controls-bar > .section {
+  height: 64px !important;
+  min-height: 64px !important;
+  align-items: center !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+}
+
+/* Internal blocks fill the card height */
+.field-container,
+.compact-group,
+.grow-group {
+  height: 100% !important;
+  box-sizing: border-box !important;
+}
+
+/* Icon chip sizing (no vertical wiggle) */
+.section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  width: 28px;
+  min-width: 28px;
+  margin-right: 10px;
+  opacity: 0.9;
+}
+
+/* Confidence meter scales neatly */
+.confidence-meter {
+  width: 100%;
+  min-width: 180px;
+  height: 10px;
+  border: 1px solid #E6E8F0;
+  border-radius: 10px;
+  background: linear-gradient(to right, #f8f9fa, #ffffff);
+  overflow: hidden;
+}
+.confidence-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(to right, #20C06A, #18A557);
+  border-radius: 10px 0 0 10px;
+  transition: width 260ms ease;
+}
+.confidence-label {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 3.5em;
+  text-align: center;
+  border-radius: 6px;
+  padding: 3px 8px;
+  background: #f0f2f5;
+  line-height: 1.2;
+}
+
+/* Pills */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1.5px solid #E6E8F0;
+  background: rgba(255,255,255,0.85);
+  color: #6B7280;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* Card shells */
+.compact-group, .grow-group {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: rgba(255,255,255,0.7);
+  border-radius: 14px;
+  box-shadow: 0 2px 8px rgba(32,192,106,0.08);
+  padding: 12px 16px;
+  min-width: 0;
+  height: 100%;
+}
+
+/* Normalize Vaadin radio-group vertical spacing */
+.mode-selector::part(group-field) { padding: 2px 6px; margin: 0; }
+.mode-selector::part(radio-button) { margin: 0; font-weight: 600; }
+.mode-selector { --lumo-space-xs: 0; }
+
+/* Buttons: remove extra vertical slack from text */
+.action-button { line-height: 1 !important; }
+
+/* Responsive wrap */
+@media (max-width: 1280px) {
+  .controls-bar { grid-template-columns: 1fr 1fr !important; grid-auto-rows: 64px !important; }
+}
+@media (max-width: 860px) {
+  .controls-bar { grid-template-columns: 1fr !important; }
+}
+
+/* Ripple keyframes (used by the ripple effect) */
+@keyframes ripple { to { transform: scale(4); opacity: 0; } }

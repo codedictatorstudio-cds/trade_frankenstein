@@ -1,33 +1,36 @@
 package com.trade.frankenstein.trader.model.upstox;
 
+import com.trade.frankenstein.trader.enums.OrderType;
+import jakarta.validation.constraints.NotNull;
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 @Data
 @Builder
-public final class ModifyOrderRequest {
+@AllArgsConstructor
+@NoArgsConstructor
+public class ModifyOrderRequest {
 
-    public final String orderId;          // required
-    public final Integer quantity;        // optional
-    public final BigDecimal price;        // optional
-    public final BigDecimal triggerPrice; // optional
-    public final String validity;         // optional
-    public final String tag;              // optional
+    public Integer quantity;
 
-    public Map<String, Object> toUpstoxPayload() {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("order_id", orderId);
-        if (quantity != null) m.put("quantity", quantity);
-        if (price != null) m.put("price", price);
-        if (triggerPrice != null) m.put("trigger_price", triggerPrice);
-        if (validity != null) m.put("validity", validity);
-        if (tag != null) m.put("tag", tag);
-        return m;
-    }
+    @NotNull
+    public String validity;
 
+    @NotNull
+    public BigDecimal price;
 
+    @NotNull
+    public String order_id;
+
+    @NotNull
+    private OrderType order_type;
+
+    public int disclosed_quantity;
+
+    @NotNull
+    public int trigger_price;
 }

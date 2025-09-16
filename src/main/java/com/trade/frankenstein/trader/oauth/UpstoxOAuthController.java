@@ -1,32 +1,25 @@
 package com.trade.frankenstein.trader.oauth;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
+import com.trade.frankenstein.trader.common.constants.UpstoxConstants;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Controller;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.view.RedirectView;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 
-@Controller
+@Slf4j
+@RestController
 public class UpstoxOAuthController {
-
-    @Value("${upstox.client-id}")
-    private String clientId;
-
-    @Value("${upstox.redirect-uri}")
-    private String redirectUri;
-
-    @Value("${upstox.authorize-url:https://api.upstox.com/v2/login/authorization/dialog}")
-    private String oauthUrl;
 
     @GetMapping("/oauth/upstox/login")
     public RedirectView login() {
-        String url = oauthUrl +
-                "?client_id=" + URLEncoder.encode(clientId, StandardCharsets.UTF_8) +
-                "&redirect_uri=" + URLEncoder.encode(redirectUri, StandardCharsets.UTF_8) +
-                "&response_type=code";
+        String url = UpstoxConstants.AUTHORIZATION_URL +
+                "?response_type=code" +
+                "&client_id=" + UpstoxConstants.CLIENT_ID +
+                "&redirect_uri=" + UpstoxConstants.REDIRECT_URL;
+
         return new RedirectView(url);
     }
 
@@ -37,10 +30,11 @@ public class UpstoxOAuthController {
         if (error != null || code == null) {
             return new RedirectView("/?error=1");
         }
-        // Here you would exchange the code for an access token and validate it.
-        // If successful:
-        return new RedirectView("/dashboard");
-        // If failed, redirect as below:
-        // return new RedirectView("/?error=1");
+        log.info("Received OAuth callback with code: {}", code);
+        if(!code.isEmpty() && !code.isBlank()) {
+            AuthCodeHolder holder = AuthCodeHolder.getInstance();
+            holder.set(code);
+        }
+        return new RedirectView("/?code=" + code);
     }
 }
