@@ -2,13 +2,10 @@ package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
-import com.trade.frankenstein.trader.enums.OrderStatus;
 import com.trade.frankenstein.trader.model.documents.Advice;
-import com.trade.frankenstein.trader.model.documents.Order;
 import com.trade.frankenstein.trader.model.upstox.PlaceOrderRequest;
 import com.trade.frankenstein.trader.model.upstox.PlaceOrderResponse;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
-import com.trade.frankenstein.trader.repo.documents.OrderRepo;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
@@ -19,193 +16,157 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
+import java.util.Optional;
 
 @Service
 @Slf4j
 public class AdviceService {
 
-    @Autowired private AdviceRepo adviceRepo;
-    @Autowired private OrderRepo orderRepo;
-    @Autowired private OrdersService ordersService;                 // single gate calls RiskService + UpstoxService
-    @Autowired private StreamGateway stream;
+    @Autowired
+    private AdviceRepo adviceRepo;
+    @Autowired
+    private OrdersService ordersService;   // risk checks + Upstox call
+    @Autowired
+    private StreamGateway stream;
 
-    // ---------------------------------------------------------------------
-    // Create (used by Engine/Strategy to publish fresh advices)
-    // ---------------------------------------------------------------------
-    @Transactional
-    public Result<Advice> create(Advice draft) {
-        if (draft == null) return Result.fail("BAD_REQUEST", "Advice payload required");
-        if (draft.getSymbol() == null || draft.getSymbol().trim().isEmpty())
-            return Result.fail("BAD_REQUEST", "Symbol is required");
-        if (draft.getTransaction_type() == null)
-            return Result.fail("BAD_REQUEST", "Transaction type (BUY/SELL) is required");
-        if (draft.getQuantity() <= 0)
-            return Result.fail("BAD_REQUEST", "Quantity must be > 0");
+    // =========================== Queries ===========================
 
-        if (draft.getStatus() == null) draft.setStatus(AdviceStatus.PENDING);
-        Instant now = Instant.now();
-        if (draft.getCreatedAt() == null) draft.setCreatedAt(now);
-        draft.setUpdatedAt(now);
-
-        Advice saved = adviceRepo.save(draft);
-
-        // 🔔 Stream fresh advice to UI
-        try {
-            stream.send("advice.new", saved);
-            log.info("Streamed advice.new id={}", saved.getId());
-        } catch (Throwable t) {
-            log.warn("Failed to stream advice.new: {}", t.toString());
-        }
-        return Result.ok(saved);
-    }
-
-    // ---------------------------------------------------------------------
-    // List / Get
-    // ---------------------------------------------------------------------
     @Transactional(readOnly = true)
     public Result<List<Advice>> list() {
-        List<Advice> rows = adviceRepo
-                .findAll(PageRequest.of(0, 200, Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id"))))
-                .getContent();
-        return Result.ok(rows);
-    }
-
-    @Transactional(readOnly = true)
-    public Result<List<Advice>> list(@Nullable String symbolContains,
-                                     @Nullable AdviceStatus status,
-                                     int page, int size) {
-        int p = Math.max(0, page);
-        int s = Math.min(Math.max(1, size), 200);
-
-        List<Advice> out = new ArrayList<>();
-        for (Advice a : adviceRepo.findAll(PageRequest.of(p, s, Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id"))))) {
-            if (symbolContains != null) {
-                String sym = a.getSymbol() == null ? "" : a.getSymbol();
-                if (!sym.toLowerCase(Locale.ROOT).contains(symbolContains.toLowerCase(Locale.ROOT))) continue;
-            }
-            if (status != null && a.getStatus() != status) continue;
-            out.add(a);
+        try {
+            List<Advice> advs = adviceRepo
+                    .findAll(PageRequest.of(0, 100, Sort.by("createdAt").descending()))
+                    .getContent();
+            return Result.ok(advs);
+        } catch (Throwable t) {
+            log.warn("advice.list failed", t);
+            return Result.fail(t);
         }
-        return Result.ok(out);
     }
 
     @Transactional(readOnly = true)
     public Result<Advice> get(String adviceId) {
-        Advice a = adviceRepo.findById(adviceId).orElse(null);
-        if (a == null) return Result.fail("NOT_FOUND", "Advice not found: " + adviceId);
-        return Result.ok(a);
+        try {
+            if (adviceId == null || adviceId.trim().isEmpty()) {
+                return Result.fail("BAD_REQUEST", "adviceId is required");
+            }
+            Optional<Advice> opt = adviceRepo.findById(adviceId);
+            return opt.map(Result::ok).orElseGet(() -> Result.fail("NOT_FOUND", "Advice not found"));
+        } catch (Throwable t) {
+            log.warn("advice.get({}) failed", adviceId, t);
+            return Result.fail(t);
+        }
     }
 
-    // ---------------------------------------------------------------------
-    // Execute
-    // ---------------------------------------------------------------------
+    // =========================== Mutations ===========================
+
+    /**
+     * Persist a new Advice and emit advice.new
+     */
+    @Transactional
+    public Result<Advice> create(Advice draft) {
+        try {
+            if (draft == null) return Result.fail("BAD_REQUEST", "Advice payload required");
+            if (isBlank(draft.getSymbol())) return Result.fail("BAD_REQUEST", "Symbol is required");
+            if (draft.getTransaction_type() == null)
+                return Result.fail("BAD_REQUEST", "Transaction type (BUY/SELL) is required");
+            if (draft.getQuantity() <= 0) return Result.fail("BAD_REQUEST", "Quantity must be > 0");
+
+            if (draft.getStatus() == null) draft.setStatus(AdviceStatus.PENDING);
+            // direct timestamp setters (no reflection)
+            draft.setCreatedAt(Instant.now());
+            draft.setUpdatedAt(Instant.now());
+
+            Advice saved = adviceRepo.save(draft);
+
+            // stream entity directly (no mapper)
+            stream.send("advice.new", saved);
+            return Result.ok(saved);
+        } catch (Throwable t) {
+            log.warn("advice.create failed", t);
+            return Result.fail(t);
+        }
+    }
+
+    /**
+     * Execute a PENDING advice: build typed PlaceOrderRequest, place it,
+     * update Advice → EXECUTED with orderId (if available), then emit advice.updated.
+     */
     @Transactional
     public Result<Advice> execute(String adviceId) {
-        Advice a = adviceRepo.findById(adviceId).orElse(null);
-        if (a == null) return Result.fail("NOT_FOUND", "Advice not found");
-        if (a.getStatus() == AdviceStatus.EXECUTED) return Result.fail("ALREADY_EXECUTED", "Already executed");
-        if (a.getQuantity() <= 0) return Result.fail("BAD_REQUEST", "Quantity must be > 0");
-
-        PlaceOrderRequest req = toUpstoxRequest(a);
-
-        // Delegate to OrdersService (does risk checks + market-hours + broker call + its own SSE)
-        Result<PlaceOrderResponse> placedRes = ordersService.placeOrder(req);
-        if (placedRes == null || !placedRes.isOk() || placedRes.get() == null) {
-            return Result.fail(placedRes == null ? "BROKER_ERROR" : placedRes.getErrorCode(),
-                    placedRes == null ? "Failed to place order" : placedRes.getError());
-        }
-        PlaceOrderResponse placed = placedRes.get();
-
-        // Extract order id (first id)
-        String orderId = null;
         try {
-            if (placed.getData() != null &&
-                    placed.getData().getOrder_ids() != null &&
-                    !placed.getData().getOrder_ids().isEmpty()) {
-                orderId = placed.getData().getOrder_ids().get(0);
+            if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
+
+            Optional<Advice> opt = adviceRepo.findById(adviceId);
+            if (opt.isEmpty()) return Result.fail("NOT_FOUND", "Advice not found");
+
+            Advice a = opt.get();
+            if (a.getStatus() != AdviceStatus.PENDING) {
+                log.info("advice.execute: {} not PENDING (status={}), skip", adviceId, a.getStatus());
+                return Result.ok(a);
             }
-        } catch (Throwable ignored) {}
 
-        if (orderId == null) return Result.fail("BROKER_ERROR", "Order ID missing from broker response");
+            PlaceOrderRequest req = buildUpstoxRequest(a);
+            Result<PlaceOrderResponse> r = ordersService.placeOrder(req);
+            if (r == null || !r.isOk() || r.get() == null) {
+                String err = (r == null) ? "Order placement failed"
+                        : (r.getError() == null ? "Order placement failed" : r.getError());
+                return Result.fail((r == null || r.getErrorCode() == null) ? "ORDER_ERROR" : r.getErrorCode(), err);
+            }
 
-        // Update Advice
-        a.setOrder_id(orderId);
-        a.setStatus(AdviceStatus.EXECUTED);
-        a.setUpdatedAt(Instant.now());
-        adviceRepo.save(a);
+            PlaceOrderResponse placed = r.get();
+            String orderId = extractOrderId(placed);
 
-        // Mirror Order doc (lightweight)
-        try {
-            Order o = Order.builder()
-                    .id(orderId)
-                    .symbol(a.getSymbol())
-                    .order_type(a.getOrder_type())
-                    .transaction_type(a.getTransaction_type())
-                    .quantity(a.getQuantity())
-                    .product(a.getProduct())
-                    .validity(a.getValidity())
-                    .price(a.getPrice())
-                    .trigger_price(a.getTrigger_price())
-                    .disclosed_quantity(a.getDisclosed_quantity())
-                    .is_amo(a.is_amo())
-                    .slice(a.isSlice())
-                    .tag(a.getTag())
-                    .status(OrderStatus.NEW)
-                    .filled_quantity(0)
-                    .pending_quantity(a.getQuantity())
-                    .average_price(0.0)
-                    .placed_at(Instant.now())
-                    .updated_at(Instant.now())
-                    .build();
-            orderRepo.save(o);
+            // direct setters (no reflection)
+            a.setOrder_id(orderId);
+            a.setStatus(AdviceStatus.EXECUTED);
+            a.setUpdatedAt(Instant.now());
+
+            Advice saved = adviceRepo.save(a);
+
+            // stream entity directly (no mapper)
+            stream.send("advice.updated", saved);
+
+            log.info("advice.execute: placed order {} for {}", orderId, a.getSymbol());
+            return Result.ok(saved);
         } catch (Throwable t) {
-            log.warn("Order save error: {}", t.toString());
+            log.warn("advice.execute failed", t);
+            return Result.fail(t);
         }
-
-        // 🔔 Notify UI that this advice changed
-        try {
-            stream.send("advice.updated", a);
-            log.info(" Streamed advice.updated id={}", a.getId());
-        } catch (Throwable t) {
-            log.warn(" Failed to stream advice.updated: {}", t.toString());
-        }
-
-        return Result.ok(a);
     }
 
-    // ---------------------------------------------------------------------
-    // Dismiss
-    // ---------------------------------------------------------------------
+    /**
+     * Mark advice as DISMISSED and emit advice.updated.
+     */
     @Transactional
-    public Result<Void> dismiss(String adviceId) {
-        Advice a = adviceRepo.findById(adviceId).orElse(null);
-        if (a == null) return Result.fail("NOT_FOUND", "Advice not found: " + adviceId);
-        if (a.getStatus() == AdviceStatus.EXECUTED || a.getStatus() == AdviceStatus.DISMISSED) {
-            return Result.fail("INVALID_STATE", "Advice already " + (a.getStatus() == null ? "" : a.getStatus().name()));
-        }
-        a.setStatus(AdviceStatus.DISMISSED);
-        a.setUpdatedAt(Instant.now());
-        adviceRepo.save(a);
-
-        // 🔔 Notify UI that this advice changed
+    public Result<Advice> dismiss(String adviceId) {
         try {
-            stream.send("advice.updated", a);
-            log.info("Streamed advice.updated id={}", a.getId());
+            if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
+            Optional<Advice> opt = adviceRepo.findById(adviceId);
+            if (opt.isEmpty()) return Result.fail("NOT_FOUND", "Advice not found");
+
+            Advice a = opt.get();
+            if (a.getStatus() == AdviceStatus.DISMISSED) return Result.ok(a);
+
+            a.setStatus(AdviceStatus.DISMISSED);
+            a.setUpdatedAt(Instant.now());
+            Advice saved = adviceRepo.save(a);
+
+            stream.send("advice.updated", saved);
+            return Result.ok(saved);
         } catch (Throwable t) {
-            log.warn("Failed to stream advice.updated: {}", t.toString());
+            log.warn("advice.dismiss failed", t);
+            return Result.fail(t);
         }
-        return Result.ok();
     }
 
-    // ---------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------
-    private static PlaceOrderRequest toUpstoxRequest(Advice a) {
-        BigDecimal price = a.getPrice() > 0 ? BigDecimal.valueOf(a.getPrice()) : null;
-        BigDecimal trigger = a.getTrigger_price() > 0 ? BigDecimal.valueOf(a.getTrigger_price()) : null;
+    // =========================== Helpers ===========================
+
+    private PlaceOrderRequest buildUpstoxRequest(Advice a) {
+        // Strategy must populate these fields on Advice before calling create()
+        BigDecimal price = toBigDecimal(a.getPrice());
+        BigDecimal trigger = toBigDecimal(a.getTrigger_price());
 
         return PlaceOrderRequest.builder()
                 .instrument_token(a.getInstrument_token())
@@ -221,5 +182,33 @@ public class AdviceService {
                 .slice(a.isSlice())
                 .tag(a.getTag())
                 .build();
+    }
+
+    @Nullable
+    public String extractOrderId(PlaceOrderResponse resp) {
+        if (resp == null) return null;
+        try {
+            return resp.getData().getOrder_ids().stream().findFirst().orElse(null);
+        } catch (Throwable t) {
+            log.warn("extractOrderId failed", t);
+            return null;
+        }
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    private static BigDecimal toBigDecimal(Object v) {
+        if (v == null) return null;
+        try {
+            if (v instanceof BigDecimal) return (BigDecimal) v;
+            if (v instanceof Number) return BigDecimal.valueOf(((Number) v).doubleValue());
+            String s = String.valueOf(v).trim();
+            if (s.isEmpty()) return null;
+            return new BigDecimal(s);
+        } catch (Throwable e) {
+            return null;
+        }
     }
 }

@@ -1,12 +1,12 @@
 package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
+import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
 import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -16,6 +16,8 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @Slf4j
@@ -30,11 +32,18 @@ public class MarketDataService {
     /**
      * Default underlying for market-wide decisions (used for momentum/regime).
      */
-    private String underlyingKey = "NSE_INDEX|Nifty 50";
+    private final String underlyingKey = Underlyings.NIFTY;
 
     // Momentum→Regime mapping thresholds (tweak if your signal scale changes)
     private static final BigDecimal Z_BULLISH = new BigDecimal("0.50");
     private static final BigDecimal Z_BEARISH = new BigDecimal("-0.50");
+
+    @Autowired
+    private UpstoxService upstoxService; // if not already present
+
+    private volatile Instant lastRegimeFlip = Instant.EPOCH;      // updated when hourly regime changes
+    private volatile MarketRegime prevHourlyRegime = null;        // previous hourly regime snapshot
+
 
     /**
      * Live LTP proxy from OHLC live bar's close (robust across brokers).
@@ -121,46 +130,158 @@ public class MarketDataService {
         }
     }
 
+    /**
+     * Z-score of the last close vs recent closes on the given timeframe (e.g., "minutes","60").
+     */
+    public Optional<BigDecimal> getMomentumOn(String unit, String interval) {
+        try {
+            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(Underlyings.NIFTY, unit, interval);
+            List<IntradayCandleResponse.Candle> cs = (ic == null) ? null : ic.toCandleList();
+            if (cs == null || cs.size() < 10) return Optional.empty();
+
+            double[] closes = cs.stream().mapToDouble(IntradayCandleResponse.Candle::getClose).toArray();
+            double last = closes[closes.length - 1];
+            double m = mean(closes);
+            double sd = stddev(closes, m);
+            if (sd <= 1e-9) return Optional.of(BigDecimal.ZERO);
+
+            BigDecimal z = BigDecimal.valueOf((last - m) / sd).setScale(4, RoundingMode.HALF_UP);
+            return Optional.of(z);
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Map momentum Z-score to a coarse regime; also tracks hourly flip instant for cooldown logic.
+     */
+    public Optional<MarketRegime> getRegimeOn(String unit, String interval) {
+        Optional<BigDecimal> zOpt = getMomentumOn(unit, interval);
+        if (zOpt.isEmpty()) return Optional.empty();
+
+        BigDecimal z = zOpt.get();
+        MarketRegime reg = (z.compareTo(Z_BULLISH) >= 0) ? MarketRegime.BULLISH
+                : (z.compareTo(Z_BEARISH) <= 0) ? MarketRegime.BEARISH
+                : MarketRegime.NEUTRAL;
+
+        // Track flips on hourly regime specifically ("minutes","60")
+        if ("minutes".equalsIgnoreCase(unit) && "60".equalsIgnoreCase(interval)) {
+            MarketRegime prev = prevHourlyRegime;
+            if (prev != null && prev != reg) {
+                lastRegimeFlip = Instant.now();
+            }
+            prevHourlyRegime = reg;
+        }
+        return Optional.of(reg);
+    }
+
+    // Call this from your broadcast or whenever regimes are polled
+    public Optional<Instant> getLastRegimeFlipInstant() {
+        return Optional.ofNullable(lastRegimeFlip);
+    }
+
     // ---------------------------------------------------------------------
     // Math helpers (simple, fast)
     // ---------------------------------------------------------------------
     private static double mean(double[] a) {
         double s = 0.0;
         for (double v : a) s += v;
-        return s / a.length;
+        return a.length == 0 ? 0.0 : s / a.length;
     }
 
-    private static double stddev(double[] a, double mean) {
+    private static double stddev(double[] a, double m) {
+        if (a.length == 0) return 0.0;
         double s2 = 0.0;
         for (double v : a) {
-            double d = v - mean;
+            double d = v - m;
             s2 += d * d;
         }
-        return Math.sqrt(s2 / Math.max(1, a.length - 1));
+        return Math.sqrt(s2 / a.length);
     }
 
-    @Value("${trade.signals.refresh-ms:15000}")
-    private long refreshMs;
+
+    private long refreshMs = 15000;
+
+    // Add this field inside the class (e.g., MarketDataService):
+    private final Map<String, Object> state = new ConcurrentHashMap<>();
+
 
     // Broadcast regime + momentum Z for the UI (no testMode / market-hours gates)
     @Scheduled(fixedDelayString = "${trade.signals.refresh-ms:15000}")
     public void broadcastSignalsTick() {
         try {
-            Result<MarketRegime> rRegime = getRegimeNow();
-            Result<BigDecimal> rZ = getMomentumNow(Instant.now());
+            Result<MarketRegime> rRegime5 = getRegimeNow();      // 5m-derived regime
+            Optional<MarketRegime> rRegime60 = getHourlyRegime(); // hourly regime
 
-            Map<String, Object> payload = new HashMap<String, Object>();
+            boolean has5 = rRegime5 != null && rRegime5.isOk() && rRegime5.get() != null;
+            if (has5) {
+                MarketRegime nowReg = rRegime5.get();
+                MarketRegime prev = (MarketRegime) state.getOrDefault("prevReg", null);
+                if (prev != null && prev != nowReg) lastRegimeFlip = Instant.now();
+                state.put("prevReg", nowReg);
+            }
+
+            Result<BigDecimal> z5 = getMomentumNow(Instant.now());
+            Optional<BigDecimal> z15 = getMomentumNow15m();
+            Optional<BigDecimal> z60 = getMomentumNowHourly();
+
+            Map<String, Object> payload = new HashMap<>();
             payload.put("asOf", Instant.now());
-            if (rRegime != null && rRegime.isOk() && rRegime.get() != null) {
-                payload.put("regime", rRegime.get().name());
-            }
-            if (rZ != null && rZ.isOk() && rZ.get() != null) {
-                payload.put("z", rZ.get()); // BigDecimal
-            }
+            if (has5) payload.put("regime5", rRegime5.get().name());
+            rRegime60.ifPresent(marketRegime -> payload.put("regime60", marketRegime.name()));
+            if (z5 != null && z5.isOk() && z5.get() != null) payload.put("z5", z5.get());
+            z15.ifPresent(v -> payload.put("z15", v));
+            z60.ifPresent(v -> payload.put("z60", v));
 
             stream.send("signals.regime", payload);
         } catch (Throwable t) {
             log.debug("broadcastSignalsTick failed: {}", t.getMessage());
         }
     }
+
+    // NEW: 15-minute momentum Z-score wrapper
+    public Optional<BigDecimal> getMomentumNow15m() {
+        return getMomentumOn("minutes", "15");
+    }
+
+    // NEW: Hourly (60-minute) momentum Z-score wrapper
+    public Optional<BigDecimal> getMomentumNowHourly() {
+        return getMomentumOn("minutes", "60");
+    }
+
+    // NEW: Hourly regime snapshot (tracks flips via getRegimeOn)
+    public Optional<MarketRegime> getHourlyRegime() {
+        return getRegimeOn("minutes", "60");
+    }
+
+    // NEW: Explicit 5-minute momentum Z-score wrapper (for clarity)
+    public Optional<BigDecimal> getMomentumNow5m() {
+        return getMomentumOn("minutes", "5");
+    }
+
+
+    /**
+     * Previous Day High/Low using daily candles; requires broker API to return daily bars.
+     */
+    public Optional<StrategyService.PDRange> getPreviousDayRange(String instrumentKey) {
+        try {
+            // Try daily bars via the same candle endpoint (many brokers accept unit="day", interval="1")
+            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(
+                    (instrumentKey == null || instrumentKey.isEmpty()) ? Underlyings.NIFTY : instrumentKey,
+                    "day",
+                    "1"
+            );
+            List<IntradayCandleResponse.Candle> daily = (ic == null) ? null : ic.toCandleList();
+            if (daily == null || daily.size() < 2) return Optional.empty();
+
+            IntradayCandleResponse.Candle y = daily.get(daily.size() - 2); // yesterday
+            BigDecimal pdh = BigDecimal.valueOf(y.getHigh());
+            BigDecimal pdl = BigDecimal.valueOf(y.getLow());
+
+            return Optional.of(new com.trade.frankenstein.trader.service.StrategyService.PDRange(pdh, pdl));
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
+    }
+
 }

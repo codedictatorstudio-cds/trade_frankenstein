@@ -12,14 +12,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
+import java.math.BigDecimal;
 import java.net.URI;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 @Service
 @Slf4j
@@ -38,6 +37,9 @@ public class UpstoxService {
     private AuthenticationResponseRepo authenticationResponseRepo;
 
     private AuthenticationResponse authenticationResponse;
+
+    private static final Set<String> WORKING_STATUSES = new HashSet<>(
+            Arrays.asList("open", "queued", "validation pending", "trigger pending", "enquiry", "partially filled"));
 
     @PostConstruct
     public void init() {
@@ -295,7 +297,6 @@ public class UpstoxService {
     public PortfolioResponse getShortTermPositions() {
         log.info("Checking and refreshing token if needed : getPortfolio");
         checkAndRefreshToken();
-
         // Set headers for the request
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
@@ -863,4 +864,98 @@ public class UpstoxService {
 
         return response.getBody();
     }
+
+    // --- Convenience: amend price on an existing order (wrapper on modifyOrder) ---
+    public ModifyOrderResponse amendOrderPrice(String orderId, BigDecimal newPrice) {
+        log.info("Amending order price: orderId={}, newPrice={}", orderId, newPrice);
+        checkAndRefreshToken();
+
+        // Adjust field names to your ModifyOrderRequest (orderId vs order_id, price vs newPrice, etc.)
+        ModifyOrderRequest req = ModifyOrderRequest.builder()
+                .order_id(orderId)
+                .price(newPrice.floatValue())
+                .build();
+
+        return modifyOrder(req);
+    }
+
+    // --- Convenience: quick status probe for engine trailing/SL chasing loops ---
+    public boolean isOrderWorking(String orderId) {
+        try {
+            OrderGetResponse og = getOrderDetails(orderId);
+            if (og == null || og.getData() == null || og.getData().getStatus() == null) return false;
+            String s = og.getData().getStatus().trim().toLowerCase();
+            boolean working = WORKING_STATUSES.contains(s);
+            log.info("isOrderWorking({}) -> {} (status={})", orderId, working, s);
+            return working;
+        } catch (Exception e) {
+            log.warn("isOrderWorking({}) failed: {}", orderId, e.toString());
+            return false;
+        }
+    }
+
+    // --- Convenience: place a target LIMIT sell for an existing long position ---
+    public PlaceOrderResponse placeTargetOrder(String instrumentKey, int qty, BigDecimal targetPrice) {
+        log.info("Placing target LIMIT order: {}, qty={}, price={}", instrumentKey, qty, targetPrice);
+        checkAndRefreshToken();
+
+        // Adjust field names to your PlaceOrderRequest (transactionType/orderType/product/validity/etc.)
+        PlaceOrderRequest req = PlaceOrderRequest.builder()
+                .instrument_token(instrumentKey)
+                .quantity(qty)
+                .transaction_type("SELL")
+                .order_type("LIMIT")
+                .price(targetPrice)
+                .product("I")       // intraday by default; change if you use another product
+                .validity("DAY")
+                .build();
+
+        return placeOrder(req);
+    }
+
+    // --- Convenience: place a protective SL (SL or SL-L) sell for an existing long position ---
+    public PlaceOrderResponse placeStopLossOrder(String instrumentKey, int qty, BigDecimal triggerPrice) {
+        log.info("Placing protective SL order: {}, qty={}, trigger={}", instrumentKey, qty, triggerPrice);
+        checkAndRefreshToken();
+
+        // If you prefer SL-Market, set orderType("SL") and omit .price(...)
+        PlaceOrderRequest req = PlaceOrderRequest.builder()
+                .instrument_token(instrumentKey)
+                .quantity(qty)
+                .transaction_type("SELL")
+                .order_type("SL")            // or "SL-L" if your API distinguishes
+                .trigger_price(triggerPrice) // required for SL/SL-L
+                .validity("DAY")
+                .product("I")
+                .build();
+
+        return placeOrder(req);
+    }
+
+    public BigDecimal getRealizedPnlToday() {
+        try {
+            LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+            String d = today.format(DateTimeFormatter.ISO_DATE); // yyyy-MM-dd
+
+            // Adjust this call's signature/args if your existing getPnlReports(...) differs
+            PnLReportResponse r = getPnlReports(d, d, "FO", "CURRENT", 1, 500);
+
+            BigDecimal sum = BigDecimal.ZERO;
+            if (r != null && r.getData() != null) {
+                for (PnLReportResponse.PnLReportItem it : r.getData()) {
+                    // Realized PnL for a closed roundtrip row
+                    BigDecimal sell = BigDecimal.valueOf(it.getSell_amount());
+                    BigDecimal buy = BigDecimal.valueOf(it.getBuy_amount());
+                    sum = sum.add(sell.subtract(buy));
+                }
+            }
+
+            log.info("Realized PnL for {}: {}", d, sum);
+            return sum;
+        } catch (Exception e) {
+            log.warn("getRealizedPnlToday failed: {}", e.toString());
+            return BigDecimal.ZERO;
+        }
+    }
+
 }

@@ -1,6 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
+import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
@@ -10,7 +11,6 @@ import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
 import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -45,8 +45,7 @@ public class DecisionService {
      * - Index key: "NSE_INDEX|Nifty 50"
      * - Derivatives root: "NFO:NIFTY50-INDEX"
      */
-    @Value("${trade.nifty-underlying-key:NSE_INDEX|Nifty 50}")
-    private String niftyUnderlyingKey;
+    private final String niftyUnderlyingKey = Underlyings.NIFTY;
 
     /**
      * Primary endpoint for RegimeDecisionCard.

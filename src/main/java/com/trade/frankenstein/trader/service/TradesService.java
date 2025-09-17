@@ -17,9 +17,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.util.Locale;
-import java.util.Objects;
-import java.util.Optional;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 @Service
 @RequiredArgsConstructor
@@ -61,7 +61,7 @@ public class TradesService {
                 Sort.Order.desc("updatedAt"),
                 Sort.Order.desc("createdAt"))));
 
-        java.util.List<Trade> out = new java.util.ArrayList<Trade>(data.getNumberOfElements());
+        List<Trade> out = new ArrayList<>(data.getNumberOfElements());
         for (Trade t : data.getContent()) {
             if (status != null && status != nzs(t.getStatus())) continue;
             if (side != null && side != nzSide(t.getSide())) continue;
@@ -80,6 +80,75 @@ public class TradesService {
         Optional<Trade> t = tradeRepo.findById(tradeId);
         return t.map(Result::ok)
                 .orElseGet(() -> Result.fail("NOT_FOUND", "Trade not found: " + tradeId));
+    }
+
+    // ------------------------------------------------------------------------------
+    // Why? / Explain (used by RecentTradesCard action)
+    // ------------------------------------------------------------------------------
+
+    @Transactional(readOnly = true)
+    public Result<String> explain(String tradeId) {
+        if (isBlank(tradeId)) return Result.fail("BAD_REQUEST", "tradeId is required");
+        Optional<Trade> tOpt = tradeRepo.findById(tradeId);
+        if (!tOpt.isPresent()) return Result.fail("NOT_FOUND", "Trade not found: " + tradeId);
+
+        Trade t = tOpt.get();
+        if (t.getExplain() != null && !t.getExplain().trim().isEmpty()) {
+            // Preserve explicitly stored human reason if present
+            return Result.ok(t.getExplain());
+        }
+
+        // Compose a concise, deterministic fallback explanation
+        String sym = safe(t.getSymbol());
+        String side = (t.getSide() == null ? "—" : t.getSide().name());
+        Integer qty = (t.getQuantity() == null ? 0 : t.getQuantity());
+        double entry = t.getEntryPrice();
+        Double cur = (t.getCurrentPrice() == 0.0 ? null : t.getCurrentPrice());
+
+        String entryTs = formatIst(t.getEntryTime());
+        String exitTs = formatIst(t.getExitTime());
+
+        StringBuilder sb = new StringBuilder(128);
+        sb.append(sym).append(" • ").append(side)
+                .append(" • qty ").append(qty)
+                .append(" • @ ").append(trimDouble(entry));
+        if (entryTs != null) sb.append(" • entered ").append(entryTs);
+
+        if (t.getExitTime() != null) {
+            sb.append(" • exited ").append(exitTs)
+                    .append(" • pnl ").append(trimDouble(t.getPnl()));
+        } else if (cur != null) {
+            double pnl = (t.getSide() == OrderSide.SELL)
+                    ? (entry - cur) * qty
+                    : (cur - entry) * qty;
+            sb.append(" • mark ").append(trimDouble(cur))
+                    .append(" • mtm ").append(trimDouble(pnl));
+        }
+
+        String ord = safeNull(t.getOrder_id());
+        String brk = safeNull(t.getBrokerTradeId());
+        if (brk != null || ord != null) {
+            sb.append(" • ").append("src: ");
+            if (brk != null) sb.append("tradeId=").append(brk);
+            if (brk != null && ord != null) sb.append(", ");
+            if (ord != null) sb.append("orderId=").append(ord);
+        }
+
+        return Result.ok(sb.toString());
+    }
+
+    private static String formatIst(Instant ts) {
+        if (ts == null) return null;
+        return DateTimeFormatter.ofPattern("dd MMM HH:mm", Locale.ENGLISH)
+                .withZone(ZoneId.of("Asia/Kolkata"))
+                .format(ts);
+    }
+
+    private static String trimDouble(double d) {
+        // simple compact formatting for prices/pnl
+        return (Math.abs(d) >= 1000)
+                ? String.format(Locale.ENGLISH, "%.0f", d)
+                : String.format(Locale.ENGLISH, "%.2f", d);
     }
 
     // ------------------------------------------------------------------------------
@@ -109,7 +178,7 @@ public class TradesService {
                     Trade existing = existingOpt.get();
                     boolean changed = false;
 
-                    Integer newQty = Integer.valueOf(td.getQuantity());
+                    Integer newQty = td.getQuantity();
                     if (!Objects.equals(existing.getQuantity(), newQty)) {
                         existing.setQuantity(newQty);
                         changed = true;
@@ -172,7 +241,7 @@ public class TradesService {
     private Trade mapFrom(OrderTradesResponse.TradeData td) {
         String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrument_token(), "—");
         OrderSide side = parseSide(safeNull(td.getTransaction_type()));
-        Integer qty = Integer.valueOf(td.getQuantity());
+        Integer qty = td.getQuantity();
         double avgPrice = td.getAverage_price();
         Instant ts = parseInstant(safeNull(td.getOrder_timestamp()));
 
@@ -180,12 +249,12 @@ public class TradesService {
                 .id(null) // Mongo will assign
                 .order_id(safeNull(td.getOrder_id()))
                 .brokerTradeId(safeNull(td.getTrade_id()))
-                .symbol(sym)
+                .symbol(sym) // may be human symbol OR instrument key; we can store both later if needed
                 .side(side)
                 .quantity(qty)
                 .entryPrice(avgPrice)
-                .currentPrice(avgPrice) // initialize = entry; later a ticker can update
-                .pnl(0.0)               // compute later when exit or mark-to-market
+                .currentPrice(avgPrice) // initial = entry; updated later by mark-to-market flow
+                .pnl(0.0)
                 .status(TradeStatus.FILLED)
                 .entryTime(ts)
                 .exitTime(null)
@@ -198,20 +267,90 @@ public class TradesService {
     }
 
     // ------------------------------------------------------------------------------
-    // Repo helpers (work even if custom finders aren’t defined)
+    // Repo helpers
     // ------------------------------------------------------------------------------
 
     private Optional<Trade> findByBrokerTradeId(String brokerTradeId) {
+        return tradeRepo.findByBrokerTradeId(brokerTradeId);
+    }
+
+    // ------------------------------------------------------------------------------
+    // Throttle signal for StrategyService: what exposure is already open?
+    // ------------------------------------------------------------------------------
+
+    /**
+     * Returns HAVE_CALL / HAVE_PUT / NONE based on open trades.
+     * Open criteria:
+     * - exitTime == null AND status not in {CLOSED, EXITED, CANCELLED, REJECTED, FAILED}
+     * CE/PE inference:
+     * - from human symbol suffix " CE"/" PE"
+     * - or from Upstox key last segment (e.g., ...|CE or ...|PE)
+     */
+    public Optional<StrategyService.PortfolioSide> getOpenPortfolioSide() {
         try {
-            java.lang.reflect.Method m = tradeRepo.getClass().getMethod("findByBrokerTradeId", String.class);
-            Object r = m.invoke(tradeRepo, brokerTradeId);
-            if (r instanceof Optional) return (Optional<Trade>) r;
-        } catch (Throwable ignored) {
+            Page<Trade> page = tradeRepo.findAll(
+                    PageRequest.of(0, 200, Sort.by(
+                            Sort.Order.desc("updatedAt"),
+                            Sort.Order.desc("createdAt"),
+                            Sort.Order.desc("entryTime")))
+            );
+
+            boolean hasCE = false, hasPE = false;
+
+            for (Trade t : page.getContent()) {
+                if (t == null) continue;
+
+                // Determine if still open
+                TradeStatus st = t.getStatus();
+                String s = (st == null ? "" : st.name());
+                boolean looksClosed = s.equalsIgnoreCase("CLOSED")
+                        || s.equalsIgnoreCase("EXITED")
+                        || s.equalsIgnoreCase("CANCELLED")
+                        || s.equalsIgnoreCase("REJECTED")
+                        || s.equalsIgnoreCase("FAILED");
+                boolean isOpen = (t.getExitTime() == null) && !looksClosed;
+
+                if (!isOpen) continue;
+
+                String leg = inferLegCEorPE(t);
+                if ("CE".equals(leg)) hasCE = true;
+                else if ("PE".equals(leg)) hasPE = true;
+
+                if (hasCE && hasPE) {
+                    // Both present → treat as NONE for throttle (don’t force a hedge)
+                    return Optional.of(StrategyService.PortfolioSide.NONE);
+                }
+            }
+
+            if (hasCE && !hasPE) return Optional.of(StrategyService.PortfolioSide.HAVE_CALL);
+            if (hasPE && !hasCE) return Optional.of(StrategyService.PortfolioSide.HAVE_PUT);
+            return Optional.of(StrategyService.PortfolioSide.NONE);
+        } catch (Throwable t) {
+            return Optional.of(StrategyService.PortfolioSide.NONE);
         }
-        for (Trade t : tradeRepo.findAll()) {
-            if (brokerTradeId.equals(t.getBrokerTradeId())) return Optional.of(t);
+    }
+
+    private static String inferLegCEorPE(Trade t) {
+        String sym = safeNull(t.getSymbol());
+        if (sym == null) return null;
+
+        String u = sym.toUpperCase(Locale.ROOT).trim();
+
+        // Human symbol clues
+        if (u.endsWith(" CE") || u.contains(" CE ")) return "CE";
+        if (u.endsWith(" PE") || u.contains(" PE ")) return "PE";
+
+        // Upstox instrument key: ...|...|...|...|CE| or ...|PE
+        if (u.contains("|")) {
+            String[] parts = u.split("\\|");
+            if (parts.length >= 2) {
+                String last = parts[parts.length - 1].trim();
+                if ("CE".equals(last)) return "CE";
+                if ("PE".equals(last)) return "PE";
+            }
         }
-        return Optional.empty();
+
+        return null;
     }
 
     // ------------------------------------------------------------------------------

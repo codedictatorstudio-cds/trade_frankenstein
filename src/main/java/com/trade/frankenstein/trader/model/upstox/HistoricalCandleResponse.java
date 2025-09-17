@@ -19,22 +19,8 @@ public class HistoricalCandleResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class CandleData {
-        private List<Candle> candles;
+    public static class CandleData {
+        private List<List<Object>> candles;
 
     }
-
-    @Data
-    @AllArgsConstructor
-    @NoArgsConstructor
-    public class Candle {
-        private long timestamp;
-        private double open;
-        private double high;
-        private double low;
-        private double close;
-        private int volume;
-        private double openInterest;
-    }
-
 }

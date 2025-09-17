@@ -23,11 +23,13 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,6 +47,15 @@ public class NewsService {
     private MarketSentimentSnapshotRepo sentimentRepo;
     @Autowired
     private StreamGateway stream;
+
+    private int defaultBurstWindowMin = 10;
+
+    private static final int MAX_BUFFER_EVENTS = 2000; // ring buffer cap
+
+    /**
+     * In-memory rolling log of recent news events (append-only, auto-pruned).
+     */
+    private final Deque<NewsEvent> newsEvents = new ConcurrentLinkedDeque<>();
 
     // -------------------- Config --------------------
     private List<String> feedUrls = Arrays.asList(TradeNewsConstants.NEWS_URLS);
@@ -910,4 +921,65 @@ public class NewsService {
     public void clearCache() {
         resultCache.clear();
     }
+
+    public Optional<Integer> getRecentBurstCount(int minutes) {
+        try {
+            final int winMin = minutes > 0 ? minutes : Math.max(1, defaultBurstWindowMin);
+            final Instant now = Instant.now();
+            final Duration window = Duration.ofMinutes(winMin);
+
+            // Purge old entries beyond a reasonable cap (>= window, up to 3 hours)
+            final Duration purgeHorizon = window.compareTo(Duration.ofHours(3)) > 0 ? window : Duration.ofHours(3);
+            while (true) {
+                NewsEvent head = newsEvents.peekFirst();
+                if (head == null) break;
+                if (Duration.between(head.ts, now).compareTo(purgeHorizon) > 0) {
+                    newsEvents.pollFirst();
+                } else {
+                    break;
+                }
+            }
+
+            // Count events within the requested window (iterate newest→oldest; early break when older)
+            int count = 0;
+            for (Iterator<NewsEvent> it = newsEvents.descendingIterator(); it.hasNext(); ) {
+                NewsEvent e = it.next();
+                if (Duration.between(e.ts, now).compareTo(window) <= 0) {
+                    count++;
+                } else {
+                    // older than window; since list is time-ordered, we can stop
+                    break;
+                }
+            }
+            return Optional.of(count);
+        } catch (Throwable t) {
+            return Optional.of(0);
+        }
+    }
+
+
+    private static class NewsEvent {
+        final Instant ts;
+        final String source;
+        final String symbol;
+        final String category;
+
+        NewsEvent(Instant ts, String source, String symbol, String category) {
+            this.ts = ts;
+            this.source = source;
+            this.symbol = symbol;
+            this.category = category;
+        }
+    }
+
+    /**
+     * Call this from your NewsIngestJob when a news item is ingested.
+     */
+    public void recordNewsEvent(String source, String symbol, String category, Instant publishedAt) {
+        Instant ts = publishedAt != null ? publishedAt : Instant.now();
+        newsEvents.addLast(new NewsEvent(ts, source, symbol, category));
+        // ring-buffer trim
+        while (newsEvents.size() > MAX_BUFFER_EVENTS) newsEvents.pollFirst();
+    }
+
 }

@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,9 +33,7 @@ public class NewsIngestJob {
     private final AtomicLong successfulIngests = new AtomicLong(0);
 
     private boolean newsEnabled = TradeNewsConstants.NEWS_ENABLED;
-
     private boolean marketHoursOnly = TradeNewsConstants.NEWS_MARKET_HOURS_ONLY;
-
     private String marketTimezone = TradeNewsConstants.NEWS_MARKET_TIMEZONE;
 
     /**
@@ -65,12 +64,17 @@ public class NewsIngestJob {
                         (data == null ? null : data.getSentiment()),
                         (data == null ? null : data.getConfidence()));
 
+                // --- NEW: feed SentimentService window and broadcast via its refresh() ---
                 try {
-                    // Trigger emission via SentimentService pathway (SSE)
-                    Result<?> s = sentimentService.getNow();
-                    if (s.isOk()) lastSuccessfulEmit.set(System.currentTimeMillis());
+                    if (data != null && data.getSentiment() != null) {
+                        sentimentService.recordSentimentSample(
+                                BigDecimal.valueOf(Double.valueOf(data.getSentiment())));
+                    }
+                    // Persist a fresh snapshot and emit SSE (sentiment.update)
+                    sentimentService.refresh();
+                    lastSuccessfulEmit.set(System.currentTimeMillis());
                 } catch (Throwable t) {
-                    log.warn("Failed to emit sentiment update: {}", t.getMessage());
+                    log.warn("Failed to feed/emit sentiment after news ingest: {}", t.getMessage());
                 }
             } else {
                 log.warn("News ingest failed: {}", result.getError());

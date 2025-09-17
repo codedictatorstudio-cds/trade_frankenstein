@@ -6,11 +6,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import java.time.DayOfWeek;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.*;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @Slf4j
@@ -25,9 +27,21 @@ public class OrdersService {
     @Autowired
     private UpstoxTradeMode tradeMode;
 
-    // =========================================================================
-    // WRITE ops (gated by market hours) --------------------------------------
-    // =========================================================================
+    @Autowired
+    private UpstoxService upstoxService;
+    @Autowired
+    private AdviceService adviceService; // only used to extract orderId from response
+
+    private String defaultProduct = "MIS";
+
+    private String defaultValidity = "DAY";
+
+    private int workingTtlMinutes = 120;
+
+    /**
+     * Minimal in-memory tracker so isOrderWorking() has a fallback even if broker status isn't queried here.
+     */
+    private final Map<String, Instant> workingOrders = new ConcurrentHashMap<>();
 
     /**
      * Place an order; market-hours gated unless AMO=true or testMode=true.
@@ -330,4 +344,151 @@ public class OrdersService {
         }
         return false;
     }
+
+    /**
+     * Guard: abort if 1m bar spread is too wide relative to close.
+     * Uses OHLC live API as a proxy for bid/ask when depth is unavailable.
+     */
+    public boolean preflightSlippageGuard(String instrumentKey, BigDecimal maxSpreadPct) {
+        try {
+            OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "1minute");
+            OHLC_Quotes.OHLCData d = q.getData().get(instrumentKey);
+            if (d == null || d.getLive_ohlc() == null) return true; // can't evaluate → allow
+            double hi = d.getLive_ohlc().getHigh();
+            double lo = d.getLive_ohlc().getLow();
+            double cl = d.getLive_ohlc().getClose();
+            if (cl <= 0) return false;
+            double spread = (hi - lo) / cl;
+            return BigDecimal.valueOf(spread).compareTo(maxSpreadPct) <= 0;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    // --- Add to OrdersService.java ---
+
+    public Result<PlaceOrderResponse> placeTargetOrder(String instrumentKey, int qty, BigDecimal targetPrice) {
+        try {
+            if (!tradeMode.isSandBox() && !isMarketOpenNowIst()) {
+                return Result.fail("MARKET_CLOSED", "Market is closed for placing target orders");
+            }
+            if (instrumentKey == null || instrumentKey.trim().isEmpty() || qty <= 0 || targetPrice == null) {
+                return Result.fail("BAD_REQUEST", "instrumentKey/qty/price are required");
+            }
+            PlaceOrderResponse r = upstox.placeTargetOrder(instrumentKey, qty, targetPrice);
+            try {
+                stream.send("order.placed", r);
+            } catch (Throwable ignored) {
+                log.info( "stream send failed" );
+            }
+            return Result.ok(r);
+        } catch (Throwable t) {
+            log.error("placeTargetOrder failed", t);
+            return Result.fail(t);
+        }
+    }
+
+    public Result<PlaceOrderResponse> placeStopLossOrder(String instrumentKey, int qty, BigDecimal triggerPrice) {
+        try {
+            if (!tradeMode.isSandBox() && !isMarketOpenNowIst()) {
+                return Result.fail("MARKET_CLOSED", "Market is closed for placing stop-loss orders");
+            }
+            if (instrumentKey == null || instrumentKey.trim().isEmpty() || qty <= 0 || triggerPrice == null) {
+                return Result.fail("BAD_REQUEST", "instrumentKey/qty/trigger are required");
+            }
+            PlaceOrderResponse r = upstox.placeStopLossOrder(instrumentKey, qty, triggerPrice);
+            try {
+                stream.send("order.placed", r);
+            } catch (Throwable ignored) {
+            }
+            return Result.ok(r);
+        } catch (Throwable t) {
+            log.error("placeStopLossOrder failed", t);
+            return Result.fail(t);
+        }
+    }
+
+    public Result<ModifyOrderResponse> amendOrderPrice(String orderId, BigDecimal newPrice) {
+        try {
+            if (!tradeMode.isSandBox() && !isMarketOpenNowIst()) {
+                return Result.fail("MARKET_CLOSED", "Market is closed for modifying orders");
+            }
+            if (orderId == null || orderId.trim().isEmpty() || newPrice == null) {
+                return Result.fail("BAD_REQUEST", "orderId/newPrice are required");
+            }
+            ModifyOrderResponse r = upstox.amendOrderPrice(orderId, newPrice);
+            try {
+                stream.send("order.modified", r);
+            } catch (Throwable ignored) {
+            }
+            return Result.ok(r);
+        } catch (Throwable t) {
+            log.error("amendOrderPrice failed", t);
+            return Result.fail(t);
+        }
+    }
+
+    public Result<Boolean> isOrderWorking(String orderId) {
+        try {
+            if (orderId == null || orderId.trim().isEmpty()) {
+                return Result.fail("BAD_REQUEST", "orderId is required");
+            }
+            boolean working = upstox.isOrderWorking(orderId);
+            return Result.ok(working);
+        } catch (Throwable t) {
+            log.error("isOrderWorking failed", t);
+            return Result.fail(t);
+        }
+    }
+
+
+    private void markWorking(String orderId) {
+        if (orderId != null) workingOrders.put(orderId, Instant.now());
+    }
+
+    // Optional utility: mid-price approximation using 1m OHLC (falls back to LTP if needed)
+    public Optional<BigDecimal> getBidAskMid(String instrumentKey) {
+        try {
+            // Prefer 1-minute OHLC mid as a proxy when depth isn't available here
+            var ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "1minute");
+            var d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
+            if (d != null && d.getLive_ohlc() != null) {
+                double hi = d.getLive_ohlc().getHigh();
+                double lo = d.getLive_ohlc().getLow();
+                if (hi > 0 && lo > 0) {
+                    return Optional.of(BigDecimal.valueOf((hi + lo) / 2.0).setScale(2, RoundingMode.HALF_UP));
+                }
+            }
+            // Fallback: LTP
+            var ltp = upstoxService.getMarketLTPQuote(instrumentKey);
+            double px = ltp.getData().get(instrumentKey).getLast_price();
+            return px > 0 ? Optional.of(BigDecimal.valueOf(px).setScale(2, RoundingMode.HALF_UP)) : Optional.empty();
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
+    }
+
+    // Optional utility: spread % using 1m OHLC as a proxy ( (H-L)/Close )
+    public Optional<BigDecimal> getSpreadPct(String instrumentKey) {
+        try {
+            var ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "1minute");
+            var d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
+            if (d == null || d.getLive_ohlc() == null) return Optional.empty();
+            double hi = d.getLive_ohlc().getHigh();
+            double lo = d.getLive_ohlc().getLow();
+            double cl = d.getLive_ohlc().getClose();
+            if (hi <= 0 || lo <= 0 || cl <= 0) return Optional.empty();
+            double pct = (hi - lo) / cl;
+            return Optional.of(BigDecimal.valueOf(pct).setScale(4, RoundingMode.HALF_UP));
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
+    }
+
+    // Optional: record external order ids as "working" so isOrderWorking() returns true for a while
+    public void recordOrder(String orderId) {
+        if (orderId != null) workingOrders.put(orderId, Instant.now());
+    }
+
+
 }

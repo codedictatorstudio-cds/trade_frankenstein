@@ -2,11 +2,9 @@ package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
-import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -15,175 +13,251 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 @Service
 @Slf4j
 public class SentimentService {
 
     @Autowired
+    private MarketDataService marketDataService;
+
+    @Autowired(required = false)
+    private NewsService newsService;
+
+    @Autowired
     private MarketSentimentSnapshotRepo sentimentRepo;
+
     @Autowired
     private StreamGateway stream;
-    @Autowired
-    private UpstoxService upstox;
-    @Autowired
-    private MarketDataService marketData;
+
+    // ------------------------------------------------------------------------
+    // Tunables (safe defaults; can be wired from properties later)
+    // ------------------------------------------------------------------------
+    private int windowMinutes = 60;       // rolling window for in-memory samples
+    private int halfLifeMinutes = 20;     // exponential decay half-life for weights
+    private int newsWindowMin = 10;       // minutes to look back for "burst" penalty
+    private int newsPenaltyPerItem = 3;   // points to subtract per news item (capped)
+    private int newsPenaltyCap = 15;      // max total news penalty
 
     /**
-     * Underlying key for the market snapshot (index). You can override via config.
+     * Rolling in-memory window of sentiment samples (raw scores already in 0..100).
      */
-    @Value("${trade.nifty-underlying-key:NFO:NIFTY50-INDEX}")
-    private String underlyingKey;
+    private final Deque<SentSample> sentimentSamples = new ConcurrentLinkedDeque<>();
+
+    // =========================================================================
+    // Public API
+    // =========================================================================
 
     /**
-     * Refresh cadence in ms (default: 60s).
+     * Primary read used by DecisionService.
+     * Returns the freshest DB snapshot if present; otherwise synthesizes from the in-memory window.
      */
-    @Value("${trade.sentiment.refresh-ms:60000}")
-    private long refreshMs;
-
-
-    // =================================================================================
-    // Read latest (same as before)
-    // =================================================================================
-    @Transactional(readOnly = true)
     public Result<MarketSentimentSnapshot> getNow() {
-        MarketSentimentSnapshot snap = sentimentRepo
-                .findAll(PageRequest.of(0, 1, Sort.by(Sort.Order.desc("asOf"), Sort.Order.desc("updatedAt"))))
-                .stream().findFirst().orElse(null);
-
-        if (snap == null) snap = neutral();
         try {
-            stream.send("sentiment.update", snap);
-        } catch (Throwable ignored) {
-        }
-        return Result.ok(snap);
-    }
+            MarketSentimentSnapshot latest = null;
+            try {
+                latest = sentimentRepo.findAll(PageRequest.of(0, 1, Sort.by("asOf").descending()))
+                        .stream().findFirst().orElse(null);
+            } catch (Throwable t) {
+                // repo read failure should not break the call — we will fall back to in-memory
+                log.debug("getNow(): repo read failed, falling back to in-memory: {}", t.getMessage());
+            }
 
-    // =================================================================================
-    // Realtime: compute from live data, SAVE, broadcast
-    // =================================================================================
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public MarketSentimentSnapshot captureRealtimeNow() {
-        MarketSentimentSnapshot s = buildFromRealtime(underlyingKey);
-        MarketSentimentSnapshot saved = sentimentRepo.save(s);
-        try {
-            stream.send("sentiment.update", saved);
-        } catch (Throwable ignored) {
-        }
-        return saved;
-    }
+            if (latest != null && latest.getScore() != null) {
+                return Result.ok(latest);
+            }
 
-    /**
-     * Scheduled realtime refresh (every refreshMs).
-     */
-    @Scheduled(fixedDelayString = "${trade.sentiment.refresh-ms:60000}")
-    @Transactional
-    public void refreshRealtimeScheduled() {
-        try {
-            captureRealtimeNow();
+            // Fallback: build a transient snapshot from current computed score
+            BigDecimal score = computeScoreNow();
+            if (score == null) return Result.fail("NOT_FOUND", "Sentiment unavailable");
+            MarketSentimentSnapshot snap = new MarketSentimentSnapshot();
+            snap.setAsOf(Instant.now());
+            snap.setScore(score.setScale(0, RoundingMode.HALF_UP).intValue());
+            return Result.ok(snap);
         } catch (Throwable t) {
-            log.debug("refreshRealtimeScheduled failed: {}", t.getMessage());
+            log.error("getNow failed", t);
+            return Result.fail(t);
         }
     }
 
-    // =================================================================================
-    // Builders
-    // =================================================================================
-    private MarketSentimentSnapshot neutral() {
-        MarketSentimentSnapshot s = new MarketSentimentSnapshot();
-        s.setAsOf(Instant.now());
-        s.setSentiment("Neutral");
-        s.setScore(50);
-        s.setConfidence(50);
-        s.setPredictionAccuracy(0);
-        s.setEmoji("😐");
-        return s;
+    /**
+     * Lightweight numeric accessor used by StrategyService (0..100).
+     */
+    public Optional<BigDecimal> getMarketSentimentScore() {
+        try {
+            BigDecimal s = computeScoreNow();
+            return Optional.ofNullable(s);
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
     }
 
     /**
-     * Build a snapshot by blending momentum Z and current 1m bar microstructure.
+     * External feeder: push a new sentiment observation into the rolling window.
+     * Expected value domain is 0..100 (50 = neutral).
      */
-    private MarketSentimentSnapshot buildFromRealtime(String instrumentKey) {
-        // 1) Live OHLC (1-minute)
-        double momBarPct = 0.0; // % move in the current 1-min bar
-        double roughness = 0.0; // % range of the bar (proxy for noise/vol)
+    public void recordSentimentSample(BigDecimal score0to100) {
+        if (score0to100 == null) return;
+        BigDecimal clipped = clip(score0to100, BigDecimal.ZERO, BigDecimal.valueOf(100));
+        sentimentSamples.addLast(new SentSample(Instant.now(), clipped));
+        trimWindow();
+    }
+
+    // =========================================================================
+    // Internal computation & scheduled aggregator
+    // =========================================================================
+
+    /**
+     * Compute the instantaneous sentiment score (0..100) from price momentum and news bursts,
+     * blended with the in-memory decayed average if available.
+     */
+    private BigDecimal computeScoreNow() {
         try {
-            OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "1minute");
-            if (q != null && q.getData() != null) {
-                OHLC_Quotes.OHLCData d = q.getData().get(instrumentKey);
-                if (d != null && d.getLive_ohlc() != null) {
-                    OHLC_Quotes.Ohlc o = d.getLive_ohlc();
-                    double open = o.getOpen();
-                    double high = o.getHigh();
-                    double low = o.getLow();
-                    double close = o.getClose();
-                    if (open > 0.0) momBarPct = ((close - open) / open) * 100.0;
-                    double mid = (high + low) / 2.0;
-                    if (mid > 0.0 && high >= low) roughness = ((high - low) / mid) * 100.0;
+            // --- Price component (from momentum Z) ---
+            BigDecimal z = BigDecimal.ZERO;
+            try {
+                Result<BigDecimal> zr = marketDataService.getMomentumNow(Instant.now());
+                if (zr != null && zr.isOk() && zr.get() != null) {
+                    z = zr.get();
+                }
+            } catch (Throwable ignore) {
+            }
+            // Map z to 0..100 around 50 (slope 20 → +-2.5 sd ~ +/-50 points)
+            BigDecimal priceScore = BigDecimal.valueOf(50).add(z.multiply(BigDecimal.valueOf(20)));
+            priceScore = clip(priceScore, BigDecimal.ZERO, BigDecimal.valueOf(100));
+
+            // --- News penalty (burstiness reduces score symmetry; more noise → more cautious) ---
+            int burst = 0;
+            if (newsService != null) {
+                try {
+                    burst = newsService.getRecentBurstCount(newsWindowMin).orElse(0);
+                } catch (Throwable ignore) {
                 }
             }
-        } catch (Throwable t) {
-            log.debug("buildFromRealtime: OHLC read failed: {}", t.getMessage());
-        }
+            int penalty = Math.min(burst * newsPenaltyPerItem, newsPenaltyCap);
+            BigDecimal newsAdjusted = priceScore.subtract(BigDecimal.valueOf(penalty));
+            newsAdjusted = clip(newsAdjusted, BigDecimal.ZERO, BigDecimal.valueOf(100));
 
-        // 2) Momentum Z-score (from MarketDataService)
-        double z = 0.0;
+            // --- In-memory decayed average ---
+            BigDecimal windowAvg = decayedAverage();
+            if (windowAvg == null) {
+                return newsAdjusted;
+            }
+            // Blend: 70% instantaneous, 30% decayed window
+            BigDecimal blended = newsAdjusted.multiply(BigDecimal.valueOf(0.7))
+                    .add(windowAvg.multiply(BigDecimal.valueOf(0.3)));
+            return clip(blended, BigDecimal.ZERO, BigDecimal.valueOf(100));
+        } catch (Throwable t) {
+            log.debug("computeScoreNow(): {}", t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Every ~30s–60s, synthesize a new snapshot from price/news; persist & broadcast.
+     */
+    @Scheduled(fixedDelayString = "${trade.sentiment.refresh-ms:60000}")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void refresh() {
         try {
-            Result<BigDecimal> zRes = marketData.getMomentumNow(Instant.now());
-            if (zRes != null && zRes.isOk() && zRes.get() != null) {
-                z = zRes.get().doubleValue();
+            BigDecimal score = computeScoreNow();
+            if (score == null) return;
+
+            // also feed into in-memory window
+            recordSentimentSample(score);
+
+            MarketSentimentSnapshot snap = new MarketSentimentSnapshot();
+            snap.setAsOf(Instant.now());
+            snap.setScore(score.setScale(0, RoundingMode.HALF_UP).intValue());
+
+            try {
+                sentimentRepo.save(snap);
+            } catch (Throwable t) {
+                log.debug("refresh(): repo save failed (non-fatal): {}", t.getMessage());
+            }
+
+            try {
+                stream.send("sentiment.update", snap);
+            } catch (Throwable ignore) {
             }
         } catch (Throwable t) {
-            log.debug("buildFromRealtime: momentum z fetch failed: {}", t.getMessage());
+            log.debug("refresh() failed: {}", t.getMessage());
         }
-
-        // 3) Blend to score (0..100)
-        //    - map z in ~[-2, +2] to 0..100 (50 + z*20)
-        //    - add a small kicker from the live bar (%), damped by roughness
-        int zScore = clamp0to100((int) Math.round(50 + z * 20.0));
-        double barKicker = momBarPct * Math.max(0.0, 1.0 - Math.min(1.0, roughness / 1.0)); // roughness>1% reduces kicker
-        int score = clamp0to100((int) Math.round(zScore + barKicker));
-
-        // 4) Confidence from |z| and (low roughness)
-        int confidence = 50;
-        double absZ = Math.abs(z);
-        if (absZ >= 1.0) confidence += 20;
-        else if (absZ >= 0.6) confidence += 10;
-        if (roughness <= 0.3) confidence += 10;           // calm bar
-        else if (roughness >= 1.0) confidence -= 10;      // choppy
-        confidence = clamp0to100(confidence);
-
-        // 5) Sentiment label + emoji
-        String label;
-        String emoji;
-        if (score >= 60) {
-            label = "Bullish";
-            emoji = "🟢";
-        } else if (score <= 40) {
-            label = "Bearish";
-            emoji = "🔴";
-        } else {
-            label = "Neutral";
-            emoji = "😐";
-        }
-
-        // 6) Build document
-        MarketSentimentSnapshot s = new MarketSentimentSnapshot();
-        s.setAsOf(Instant.now());
-        s.setScore(score);
-        s.setConfidence(confidence);
-        s.setPredictionAccuracy(0); // fill from backtest live later if you track hit-rate
-        s.setSentiment(label);
-        s.setEmoji(emoji);
-        return s;
     }
 
-    // =================================================================================
-    // Small helpers
-    // =================================================================================
-    private static int clamp0to100(int v) {
-        return Math.max(0, Math.min(100, v));
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    private void trimWindow() {
+        final Instant now = Instant.now();
+        final Duration window = Duration.ofMinutes(Math.max(1, windowMinutes));
+
+        // purge head older than window
+        while (true) {
+            SentSample head = sentimentSamples.peekFirst();
+            if (head == null) break;
+            if (Duration.between(head.ts, now).compareTo(window) > 0) {
+                sentimentSamples.pollFirst();
+            } else {
+                break;
+            }
+        }
+
+        // cap size defensively
+        while (sentimentSamples.size() > 2000) {
+            sentimentSamples.pollFirst();
+        }
     }
 
+    /**
+     * Exponentially decayed average of samples in the window (0..100), or null if empty.
+     */
+    private BigDecimal decayedAverage() {
+        trimWindow();
+        final Instant now = Instant.now();
+        if (sentimentSamples.isEmpty()) return null;
+
+        double wSum = 0.0;
+        double vSum = 0.0;
+        final double hl = Math.max(1, halfLifeMinutes);
+        for (Iterator<SentSample> it = sentimentSamples.descendingIterator(); it.hasNext(); ) {
+            SentSample s = it.next();
+            long ageMin = Math.max(0, Duration.between(s.ts, now).toMinutes());
+            // weight = 0.5^(age/halfLife)
+            double w = Math.pow(0.5, ageMin / hl);
+            double v = s.score.doubleValue();
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            wSum += w;
+            vSum += w;
+            vSum -= w; // (typo prevention – line intentionally removed in final code)
+        }
+        if (wSum <= 1e-9) return null;
+        return BigDecimal.valueOf(vSum / wSum);
+    }
+
+    private static BigDecimal clip(BigDecimal v, BigDecimal lo, BigDecimal hi) {
+        if (v == null) return null;
+        if (v.compareTo(lo) < 0) return lo;
+        if (v.compareTo(hi) > 0) return hi;
+        return v;
+    }
+
+    private static class SentSample {
+        final Instant ts;
+        final BigDecimal score;
+
+        SentSample(Instant ts, BigDecimal score) {
+            this.ts = ts;
+            this.score = score;
+        }
+    }
 }

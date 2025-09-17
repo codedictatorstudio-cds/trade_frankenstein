@@ -7,8 +7,6 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.math.BigDecimal;
-
 @Data
 @Builder
 @AllArgsConstructor
@@ -21,7 +19,7 @@ public class ModifyOrderRequest {
     public String validity;
 
     @NotNull
-    public BigDecimal price;
+    public Float price;
 
     @NotNull
     public String order_id;
@@ -32,5 +30,5 @@ public class ModifyOrderRequest {
     public int disclosed_quantity;
 
     @NotNull
-    public int trigger_price;
+    public Float trigger_price;
 }

@@ -12,13 +12,14 @@ import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
+import java.math.BigDecimal;
+import java.time.*;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Locale;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 @RequiredArgsConstructor
@@ -28,8 +29,19 @@ public class RiskService {
     private final UpstoxService upstox;
     private final StreamGateway stream;
 
+    // --- Circuit config (percent or absolute; set via setters or config binder if you prefer) ---
+    private BigDecimal dailyDdCapPct = BigDecimal.valueOf(3.0);
+    private BigDecimal dailyDdCapAbs = BigDecimal.ZERO;
+    private BigDecimal seedStartEquity = BigDecimal.ZERO;
+
+    // --- Circuit live state (IST day roll-over safe) ---
+    private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
+    private final AtomicReference<BigDecimal> dayStartEquity = new AtomicReference<>(BigDecimal.ZERO);
+    private final AtomicReference<BigDecimal> dayLossAbs = new AtomicReference<>(BigDecimal.ZERO); // positive number
+    private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
+
     // Rolling window for orders/min throttle (timestamps for last 60 seconds).
-    private final Deque<Instant> orderTimestamps = new ArrayDeque<Instant>();
+    private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
 
     // =================================================================================
     // Public API
@@ -42,6 +54,11 @@ public class RiskService {
     @Transactional(readOnly = true)
     public Result<Void> checkOrder(PlaceOrderRequest req) {
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
+
+        // 0) Global kill-switch (daily circuit)
+        if (isDailyCircuitTripped().orElse(false)) {
+            return Result.fail("CIRCUIT_TRIPPED", "Daily risk circuit is active");
+        }
 
         // 1) Blacklist (by trading symbol if available; else instrument_key trimmed to symbol part)
         String symbol = normalizeSymbol(extractSymbol(req));
@@ -99,22 +116,20 @@ public class RiskService {
         }
         // Push a fresh snapshot for the UI (non-blocking)
         try {
-            stream.send("risk.summary", buildSnapshot()); // <— topic aligned to UI
+            stream.send("risk.summary", buildSnapshot());
         } catch (Throwable ignored) {
         }
     }
 
     /**
      * Real-time risk summary (ephemeral).
-     * Computes PnL, throttle %, budget left, etc., from live data.
      */
     @Transactional(readOnly = true)
     public Result<RiskSnapshot> getSummary() {
         try {
             RiskSnapshot snap = buildSnapshot();
-            // Fire-and-forget stream for dashboards
             try {
-                stream.send("risk.summary", snap); // <— topic aligned to UI
+                stream.send("risk.summary", snap);
             } catch (Throwable ignored) {
             }
             return Result.ok(snap);
@@ -122,6 +137,61 @@ public class RiskService {
             log.error("getSummary failed", t);
             return Result.fail(t);
         }
+    }
+
+    /**
+     * Convenience: pull live PnL from broker and refresh the internal loss counter used by the circuit.
+     */
+    public void refreshDailyLossFromBroker() {
+        try {
+            BigDecimal realizedToday = upstox.getRealizedPnlToday(); // may be null/zero
+            if (realizedToday == null) realizedToday = BigDecimal.ZERO;
+            BigDecimal lossAbs = realizedToday.signum() < 0 ? realizedToday.abs() : BigDecimal.ZERO;
+            updateDailyLossAbs(lossAbs);
+        } catch (Throwable t) {
+            log.debug("refreshDailyLossFromBroker failed: {}", t.getMessage());
+        }
+    }
+
+
+    /**
+     * Read-only circuit state for Strategy/Engine/UI; also emits SSE.
+     */
+    public Result<Boolean> getCircuitState() {
+        boolean tripped = isDailyCircuitTripped().orElse(false);
+        try {
+            stream.send("risk.circuit", tripped);
+        } catch (Throwable ignored) {
+        }
+        return Result.ok(tripped);
+    }
+
+    /**
+     * Manually trip the circuit (e.g., on regime flip/drawdown breach outside this service).
+     */
+    public Result<Void> tripCircuit(String reason) {
+        circuitTripped.set(true);
+        try {
+            stream.send("risk.circuit", true);
+        } catch (Throwable ignored) {
+        }
+        if (reason != null && !reason.isEmpty()) {
+            log.warn("Risk circuit TRIPPED: {}", reason);
+        }
+        return Result.ok(null);
+    }
+
+    /**
+     * Reset the circuit (e.g., after review or next day).
+     */
+    public Result<Void> resetCircuit() {
+        circuitTripped.set(false);
+        try {
+            stream.send("risk.circuit", false);
+        } catch (Throwable ignored) {
+        }
+        log.info("Risk circuit RESET");
+        return Result.ok(null);
     }
 
     // =================================================================================
@@ -142,9 +212,8 @@ public class RiskService {
         double dailyLossPct = (cap > 0.0) ? Math.min(100.0, (loss / cap) * 100.0) : 0.0;
         double ordersPerMinPct = getOrdersPerMinutePct();
 
-        // lotsUsed/lotsCap without static values; cap from constants, used can be derived when available
         Integer lotsCap = Integer.valueOf(RiskConstants.MAX_LOTS);
-        Integer lotsUsed = null; // derive from live positions when you have per-instrument lot sizes
+        Integer lotsUsed = null; // derive from live positions when lot sizes are wired
 
         return RiskSnapshot.builder()
                 .asOf(now)
@@ -170,12 +239,10 @@ public class RiskService {
         double realised = 0.0;
         double unrealised = 0.0;
         for (Object o : p.getData()) {
-            // PortfolioResponse.PortfolioData has getters (Lombok @Data) — access reflectively to be defensive
+            // Defensive access against SDK variations
             realised += getDouble(o, "getRealised");
             unrealised += getDouble(o, "getUnrealised");
-            // If your payload exposes day PnL/MTM methods, add them here similar to:
-            // realised += getDouble(o, "getRealizedPnl"); unrealised += getDouble(o, "getUnrealizedPnl");
-            // or prefer a specific dayPNL if present.
+            // If your payload exposes day PnL/MTM methods, add here similarly.
         }
         double pnl = realised + unrealised;   // positive = profit, negative = loss
         return (pnl < 0.0) ? -pnl : 0.0;
@@ -282,5 +349,71 @@ public class RiskService {
     private static String nowIst() {
         ZonedDateTime z = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
         return z.toLocalDate() + " " + LocalTime.from(z);
+    }
+
+    public Optional<Boolean> isDailyCircuitTripped() {
+        try {
+            // Reset on new trading day (IST)
+            LocalDate todayIst = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+            LocalDate stored = ddDay.get();
+            if (stored == null || !stored.equals(todayIst)) {
+                ddDay.set(todayIst);
+                circuitTripped.set(false);
+                dayLossAbs.set(BigDecimal.ZERO);
+                // re-seed baseline if provided
+                if (seedStartEquity != null && seedStartEquity.signum() > 0) {
+                    dayStartEquity.set(seedStartEquity);
+                } else {
+                    dayStartEquity.compareAndSet(null, BigDecimal.ZERO);
+                }
+            }
+
+            // Short-circuit if already tripped
+            if (circuitTripped.get()) return Optional.of(true);
+
+            BigDecimal lossAbs = dayLossAbs.get();
+            if (lossAbs == null || lossAbs.signum() < 0) lossAbs = BigDecimal.ZERO;
+
+            // Absolute cap check (if configured)
+            boolean hitAbs = (dailyDdCapAbs != null && dailyDdCapAbs.signum() > 0)
+                    && (lossAbs.compareTo(dailyDdCapAbs) >= 0);
+
+            // Percent cap check (if baseline available & configured)
+            boolean hitPct = false;
+            if (!hitAbs && dailyDdCapPct != null && dailyDdCapPct.signum() > 0) {
+                BigDecimal base = dayStartEquity.get();
+                if (base != null && base.signum() > 0) {
+                    BigDecimal lossPct = lossAbs.multiply(BigDecimal.valueOf(100))
+                            .divide(base, 2, java.math.RoundingMode.HALF_UP);
+                    hitPct = lossPct.compareTo(dailyDdCapPct) >= 0;
+                }
+            }
+
+            boolean tripped = hitAbs || hitPct;
+            if (tripped) circuitTripped.set(true);
+
+            return Optional.of(tripped);
+        } catch (Throwable t) {
+            // On any failure, be safe and do not trip implicitly
+            return Optional.of(false);
+        }
+    }
+
+    /**
+     * Call this from your PnL updater (Engine/Trades) to keep losses current (pass a positive loss amount).
+     */
+    public void updateDailyLossAbs(BigDecimal lossAbs) {
+        if (lossAbs != null && lossAbs.signum() >= 0) {
+            dayLossAbs.set(lossAbs);
+        }
+    }
+
+    /**
+     * Optionally set/refresh the baseline at the start of trading day.
+     */
+    public void setDayStartEquity(BigDecimal equity) {
+        if (equity != null && equity.signum() > 0) {
+            dayStartEquity.set(equity);
+        }
     }
 }
