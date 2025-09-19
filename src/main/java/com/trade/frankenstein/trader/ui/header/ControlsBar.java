@@ -1,5 +1,6 @@
 package com.trade.frankenstein.trader.ui.header;
 
+import com.trade.frankenstein.trader.service.UpstoxTradeMode;
 import com.vaadin.flow.component.*;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
@@ -199,6 +200,12 @@ public class ControlsBar extends HorizontalLayout {
             modeGroup.getStyle().set("border-color", sandbox ? INFO : DANGER);
             UI ui = UI.getCurrent();
             if (ui != null) ComponentUtil.fireEvent(ui, new ModeChangedEvent(this, false, sandbox));
+            UpstoxTradeMode mode = UpstoxTradeMode.getInstance();
+            if (killBtn.isVisible()){
+                mode.updateTradeMode("live");
+            } else {
+                mode.updateTradeMode("sandbox");
+            }
         });
 
         Div wrap = new Div(modeGroup);
@@ -272,13 +279,12 @@ public class ControlsBar extends HorizontalLayout {
     private HorizontalLayout createStatusBadges() {
         engineStatus = badge("Engine: NOT STARTED", "err");
         feedsStatus = badge("Feeds: —", "warn");
-        ordersStatus = badge("Orders: —", "warn");
 
         Icon icon = VaadinIcon.TASKS.create();
         icon.setSize("18px");
         icon.addClassName("section-icon");
 
-        HorizontalLayout pills = new HorizontalLayout(engineStatus, feedsStatus, ordersStatus);
+        HorizontalLayout pills = new HorizontalLayout(engineStatus, feedsStatus);
         pills.setPadding(false);
         pills.setSpacing(false);
         pills.setAlignItems(Alignment.CENTER);
@@ -371,35 +377,6 @@ public class ControlsBar extends HorizontalLayout {
                         else                  cmp.$server._setFeedsState('ok');    // fresh -> OK
                       }, 5000);
                     """, getElement()));
-
-
-            // Orders: flip OK on order/trade SSE; fallback poll /api/orders every 30s
-            getUI().ifPresent(ui -> ui.getPage().executeJs("""
-                      const cmp = $0;
-                      function ok(){ cmp.$server._setOrdersState('ok'); }
-                    
-                      // Listen to the actual topics emitted by backend
-                      ['order.placed','order.modified','order.cancelled',
-                       'orders.created','trade.created','trade.updated'
-                      ].forEach(ev => addEventListener(ev, ok));
-                    
-                      // Fallback ping — a plain 200 is good enough to call it 'OK'
-                      async function pingOrders(){
-                        try{
-                          const r = await fetch('/api/orders', {credentials:'include'});
-                          if(r.ok)        cmp.$server._setOrdersState('ok');
-                          else if(r.status===401 || r.status===403)
-                                          cmp.$server._setOrdersState('warn'); // auth/session issue
-                          else            cmp.$server._setOrdersState('err');  // server/downstream issue
-                        }catch(_){
-                          cmp.$server._setOrdersState('err');
-                        }
-                      }
-                      pingOrders();
-                      if(window.__ordersPoll){ clearInterval(window.__ordersPoll); }
-                      window.__ordersPoll = setInterval(pingOrders, 30000);
-                    """, getElement()));
-
         });
     }
 
@@ -431,11 +408,6 @@ public class ControlsBar extends HorizontalLayout {
     public void updateFeedStatus(String status, String state) {
         feedsStatus.setText("Feeds: " + status);
         applyBadgeState(feedsStatus, state);
-    }
-
-    public void updateOrderStatus(String status, String state) {
-        ordersStatus.setText("Orders: " + status);
-        applyBadgeState(ordersStatus, state);
     }
 
     /**
@@ -623,12 +595,6 @@ public class ControlsBar extends HorizontalLayout {
     private void _setFeedsState(String state) {
         String st = normalizeState(state);
         updateFeedStatus(labelFor(st), st);
-    }
-
-    @ClientCallable
-    private void _setOrdersState(String state) {
-        String st = normalizeState(state);
-        updateOrderStatus(labelFor(st), st);
     }
 
     private String normalizeState(String raw) {

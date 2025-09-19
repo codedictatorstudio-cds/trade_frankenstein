@@ -20,7 +20,7 @@ public class PnLReportResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PnLReportItem {
+    public static class PnLReportItem {
         private int quantity;
         private String isin;
         private String scrip_name;
@@ -34,12 +34,12 @@ public class PnLReportResponse {
     }
 
     @Data
-    public class PnLReportMetadata {
+    public static class PnLReportMetadata {
         private PnLReportPage page;
     }
 
     @Data
-    public class PnLReportPage {
+    public static class PnLReportPage {
         private int page_number;
         private int page_size;
     }

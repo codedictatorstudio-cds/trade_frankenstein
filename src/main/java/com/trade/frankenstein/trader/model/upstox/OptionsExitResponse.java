@@ -19,14 +19,14 @@ public class OptionsExitResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OrderIdsData {
+    public static class OrderIdsData {
         private List<String> order_ids;
     }
 
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class Summary {
+    public static class Summary {
         private int total;
         private int success;
         private int error;

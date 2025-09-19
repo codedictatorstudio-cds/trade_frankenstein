@@ -65,9 +65,9 @@ public class SentimentService {
             try {
                 latest = sentimentRepo.findAll(PageRequest.of(0, 1, Sort.by("asOf").descending()))
                         .stream().findFirst().orElse(null);
-            } catch (Throwable t) {
+            } catch (Exception t) {
                 // repo read failure should not break the call — we will fall back to in-memory
-                log.debug("getNow(): repo read failed, falling back to in-memory: {}", t.getMessage());
+                log.error("getNow(): repo read failed, falling back to in-memory: {}", t);
             }
 
             if (latest != null && latest.getScore() != null) {
@@ -81,7 +81,7 @@ public class SentimentService {
             snap.setAsOf(Instant.now());
             snap.setScore(score.setScale(0, RoundingMode.HALF_UP).intValue());
             return Result.ok(snap);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getNow failed", t);
             return Result.fail(t);
         }
@@ -94,7 +94,8 @@ public class SentimentService {
         try {
             BigDecimal s = computeScoreNow();
             return Optional.ofNullable(s);
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("getMarketSentimentScore(): {}", t);
             return Optional.empty();
         }
     }
@@ -127,7 +128,8 @@ public class SentimentService {
                 if (zr != null && zr.isOk() && zr.get() != null) {
                     z = zr.get();
                 }
-            } catch (Throwable ignore) {
+            } catch (Exception ignore) {
+                log.error("computeScoreNow(): marketDataService.getMomentumNow() failed: {}", ignore);
             }
             // Map z to 0..100 around 50 (slope 20 → +-2.5 sd ~ +/-50 points)
             BigDecimal priceScore = BigDecimal.valueOf(50).add(z.multiply(BigDecimal.valueOf(20)));
@@ -138,7 +140,8 @@ public class SentimentService {
             if (newsService != null) {
                 try {
                     burst = newsService.getRecentBurstCount(newsWindowMin).orElse(0);
-                } catch (Throwable ignore) {
+                } catch (Exception ignore) {
+                    log.error("computeScoreNow(): newsService.getRecentBurstCount() failed: {}", ignore);
                 }
             }
             int penalty = Math.min(burst * newsPenaltyPerItem, newsPenaltyCap);
@@ -154,8 +157,8 @@ public class SentimentService {
             BigDecimal blended = newsAdjusted.multiply(BigDecimal.valueOf(0.7))
                     .add(windowAvg.multiply(BigDecimal.valueOf(0.3)));
             return clip(blended, BigDecimal.ZERO, BigDecimal.valueOf(100));
-        } catch (Throwable t) {
-            log.debug("computeScoreNow(): {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("computeScoreNow(): {}", t);
             return null;
         }
     }
@@ -179,16 +182,17 @@ public class SentimentService {
 
             try {
                 sentimentRepo.save(snap);
-            } catch (Throwable t) {
-                log.debug("refresh(): repo save failed (non-fatal): {}", t.getMessage());
+            } catch (Exception t) {
+                log.error("refresh(): repo save failed (non-fatal): {}", t);
             }
 
             try {
                 stream.send("sentiment.update", snap);
-            } catch (Throwable ignore) {
+            } catch (Exception ignore) {
+                log.error("refresh(): stream send failed (non-fatal): {}", ignore);
             }
-        } catch (Throwable t) {
-            log.debug("refresh() failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("refresh() failed: {}", t);
         }
     }
 

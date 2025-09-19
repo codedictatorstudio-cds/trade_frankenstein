@@ -30,8 +30,6 @@ public class AdviceService {
     @Autowired
     private StreamGateway stream;
 
-    // =========================== Queries ===========================
-
     @Transactional(readOnly = true)
     public Result<List<Advice>> list() {
         try {
@@ -39,8 +37,8 @@ public class AdviceService {
                     .findAll(PageRequest.of(0, 100, Sort.by("createdAt").descending()))
                     .getContent();
             return Result.ok(advs);
-        } catch (Throwable t) {
-            log.warn("advice.list failed", t);
+        } catch (Exception t) {
+            log.error("advice.list failed", t);
             return Result.fail(t);
         }
     }
@@ -53,13 +51,11 @@ public class AdviceService {
             }
             Optional<Advice> opt = adviceRepo.findById(adviceId);
             return opt.map(Result::ok).orElseGet(() -> Result.fail("NOT_FOUND", "Advice not found"));
-        } catch (Throwable t) {
-            log.warn("advice.get({}) failed", adviceId, t);
+        } catch (Exception t) {
+            log.error("advice.get({}) failed", adviceId, t);
             return Result.fail(t);
         }
     }
-
-    // =========================== Mutations ===========================
 
     /**
      * Persist a new Advice and emit advice.new
@@ -77,14 +73,17 @@ public class AdviceService {
             // direct timestamp setters (no reflection)
             draft.setCreatedAt(Instant.now());
             draft.setUpdatedAt(Instant.now());
+            // AdviceService.create(...) — before saving:
+            assertReadyForCreationOrExecution(draft);
 
             Advice saved = adviceRepo.save(draft);
 
             // stream entity directly (no mapper)
             stream.send("advice.new", saved);
+
             return Result.ok(saved);
-        } catch (Throwable t) {
-            log.warn("advice.create failed", t);
+        } catch (Exception t) {
+            log.error("advice.create failed", t);
             return Result.fail(t);
         }
     }
@@ -124,14 +123,16 @@ public class AdviceService {
             a.setUpdatedAt(Instant.now());
 
             Advice saved = adviceRepo.save(a);
+            // AdviceService.execute(...) — after fetching the entity and before placing the order:
+            assertReadyForCreationOrExecution(a);
 
             // stream entity directly (no mapper)
             stream.send("advice.updated", saved);
 
             log.info("advice.execute: placed order {} for {}", orderId, a.getSymbol());
             return Result.ok(saved);
-        } catch (Throwable t) {
-            log.warn("advice.execute failed", t);
+        } catch (Exception t) {
+            log.error("advice.execute failed", t);
             return Result.fail(t);
         }
     }
@@ -155,8 +156,8 @@ public class AdviceService {
 
             stream.send("advice.updated", saved);
             return Result.ok(saved);
-        } catch (Throwable t) {
-            log.warn("advice.dismiss failed", t);
+        } catch (Exception t) {
+            log.error("advice.dismiss failed", t);
             return Result.fail(t);
         }
     }
@@ -189,8 +190,8 @@ public class AdviceService {
         if (resp == null) return null;
         try {
             return resp.getData().getOrder_ids().stream().findFirst().orElse(null);
-        } catch (Throwable t) {
-            log.warn("extractOrderId failed", t);
+        } catch (Exception t) {
+            log.error("extractOrderId failed", t);
             return null;
         }
     }
@@ -207,8 +208,24 @@ public class AdviceService {
             String s = String.valueOf(v).trim();
             if (s.isEmpty()) return null;
             return new BigDecimal(s);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             return null;
         }
     }
+
+    // AdviceService.java — add this helper
+    private void assertReadyForCreationOrExecution(Advice a) {
+        if (a == null) throw new IllegalArgumentException("Advice is null");
+        if (a.getInstrument_token() == null || a.getInstrument_token().trim().isEmpty())
+            throw new IllegalStateException("instrumentToken is required on Advice");
+        if (a.getSymbol() == null || a.getSymbol().trim().isEmpty())
+            throw new IllegalStateException("tradingSymbol is required on Advice");
+        if (a.getOrder_type() == null || a.getOrder_type().trim().isEmpty())
+            throw new IllegalStateException("orderType is required on Advice");
+        if (a.getTransaction_type() == null)
+            throw new IllegalStateException("transactionType (BUY/SELL) is required on Advice");
+        if (a.getQuantity() <= 0)
+            throw new IllegalStateException("quantity must be > 0 on Advice");
+    }
+
 }

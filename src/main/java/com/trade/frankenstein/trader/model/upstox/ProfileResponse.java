@@ -19,7 +19,7 @@ public class ProfileResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class ProfileData {
+    public static class ProfileData {
         private String email;
         private List<String> exchanges;
         private List<String> products;

@@ -19,7 +19,7 @@ public class TradeChargesResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class Taxes {
+    public static class Taxes {
         private double gst;
         private double stt;
         private double stamp_duty;
@@ -28,7 +28,7 @@ public class TradeChargesResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class Charges {
+    public static class Charges {
         private Double transaction;
         private Double clearing;
         private Double ipft;

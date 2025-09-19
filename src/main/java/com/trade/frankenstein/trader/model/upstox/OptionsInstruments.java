@@ -19,7 +19,7 @@ public class OptionsInstruments {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OptionInstrument {
+    public static class OptionInstrument {
         private String name;
         private String segment;
         private String exchange;

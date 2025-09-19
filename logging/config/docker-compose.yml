@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  loki:
+    image: grafana/loki:2.9.4
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports: ["3100:3100"]
+    volumes:
+      - ./loki-config.yml:/etc/loki/local-config.yml:ro
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      # CHANGE the host path to your app log directory
+      - E:\tradefrankenstein\tradefrankenstein\logging:/logs:ro
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro

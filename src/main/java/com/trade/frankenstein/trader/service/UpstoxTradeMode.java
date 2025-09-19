@@ -8,8 +8,23 @@ import org.springframework.stereotype.Component;
 @Slf4j
 public class UpstoxTradeMode {
 
+    private static UpstoxTradeMode instance;
+
     @Value("${trade.mode}")
     private String mode;
+
+    // Private constructor to prevent instantiation
+    private UpstoxTradeMode() {
+        // Default constructor - Spring will populate the mode value
+    }
+
+    // Static method to get the instance
+    public static synchronized UpstoxTradeMode getInstance() {
+        if (instance == null) {
+            instance = new UpstoxTradeMode();
+        }
+        return instance;
+    }
 
     public String getTradeMode() {
         log.info("Trade Mode: {}", mode);

@@ -15,13 +15,13 @@ public class FundsResponse {
     private FundsData data;
 
     @Data
-    public class FundsData {
+    public static class FundsData {
         private FundDetails equity;
         private FundDetails commodity;
     }
 
     @Data
-    public class FundDetails {
+    public static class FundDetails {
         private double used_margin;
         private double payin_amount;
         private double span_margin;

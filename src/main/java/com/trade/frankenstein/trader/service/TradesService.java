@@ -161,8 +161,8 @@ public class TradesService {
         OrderTradesResponse resp;
         try {
             resp = upstoxService.getTradesForDay();
-        } catch (Throwable t) {
-            log.info("reconcileToday: getTradesForDay failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("reconcileToday: getTradesForDay failed: {}", t);
             return;
         }
         if (resp == null || resp.getData() == null || resp.getData().isEmpty()) return;
@@ -219,13 +219,14 @@ public class TradesService {
                         Trade saved = tradeRepo.save(existing);
                         try {
                             stream.send("trade.updated", saved);
-                        } catch (Throwable ignored) {
+                        } catch (Exception ignored) {
+                            log.error("reconcileToday: stream send trade.updated failed", ignored);
                         }
                     }
                     continue;
                 }
-            } catch (Throwable ignored) {
-                // fall through to create
+            } catch (Exception ignored) {
+                log.error("reconcileToday: update existing trade failed", ignored);
             }
 
             // Create new Trade doc
@@ -233,7 +234,8 @@ public class TradesService {
             Trade saved = tradeRepo.save(t);
             try {
                 stream.send("trade.created", saved);
-            } catch (Throwable ignored) {
+            } catch (Exception ignored) {
+                log.error("reconcileToday: stream send trade.created failed", ignored);
             }
         }
     }
@@ -325,7 +327,7 @@ public class TradesService {
             if (hasCE && !hasPE) return Optional.of(StrategyService.PortfolioSide.HAVE_CALL);
             if (hasPE && !hasCE) return Optional.of(StrategyService.PortfolioSide.HAVE_PUT);
             return Optional.of(StrategyService.PortfolioSide.NONE);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return Optional.of(StrategyService.PortfolioSide.NONE);
         }
     }
@@ -406,7 +408,7 @@ public class TradesService {
     private static Instant parseInstant(String iso) {
         try {
             return (iso == null) ? null : Instant.parse(iso);
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
             return null;
         }
     }

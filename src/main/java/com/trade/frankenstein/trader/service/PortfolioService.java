@@ -38,7 +38,7 @@ public class PortfolioService {
                 return Result.fail("NOT_FOUND", "No live portfolio data");
             }
             return Result.ok(p);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getPortfolio failed", t);
             return Result.fail(t);
         }
@@ -52,7 +52,7 @@ public class PortfolioService {
                 return Result.fail("NOT_FOUND", "No live holdings data");
             }
             return Result.ok(h);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getHoldings failed", t);
             return Result.fail(t);
         }
@@ -144,7 +144,7 @@ public class PortfolioService {
                     countedLines
             );
             return Result.ok(summary);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getPortfolioSummary failed", t);
             return Result.fail(t);
         }
@@ -167,7 +167,7 @@ public class PortfolioService {
             BigDecimal day = sumRes.get().getDayPnl();
             if (day == null) return Result.ok(BigDecimal.ZERO);
             return Result.ok(day.signum() < 0 ? day.abs() : BigDecimal.ZERO);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getDayPnlAbsNow failed", t);
             return Result.fail(t);
         }
@@ -186,7 +186,7 @@ public class PortfolioService {
             BigDecimal total = sumRes.get().getTotalPnl();
             if (total == null) return Result.ok(BigDecimal.ZERO);
             return Result.ok(total.signum() < 0 ? total.abs() : BigDecimal.ZERO);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getTotalPnlAbsNow failed", t);
             return Result.fail(t);
         }
@@ -232,7 +232,7 @@ public class PortfolioService {
             }
 
             return Result.ok(lots);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getOpenLotsForUnderlying failed", t);
             return Result.fail(t);
         }
@@ -247,7 +247,7 @@ public class PortfolioService {
             upstox.getShortTermPositions();
             upstox.getLongTermHoldings();
             return Result.ok(null);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("refreshFromBroker failed", t);
             return Result.fail(t);
         }

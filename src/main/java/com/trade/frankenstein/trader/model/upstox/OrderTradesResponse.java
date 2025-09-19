@@ -19,7 +19,7 @@ public class OrderTradesResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class TradeData {
+    public static class TradeData {
         private String exchange;
         private String product;
         private String trading_symbol;

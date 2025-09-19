@@ -73,13 +73,13 @@ public class NewsIngestJob {
                     // Persist a fresh snapshot and emit SSE (sentiment.update)
                     sentimentService.refresh();
                     lastSuccessfulEmit.set(System.currentTimeMillis());
-                } catch (Throwable t) {
-                    log.warn("Failed to feed/emit sentiment after news ingest: {}", t.getMessage());
+                } catch (Exception t) {
+                    log.error("Failed to feed/emit sentiment after news ingest: {}", t);
                 }
             } else {
-                log.warn("News ingest failed: {}", result.getError());
+                log.error("News ingest failed: {}", result.getError());
             }
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("Error during news ingest job", t);
         }
     }
@@ -108,8 +108,8 @@ public class NewsIngestJob {
         if (marketHoursOnly && !isMarketHoursNow()) return;
         try {
             newsService.preflightValidateFeeds();
-        } catch (Throwable t) {
-            log.warn("Feed health refresh failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("Feed health refresh failed: {}", t.getMessage());
         }
     }
 

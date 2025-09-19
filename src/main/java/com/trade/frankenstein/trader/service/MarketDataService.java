@@ -53,14 +53,14 @@ public class MarketDataService {
             if (instrumentKey == null || instrumentKey.trim().isEmpty()) {
                 return Result.fail("BAD_REQUEST", "instrumentKey is required");
             }
-            OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "1minute");
+            OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
             if (q == null || q.getData() == null || q.getData().get(instrumentKey) == null
                     || q.getData().get(instrumentKey).getLive_ohlc() == null) {
                 return Result.fail("NOT_FOUND", "No live OHLC for " + instrumentKey);
             }
             double close = q.getData().get(instrumentKey).getLive_ohlc().getClose();
             return Result.ok(BigDecimal.valueOf(close));
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getLtp failed", t);
             return Result.fail(t);
         }
@@ -124,7 +124,7 @@ public class MarketDataService {
 
             double z = (last - mean) / std;
             return Result.ok(BigDecimal.valueOf(z).setScale(4, RoundingMode.HALF_UP));
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getMomentumNow failed", t);
             return Result.fail(t);
         }
@@ -147,7 +147,7 @@ public class MarketDataService {
 
             BigDecimal z = BigDecimal.valueOf((last - m) / sd).setScale(4, RoundingMode.HALF_UP);
             return Optional.of(z);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return Optional.empty();
         }
     }
@@ -200,7 +200,7 @@ public class MarketDataService {
     }
 
 
-    private long refreshMs = 15000;
+    private final long refreshMs = 15000;
 
     // Add this field inside the class (e.g., MarketDataService):
     private final Map<String, Object> state = new ConcurrentHashMap<>();
@@ -234,8 +234,8 @@ public class MarketDataService {
             z60.ifPresent(v -> payload.put("z60", v));
 
             stream.send("signals.regime", payload);
-        } catch (Throwable t) {
-            log.debug("broadcastSignalsTick failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("broadcastSignalsTick failed: {}", t);
         }
     }
 
@@ -279,7 +279,7 @@ public class MarketDataService {
             BigDecimal pdl = BigDecimal.valueOf(y.getLow());
 
             return Optional.of(new com.trade.frankenstein.trader.service.StrategyService.PDRange(pdh, pdl));
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return Optional.empty();
         }
     }

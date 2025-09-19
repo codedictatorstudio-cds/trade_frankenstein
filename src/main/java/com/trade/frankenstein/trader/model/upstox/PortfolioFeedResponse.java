@@ -24,7 +24,7 @@ public class PortfolioFeedResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PortfolioFeedOrderPosition {
+    public static class PortfolioFeedOrderPosition {
 
         private String update_type;
         private String instrument_token;
@@ -133,7 +133,7 @@ public class PortfolioFeedResponse {
         @Data
         @AllArgsConstructor
         @NoArgsConstructor
-        public class GTTOrderRule {
+        public static class GTTOrderRule {
             private String strategy;
             private String status;
             private String trigger_type;

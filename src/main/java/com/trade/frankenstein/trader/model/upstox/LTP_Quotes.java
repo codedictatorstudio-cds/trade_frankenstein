@@ -19,7 +19,7 @@ public class LTP_Quotes {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class LTPQuoteData {
+    public static class LTPQuoteData {
         private double last_price;
         private String instrument_token;
         private int ltq;

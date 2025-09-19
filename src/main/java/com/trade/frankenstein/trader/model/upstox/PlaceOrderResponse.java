@@ -20,14 +20,14 @@ public class PlaceOrderResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PlaceOrderData {
+    public static class PlaceOrderData {
         private List<String> order_ids;
     }
 
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PlaceOrderMetadata {
+    public static class PlaceOrderMetadata {
         private int latency;
     }
 

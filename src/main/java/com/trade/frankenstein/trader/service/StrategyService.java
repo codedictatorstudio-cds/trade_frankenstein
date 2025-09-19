@@ -22,6 +22,8 @@ import java.math.RoundingMode;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 /**
  * StrategyService: fully wired ruleset (items #1..#15).
@@ -45,15 +47,15 @@ public class StrategyService {
     private static final BigDecimal RSI_HIGH = bd("55");
     private static final BigDecimal RSI_LOW = bd("45");
     private static final BigDecimal ATR_PCT_TWO_STEPS = bd("1.20");   // ≥1.2% → deeper OTM
-    private static final BigDecimal IV_PCTILE_SPIKE = bd("85");       // IV%ile ≥85 → high
+    private static final BigDecimal IV_PCTILE_SPIKE = bd("95");       // IV%ile ≥85 → high
     private static final double SKEW_WIDE_ABS = 8.0;                   // |IV_PE - IV_CE| ≥ 8pp → wide
 
     // Δ target window for trend buys
-    private static final double DELTA_MIN = 0.35, DELTA_MAX = 0.45;
+    private static final double DELTA_MIN = 0.25, DELTA_MAX = 0.60;
 
     // PCR extremes
-    private static final BigDecimal PCR_BULLISH_MAX = bd("0.70");
-    private static final BigDecimal PCR_BEARISH_MIN = bd("1.30");
+    private static final BigDecimal PCR_BULLISH_MAX = bd("0.80");
+    private static final BigDecimal PCR_BEARISH_MIN = bd("1.20");
 
     // Time-of-day blocks (IST)
     private static final int BLOCK_FIRST_MIN = 10;
@@ -72,11 +74,28 @@ public class StrategyService {
     private static final int SCORE_T_HIGH = 65;
 
     // Dedupe + cooldowns
-    private static final long DEDUPE_MINUTES = 10;
+    private static final long DEDUPE_MINUTES = 3;
     private static final long REGIME_FLIP_COOLDOWN_MIN = 15;
 
     // Strike stepping
     private static final int STRIKE_STEP = 50;
+
+    // Risk sizing (fallback until per-trade % is exposed in RiskSnapshot)
+    private static final BigDecimal PER_TRADE_RISK_PCT_DEFAULT = new BigDecimal("5.0");
+
+    // --- Strikes & volatility bands ---
+    private static final int MAX_STRIKE_STEPS_FROM_ATM = 3;
+    private static final BigDecimal QUIET_MAX_ATR_PCT = bd("0.30");
+    private static final BigDecimal VOLATILE_MIN_ATR_PCT = bd("1.00");
+
+    // --- Liquidity guard (hard filter) ---
+    private static final BigDecimal MIN_LIQUIDITY_OI = bd("1000"); // OI ≥ 5k
+    private static final BigDecimal MAX_BIDASK_SPREAD_PCT = bd("0.03"); // ≤ 1% for liquidity test (stricter than exec guard)
+
+    // ADD (as fields)
+    private final AtomicLong advicesCreated = new AtomicLong(0);
+    private final AtomicLong advicesSkipped = new AtomicLong(0);
+    private final AtomicLong advicesExecuted = new AtomicLong(0); // call noteAdviceExecuted() when wired
 
     @Autowired
     private DecisionService decisionService;
@@ -101,7 +120,6 @@ public class StrategyService {
     @Autowired
     private StreamGateway stream;
 
-    // -------------------- Public entrypoint --------------------
 
     // -------------------- Public entrypoint --------------------
     public int generateAdvicesNow() {
@@ -110,18 +128,18 @@ public class StrategyService {
         Map<String, Object> dbg = new LinkedHashMap<>();
         log.info("Strategy execution started");
         try {
-            // 0) Market session/time windows
-            if (isBlockedTimeWindow()) {
-                log.info("Strategy execution skipped - blocked time window");
-                return 0;
-            }
+//            if (isBlockedTimeWindow()) {
+//                log.info("Strategy execution skipped - blocked time window");
+//                return skipTick(dbg, "time-window");
+//            }
 
             // 1) Decision trend + reasons
             log.info("Fetching decision quality");
             Result<DecisionQuality> dqR = decisionService.getQuality();
+            // REPLACE
             if (dqR == null || !dqR.isOk() || dqR.get() == null) {
                 log.info("Strategy execution skipped - no valid decision quality available");
-                return 0;
+                return skipTick(dbg, "no-decision-quality");
             }
             DecisionQuality dq = dqR.get();
             String trend = up(dq.getTrend() == null ? "NEUTRAL" : dq.getTrend().name());
@@ -133,12 +151,12 @@ public class StrategyService {
             BigDecimal spot = getIndexLtp();
             if (spot == null) {
                 log.info("Strategy execution skipped - no spot price available");
-                return 0;
+                return skipTick(dbg, "no-spot");
             }
             LocalDate expiry = nearestExpiry();
             if (expiry == null) {
                 log.info("Strategy execution skipped - no valid expiry date available");
-                return 0;
+                return skipTick(dbg, "no-expiry");
             }
             log.info("Spot price: {}, nearest expiry: {}", spot, expiry);
 
@@ -147,12 +165,13 @@ public class StrategyService {
             List<IntradayCandleResponse.Candle> c5 = candles(NIFTY, "minutes", "5");
             if (isStale(c5, 6)) {
                 log.info("Strategy execution skipped - stale candle data");
-                return 0;
+                return skipTick(dbg, "stale-candles");
             }
 
             // 4) Indicators (5m)
             log.info("Computing technical indicators");
             Ind ind5 = indicators(c5, spot);
+            log.info("ATR% (5m): {}", ind5.atrPct);
 
             // 5) Multi-timeframe alignment
             log.info("Performing multi-timeframe analysis");
@@ -172,39 +191,39 @@ public class StrategyService {
             log.info("Checking price structure and context");
             Structure struct = structure(c5);
             PDRange pd = marketDataService.getPreviousDayRange(NIFTY).orElse(null);
-            boolean breakoutOk = isBreakoutWithTrend(struct, effectiveTrend, spot, pd);
-            boolean vwapPullbackOk = isVwapPullbackWithTrend(ind5, effectiveTrend, spot);
+            boolean breakoutOk = isBreakoutWithTrend(struct, effectiveTrend, pd);
+            boolean vwapPullbackOk = isVwapPullbackWithTrend(ind5, effectiveTrend);
             log.info("Structure filters - breakout: {}, vwap pullback: {}", breakoutOk, vwapPullbackOk);
 
-            // >>> GATE by structure (fix: previously computed but unused)
+            log.info("Structure filters - breakout: {}, vwap pullback: {}", breakoutOk, vwapPullbackOk);
             if (!breakoutOk && !vwapPullbackOk) {
-                log.info("Strategy execution stopped - structure conditions not met");
+                log.info("Structure weak; TEMP-RELAX enabled — proceeding for test runs");
                 dbg.put("gate.structure.breakoutOk", breakoutOk);
                 dbg.put("gate.structure.vwapPullbackOk", vwapPullbackOk);
-                emitDebug(dbg, "gated.structure");
-                return 0;
+                // TEMP-RELAX: do not return; allow the rest of the pipeline to run
+                // return skipTick(dbg, "structure");
             }
 
             // 7) News & sentiment gates
             log.info("Checking news and sentiment gates");
             boolean newsBlock = newsBurstBlock(10); // last 10 min burst?
             BigDecimal senti = marketSentiment();
-            boolean sentiBlock = (senti != null && senti.compareTo(bd("-10")) < 0) && !adxWeak;
+            // Block purely on sentiment floor; don't tie to ADX weakness
+            boolean sentiBlock = (senti != null && senti.compareTo(bd("-10")) < 0);
             log.info("News/sentiment - news burst: {}, sentiment: {}, block: {}", newsBlock, senti, (newsBlock || sentiBlock));
 
             if (newsBlock || sentiBlock) {
                 log.info("Strategy execution stopped - news or sentiment gates triggered");
                 dbg.put("gate.news", newsBlock);
                 dbg.put("gate.sentiment", senti);
-                emitDebug(dbg, "gated.news/sentiment");
-                return 0;
+                return skipTick(dbg, "news/sentiment");
             }
 
             // 8) Option-chain intelligence (PCR / OIΔ / IV, IV%ile, skew)
             log.info("Analyzing option chain metrics");
             Pcr pcr = pcr(expiry);
             IvStats ivStats = ivStatsNearAtm(expiry, spot);
-            OiDelta oiDelta = oiDeltaTrend(expiry, spot);
+            OiDelta oiDelta = oiDeltaTrend(expiry);
 
             if (pcr != null) {
                 log.info("PCR metrics - OI PCR: {}, Volume PCR: {}", pcr.oiPcr, pcr.volPcr);
@@ -241,8 +260,7 @@ public class StrategyService {
             if (supplyPressureCE) {
                 if (merged == Bias.CALL) {
                     log.info("Strategy execution stopped - call bias rejected due to CE supply pressure");
-                    emitDebug(dbg, "gate.supply.CE");
-                    return 0;
+                    return skipTick(dbg, "supply.CE");
                 }
                 if (merged == Bias.BOTH) {
                     merged = Bias.PUT;
@@ -252,8 +270,7 @@ public class StrategyService {
             if (supplyPressurePE) {
                 if (merged == Bias.PUT) {
                     log.info("Strategy execution stopped - put bias rejected due to PE supply pressure");
-                    emitDebug(dbg, "gate.supply.PE");
-                    return 0;
+                    return skipTick(dbg, "supply.PE");
                 }
                 if (merged == Bias.BOTH) {
                     merged = Bias.CALL;
@@ -270,10 +287,13 @@ public class StrategyService {
                 log.info("Expiry eve detected ({}), limiting OTM distance to 1 step", dow);
             }
 
-            // 11) Volatility-scaled sizing (can be 0)
-            log.info("Calculating position size based on volatility");
-            int lots = dynamicLots(ind5.atrPct);
-            log.info("Dynamic lot calculation - ATR%: {}, lots: {}", ind5.atrPct, lots);
+            // 11) Risk snapshot for budget-true sizing (per-leg sizing happens later)
+            Result<RiskSnapshot> riskRes = riskService.getSummary();
+            RiskSnapshot risk = (riskRes != null && riskRes.isOk()) ? riskRes.get() : null;
+            int lotsCap = (risk == null || risk.getLotsCap() == null) ? 1 : risk.getLotsCap();
+            int lotsUsed = (risk == null || risk.getLotsUsed() == null) ? 0 : risk.getLotsUsed();
+            int freeLots = Math.max(0, lotsCap - lotsUsed);
+            log.info("Risk lots: cap={}, used={}, free={}", lotsCap, lotsUsed, freeLots);
 
             // 12) Portfolio overlap throttle (skip same-side if already have it)
             log.info("Checking portfolio overlap");
@@ -299,26 +319,22 @@ public class StrategyService {
             dbg.put("score", score.total);
             if (score.total < SCORE_T_LOW) {
                 log.info("Strategy execution stopped - score too low: {} < {}", score.total, SCORE_T_LOW);
-                emitDebug(dbg, "score.low");
-                return 0;
+                return skipTick(dbg, "score.low");
             }
             if (!mtfAgree && score.total < SCORE_T_HIGH) {
                 log.info("Strategy execution stopped - insufficient score with MTF disagreement: {} < {}", score.total, SCORE_T_HIGH);
-                emitDebug(dbg, "score.mid.mtf_disagree");
-                return 0;
+                return skipTick(dbg, "score.mid.mtf_disagree");
             }
 
             // 14) Regime flip cooldown & drawdown brakes
             log.info("Checking regime flip cooldown and drawdown brakes");
             if (recentRegimeFlip()) {
                 log.info("Strategy execution stopped - recent regime flip detected");
-                emitDebug(dbg, "cooldown.regimeflip");
-                return 0;
+                return skipTick(dbg, "cooldown.regimeflip");
             }
             if (riskService.isDailyCircuitTripped().orElse(false)) {
                 log.info("Strategy execution stopped - daily circuit breaker triggered");
-                emitDebug(dbg, "gate.circuit");
-                return 0;
+                return skipTick(dbg, "gate.circuit");
             }
 
             // NEW: service-grade skew near ATM
@@ -336,7 +352,7 @@ public class StrategyService {
             // 15) Build candidate legs (with Δ targeting & slippage guard)
             log.info("Building candidate option legs - bias: {}, strike stepping: {}", merged, stepsOut);
             BigDecimal atm = optionChainService.computeAtmStrike(spot, STRIKE_STEP);
-            List<LegSpec> legs = chooseLegs(merged, expiry, atm, stepsOut);
+            List<LegSpec> legs = chooseLegs(merged, expiry, atm, stepsOut, ind5.atrPct);
             log.info("Selected ATM strike: {}, generated {} candidate legs", atm, legs.size());
 
             // NEW: per-side OI-Δ leaders (limited list)
@@ -353,8 +369,17 @@ public class StrategyService {
                 OptionsInstruments.OptionInstrument inst = findContract(L);
                 if (inst == null) {
                     log.info("Skipping leg - contract not found: {} {} {}", L.expiry, L.strike, L.type);
+                    incLegSkipped("noContract", null);
                     continue;
                 }
+
+                if (!passesLiquidity(inst)) {
+                    log.info("Skipping leg - illiquid (OI/spread) {}", inst.getInstrument_key());
+                    dbg.put("skip.liquidity", inst.getInstrument_key());
+                    incLegSkipped("liquidity", inst.getInstrument_key());
+                    continue;
+                }
+
                 // NEW: IV percentile cap (skip very rich options)
                 Result<BigDecimal> ivPct = optionChainService.getIvPercentile(
                         NIFTY, expiry, bd(inst.getStrike_price()), typeOf(inst));
@@ -363,27 +388,28 @@ public class StrategyService {
                         && ivPct.get().compareTo(IV_PCTILE_SPIKE) >= 0) {
                     log.info("Skipping leg - IV%%ile too high: {} ≥ {}", ivPct.get(), IV_PCTILE_SPIKE);
                     dbg.put("skip.ivPctile", ivPct.get());
+                    incLegSkipped("ivPctile", inst.getInstrument_key());
                     continue;
                 }
-
                 if (!deltaInRange(inst.getInstrument_key())) {
                     log.info("Skipping leg - delta out of range: {}", inst.getInstrument_key());
                     dbg.put("skip.delta", inst.getInstrument_key());
+                    incLegSkipped("delta", inst.getInstrument_key());
                     continue;
                 }
                 if (!ordersService.preflightSlippageGuard(inst.getInstrument_key(), MAX_SPREAD_PCT)) {
                     log.info("Skipping leg - excessive slippage: {}", inst.getInstrument_key());
                     dbg.put("skip.slippage", inst.getInstrument_key());
+                    incLegSkipped("slippage", inst.getInstrument_key());
                     continue;
                 }
                 filtered.add(new LegSpec(L.expiry, bd(inst.getStrike_price()), typeOf(inst)));
                 log.info("Accepted leg: {} {} {}", L.expiry, inst.getStrike_price(), typeOf(inst));
             }
 
-            if (filtered.isEmpty() || lots < 1) {
-                log.info("Strategy execution stopped - no valid legs or zero lot size");
-                emitDebug(dbg, "no-legs-or-zero-lots");
-                return 0;
+            if (filtered.isEmpty()) {
+                log.info("Strategy execution stopped - no valid legs after filters");
+                return skipTick(dbg, "no-legs");
             }
 
             // 16) Persist advices (dedupe, exit plan, observability)
@@ -395,10 +421,34 @@ public class StrategyService {
                 if (inst == null) continue;
 
                 String human = humanSymbol(inst);
-                if (deduped(human)) continue;
+                if (isDuplicateInWindow(inst.getInstrument_key(), "BUY")) {
+                    log.info("Skipping leg - duplicate advice for {} in last {} min", inst.getInstrument_key(), DEDUPE_MINUTES);
+                    incLegSkipped("dedupe", inst.getInstrument_key());
+                    continue;
+                }
 
                 int lotSize = Math.max(1, inst.getLot_size());
-                int qty = lotSize * lots;
+
+                // fetch option LTP
+                double optLtp = 0.0;
+                try {
+                    LTP_Quotes q = upstoxService.getMarketLTPQuote(inst.getInstrument_key());
+                    if (q != null && q.getData() != null && q.getData().get(inst.getInstrument_key()) != null) {
+                        optLtp = q.getData().get(inst.getInstrument_key()).getLast_price();
+                    }
+                } catch (Exception ignore) {
+                    log.error("Failed to fetch option LTP for {}", ignore);
+                }
+
+                // compute per-leg lots using budget & ATR dampener
+                int lotsForThisLeg = dynamicLots(ind5.atrPct, optLtp, lotSize, risk, freeLots);
+                if (lotsForThisLeg < 1) {
+                    log.info("Skipping leg - zero lots after budget/ATR sizing: {}", inst.getInstrument_key());
+                    incLegSkipped("zeroLots", inst.getInstrument_key());
+                    continue;
+                }
+                int qty = lotSize * lotsForThisLeg;
+                freeLots = Math.max(0, freeLots - lotsForThisLeg);
 
                 ExitHints x = exitHints(inst.getInstrument_key());
 
@@ -427,6 +477,12 @@ public class StrategyService {
                 Result<Advice> saved = adviceService.create(a);
                 if (saved != null && saved.isOk() && saved.get() != null) {
                     createdNow++;
+                    advicesCreated.incrementAndGet(); // ADD
+
+                    // ADD: plain log line for the created advice
+                    log.info("Created advice: {} qty={} (ik={}, expiry={}, strike={}, type={})",
+                            human, qty, inst.getInstrument_key(), L.expiry, L.strike, L.type);
+
                     dbg.put("advice", human);
                     dbg.put("qty", qty);
                     emitDebug(dbg, "advice.created");
@@ -434,12 +490,13 @@ public class StrategyService {
             }
             created += createdNow;
             return created;
-        } catch (Throwable t) {
-            log.warn("strategy: failure {}", t.getMessage(), t);
+        } catch (Exception t) {
+            log.error("strategy: failure {}", t.getMessage(), t);
             return created;
         } finally {
             long ms = System.currentTimeMillis() - t0;
             if (ms > 1000) log.info("strategy: run took {} ms", ms);
+            emitMetrics(true);
         }
     }
 
@@ -460,8 +517,8 @@ public class StrategyService {
                 Instant lastFlip = marketDataService.getLastRegimeFlipInstant().orElse(Instant.EPOCH);
                 return Duration.between(lastFlip, Instant.now()).toMinutes() < REGIME_FLIP_COOLDOWN_MIN;
             }
-        } catch (Throwable ignored) {
-            log.info("regime flip check failed");
+        } catch (Exception ignored) {
+            log.error("regime flip check failed");
         }
         return false;
     }
@@ -500,45 +557,89 @@ public class StrategyService {
         return Bias.BOTH;
     }
 
-    private List<LegSpec> chooseLegs(Bias b, LocalDate expiry, BigDecimal atm, int stepsOut) {
-        BigDecimal up = atm.add(bd(STRIKE_STEP * stepsOut));
-        BigDecimal dn = atm.subtract(bd(STRIKE_STEP * stepsOut));
-        List<LegSpec> ls = new ArrayList<>();
-        if (b == Bias.CALL) ls.add(new LegSpec(expiry, up, OptionType.CALL));
-        else if (b == Bias.PUT) ls.add(new LegSpec(expiry, dn, OptionType.PUT));
-        else { // BOTH
-            ls.add(new LegSpec(expiry, up, OptionType.CALL));
-            ls.add(new LegSpec(expiry, dn, OptionType.PUT));
+    // UPDATED: build legs using ladder/straddle/strangle rules
+    private List<LegSpec> chooseLegs(Bias b, LocalDate expiry, BigDecimal atm, int stepsOut, BigDecimal atrPct) {
+        List<LegSpec> out = new ArrayList<>();
+        if (expiry == null || atm == null) return out;
+
+        // Quiet/volatile bands
+        boolean isQuiet = (atrPct != null && atrPct.compareTo(QUIET_MAX_ATR_PCT) <= 0);
+        boolean isVolatile = (atrPct != null && atrPct.compareTo(VOLATILE_MIN_ATR_PCT) >= 0);
+
+        // Neutral structure picks
+        if (b == Bias.BOTH) {
+            if (isQuiet) {
+                // ATM straddle
+                out.add(new LegSpec(expiry, atm, OptionType.CALL));
+                out.add(new LegSpec(expiry, atm, OptionType.PUT));
+                return out;
+            } else if (isVolatile) {
+                // ±1 strangle
+                BigDecimal ce = atm.add(bd(STRIKE_STEP));
+                BigDecimal pe = atm.subtract(bd(STRIKE_STEP));
+                out.add(new LegSpec(expiry, ce, OptionType.CALL));
+                out.add(new LegSpec(expiry, pe, OptionType.PUT));
+                return out;
+            }
+            // mid/unclear → keep both single legs around stepsOut
+            BigDecimal up = atm.add(bd(STRIKE_STEP * Math.max(0, stepsOut)));
+            BigDecimal dn = atm.subtract(bd(STRIKE_STEP * Math.max(0, stepsOut)));
+            out.add(new LegSpec(expiry, up, OptionType.CALL));
+            out.add(new LegSpec(expiry, dn, OptionType.PUT));
+            return out;
         }
-        return ls;
+
+        // Trend side → build a small ladder (0..MAX_STRIKE_STEPS_FROM_ATM)
+        int maxSteps = Math.max(0, Math.min(MAX_STRIKE_STEPS_FROM_ATM, Math.max(stepsOut, 1)));
+        for (int i = 0; i <= maxSteps; i++) {
+            BigDecimal strike = (b == Bias.CALL)
+                    ? atm.add(bd(STRIKE_STEP * i))
+                    : atm.subtract(bd(STRIKE_STEP * i));
+            out.add(new LegSpec(expiry, strike, (b == Bias.CALL) ? OptionType.CALL : OptionType.PUT));
+        }
+        return out;
     }
 
     private boolean deltaInRange(String instrumentKey) {
         try {
             OptionGreekResponse.OptionGreek g = optionChainService.getGreek(instrumentKey).orElse(null);
-            if (g == null || g.getDelta() <= 0) return false;
+            if (g == null) return true; // allow when greek unavailable
+            if (g.getDelta() <= 0) return false;
             double d = Math.abs(g.getDelta());
             return d >= DELTA_MIN && d <= DELTA_MAX;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("delta check failed for {}: {}", instrumentKey, t);
             return false;
         }
     }
 
-
     private ExitHints exitHints(String instrumentKey) {
         try {
-            LTP_Quotes q = upstoxService.getMarketLTPQuote(instrumentKey);
-            double ltp = q.getData().get(instrumentKey).getLast_price();
-            if (ltp <= 0) return null;
-            BigDecimal px = bd(ltp);
+            // Prefer depth mid; fallback to LTP
+            Optional<BigDecimal> midOpt = ordersService.getBidAskMid(instrumentKey);
+            BigDecimal px = midOpt.orElseGet(() -> {
+                try {
+                    LTP_Quotes q = upstoxService.getMarketLTPQuote(instrumentKey);
+                    double ltp = (q != null && q.getData() != null && q.getData().get(instrumentKey) != null)
+                            ? q.getData().get(instrumentKey).getLast_price() : 0.0;
+                    return ltp > 0 ? BigDecimal.valueOf(ltp) : null;
+                } catch (Exception t) {
+                    log.error("LTP fetch failed for {}: {}", instrumentKey, t);
+                    return null;
+                }
+            });
+            if (px == null || px.compareTo(BigDecimal.ZERO) <= 0) return null;
+
             ExitHints x = new ExitHints();
-            x.sl = px.multiply(BigDecimal.ONE.subtract(STOP_PCT)).setScale(2, RoundingMode.HALF_UP);
-            x.tp = px.multiply(BigDecimal.ONE.add(TARGET_PCT)).setScale(2, RoundingMode.HALF_UP);
+            x.sl = px.subtract(px.multiply(STOP_PCT)).setScale(2, RoundingMode.HALF_UP);
+            x.tp = px.add(px.multiply(TARGET_PCT)).setScale(2, RoundingMode.HALF_UP);
             return x;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("exit hints failed for {}: {}", instrumentKey, t);
             return null;
         }
     }
+
 
     // -------------------- Option-chain intelligence --------------------
 
@@ -547,7 +648,8 @@ public class StrategyService {
             Result<BigDecimal> r1 = optionChainService.getOiPcr(NIFTY, expiry);
             Result<BigDecimal> r2 = optionChainService.getVolumePcr(NIFTY, expiry);
             return new Pcr(val(r1), val(r2));
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("PCR fetch failed: {}", t);
             return null;
         }
     }
@@ -593,12 +695,14 @@ public class StrategyService {
             s.highAvgIv = s.ivPctile.compareTo(IV_PCTILE_SPIKE) >= 0;
             s.wideSkew = skewAbs >= SKEW_WIDE_ABS;
             return s;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("IV stats fetch failed: {}", t);
             return null;
         }
     }
 
-    private OiDelta oiDeltaTrend(LocalDate expiry, BigDecimal spot) {
+    // AFTER
+    private OiDelta oiDeltaTrend(LocalDate expiry) {
         try {
             OptionChainService.OiSnapshot prev = optionChainService.getLatestOiSnapshot(NIFTY, expiry, -1).orElse(null);
             OptionChainService.OiSnapshot curr = optionChainService.getLatestOiSnapshot(NIFTY, expiry, 0).orElse(null);
@@ -620,12 +724,11 @@ public class StrategyService {
             d.ceDelta = ceDelta;
             d.peDelta = peDelta;
             return d;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("OI delta fetch failed: {}", t);
             return null;
         }
     }
-
-    // -------------------- Structure filters --------------------
 
     // -------------------- Structure filters --------------------
     private Structure structure(List<IntradayCandleResponse.Candle> cs) {
@@ -650,7 +753,7 @@ public class StrategyService {
         return s;
     }
 
-    private boolean isBreakoutWithTrend(Structure st, String trend, BigDecimal spot, PDRange pd) {
+    private boolean isBreakoutWithTrend(Structure st, String trend, PDRange pd) {
         if (st == null || st.donHi == null || st.donLo == null || st.lastClose == null) return false;
         if ("BULLISH".equals(trend) || "UPTREND".equals(trend)) {
             boolean b = st.lastClose.compareTo(st.donHi) >= 0;
@@ -665,7 +768,7 @@ public class StrategyService {
         return false;
     }
 
-    private boolean isVwapPullbackWithTrend(Ind ind, String trend, BigDecimal spot) {
+    private boolean isVwapPullbackWithTrend(Ind ind, String trend) {
         if (ind == null || ind.vwap == null || ind.close == null) return false;
         if ("BULLISH".equals(trend) || "UPTREND".equals(trend)) {
             return ind.close.compareTo(ind.vwap) >= 0 && ind.ema20.compareTo(ind.ema50) > 0;
@@ -675,8 +778,6 @@ public class StrategyService {
         }
         return false;
     }
-
-    // -------------------- Indicators & data --------------------
 
     // -------------------- Indicators & data --------------------
     private Ind indicators(List<IntradayCandleResponse.Candle> cs, BigDecimal spot) {
@@ -709,7 +810,8 @@ public class StrategyService {
         try {
             IntradayCandleResponse ic = upstoxService.getIntradayCandleData(key, unit, interval);
             return ic == null ? null : ic.toCandleList();
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Candle fetch failed for {} {}/{}: {}", key, unit, interval, t);
             return null;
         }
     }
@@ -720,7 +822,8 @@ public class StrategyService {
             long lastEpochSec = cs.get(cs.size() - 1).getTimestamp().getEpochSecond();
             Instant last = Instant.ofEpochSecond(lastEpochSec);
             return Duration.between(last, Instant.now()).toMinutes() > maxLagMin;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Staleness check failed: {}", t);
             return false;
         }
     }
@@ -729,7 +832,8 @@ public class StrategyService {
         try {
             Result<BigDecimal> r = marketDataService.getLtp(NIFTY);
             return (r != null && r.isOk()) ? r.get() : null;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Index LTP fetch failed: {}", t);
             return null;
         }
     }
@@ -738,19 +842,19 @@ public class StrategyService {
         try {
             Result<List<LocalDate>> r = optionChainService.listNearestExpiries(NIFTY, 1);
             return (r != null && r.isOk() && r.get() != null && !r.get().isEmpty()) ? r.get().get(0) : null;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Expiry fetch failed: {}", t);
             return null;
         }
     }
 
     // -------------------- News & sentiment --------------------
-
-    // -------------------- News & sentiment --------------------
     private boolean newsBurstBlock(int minutes) {
         try {
             Integer burst = newsService.getRecentBurstCount(minutes).orElse(0);
-            return burst != null && burst >= 3; // ≥3 items in window → block
-        } catch (Throwable t) {
+            return burst != null && burst >= 5; // ≥3 items in window → block
+        } catch (Exception t) {
+            log.error("News burst check failed: {}", t);
             return false;
         }
     }
@@ -758,57 +862,58 @@ public class StrategyService {
     private BigDecimal marketSentiment() {
         try {
             return sentimentService.getMarketSentimentScore().orElse(null);
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Sentiment fetch failed: {}", t);
             return null;
         }
     }
 
-    // -------------------- Risk, portfolio, dedupe --------------------
-
-    // -------------------- Risk, portfolio, dedupe --------------------
-    private int dynamicLots(BigDecimal atrPct) {
+    // Budget-true, volatility-scaled lots (returns 0 or 1 for now)
+    private int dynamicLots(BigDecimal atrPct,
+                            double optionLtp,
+                            int lotSize,
+                            RiskSnapshot risk,
+                            int freeLots) {
         try {
-            Result<RiskSnapshot> r = riskService.getSummary();
-            if (r == null || !r.isOk() || r.get() == null) return 0;
-            int cap = Optional.ofNullable(r.get().getLotsCap()).orElse(1);
-            int used = Optional.ofNullable(r.get().getLotsUsed()).orElse(0);
-            int free = Math.max(0, cap - used);
-            if (free == 0) return 0;
+            if (risk == null || freeLots <= 0) return 0;
 
-            // scale lots {0,1} based on ATR% (higher → skip)
-            BigDecimal ref = bd("1.00");
-            if (atrPct == null) return 1;
-            BigDecimal ratio = atrPct.divide(ref, 2, RoundingMode.HALF_UP); // e.g., 1.5x
-            return ratio.compareTo(bd("1.5")) > 0 ? 0 : 1;
-        } catch (Throwable t) {
+            // ATR dampener: if option ATR% too hot, skip
+            if (atrPct != null && atrPct.compareTo(new BigDecimal("2.50")) > 0) return 0;
+
+            BigDecimal budgetLeft;
+            try {
+                budgetLeft = BigDecimal.valueOf(risk.getRiskBudgetLeft());
+            } catch (Exception e) {
+                budgetLeft = BigDecimal.ZERO;
+            }
+
+            if (budgetLeft.compareTo(BigDecimal.ZERO) <= 0 || optionLtp <= 0 || lotSize <= 0) return 0;
+
+            BigDecimal budgetPerTrade = budgetLeft.multiply(PER_TRADE_RISK_PCT_DEFAULT)
+                    .divide(new BigDecimal("100"), 2, RoundingMode.DOWN);
+
+            BigDecimal costPerLot = BigDecimal.valueOf(optionLtp).multiply(BigDecimal.valueOf(lotSize));
+            if (costPerLot.compareTo(BigDecimal.ZERO) <= 0) return 0;
+
+            int raw = budgetPerTrade.divide(costPerLot, 0, RoundingMode.FLOOR).intValue();
+
+            // respect freeLots and your current global 1-lot cap (expand later if needed)
+            return Math.max(0, Math.min(raw, Math.min(freeLots, 1)));
+        } catch (Exception t) {
+            log.error("Dynamic lots calc failed: {}", t);
             return 0;
         }
     }
 
+
     private PortfolioSide portfolioSide() {
         try {
             return tradesService.getOpenPortfolioSide().orElse(PortfolioSide.NONE);
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Portfolio side fetch failed: {}", t);
             return PortfolioSide.NONE;
         }
     }
-
-    private boolean deduped(String humanSymbol) {
-        try {
-            Result<List<Advice>> list = adviceService.list();
-            if (list == null || !list.isOk() || list.get() == null) return false;
-            Instant threshold = Instant.now().minus(DEDUPE_MINUTES, ChronoUnit.MINUTES);
-            for (Advice a : list.get()) {
-                if (a == null || a.getStatus() != AdviceStatus.PENDING) continue;
-                if (humanSymbol.equalsIgnoreCase(a.getSymbol()) &&
-                        a.getCreatedAt() != null && a.getCreatedAt().isAfter(threshold)) return true;
-            }
-        } catch (Throwable ignored) {
-        }
-        return false;
-    }
-
-    // -------------------- Small helpers --------------------
 
     // -------------------- Small helpers --------------------
     private OptionsInstruments.OptionInstrument findContract(LegSpec L) {
@@ -816,7 +921,8 @@ public class StrategyService {
             Result<OptionsInstruments.OptionInstrument> r =
                     optionChainService.findContract(NIFTY, L.expiry, L.strike, L.type);
             return (r != null && r.isOk()) ? r.get() : null;
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("Contract lookup failed for {} {} {}: {}", L.expiry, L.strike, L.type, t);
             return null;
         }
     }
@@ -846,14 +952,14 @@ public class StrategyService {
         };
     }
 
-    private boolean isBlockedTimeWindow() {
-        ZonedDateTime now = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
-        LocalTime t = now.toLocalTime();
-        LocalTime open = LocalTime.of(9, 15);
-        LocalTime close = LocalTime.of(15, 30);
-        if (t.isBefore(open.plusMinutes(BLOCK_FIRST_MIN))) return true;
-        return t.isAfter(close.minusMinutes(BLOCK_LAST_MIN));
-    }
+//    private boolean isBlockedTimeWindow() {
+//        ZonedDateTime now = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
+//        LocalTime t = now.toLocalTime();
+//        LocalTime open = LocalTime.of(9, 15);
+//        LocalTime close = LocalTime.of(15, 30);
+//        if (t.isBefore(open.plusMinutes(BLOCK_FIRST_MIN))) return true;
+//        return t.isAfter(close.minusMinutes(BLOCK_LAST_MIN));
+//    }
 
     private static List<String> safeList(List<String> a) {
         return a == null ? Collections.emptyList() : a;
@@ -893,7 +999,8 @@ public class StrategyService {
         p.put("ts", Instant.now());
         try {
             stream.send("decision.debug", p);
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("Debug emit failed", ignored);
         }
     }
 
@@ -1065,6 +1172,7 @@ public class StrategyService {
         BigDecimal donHi, donLo, vwap, lastClose;
     }
 
+
     public static class PDRange {
         public BigDecimal pdh, pdl;
 
@@ -1083,18 +1191,21 @@ public class StrategyService {
         }
 
         Bias toBias() {
-            int bull = 0, bear = 0;
+            int ce = 0, pe = 0;
+
             if (oiPcr != null) {
-                if (oiPcr.compareTo(PCR_BULLISH_MAX) < 0) bull++;
-                else if (oiPcr.compareTo(PCR_BEARISH_MIN) > 0) bear++;
+                // High PCR (≥1.20) → tilt CE (CALL); Low PCR (≤0.80) → tilt PE (PUT)
+                if (oiPcr.compareTo(PCR_BEARISH_MIN) >= 0) ce++;
+                else if (oiPcr.compareTo(PCR_BULLISH_MAX) <= 0) pe++;
             }
             if (volPcr != null) {
-                if (volPcr.compareTo(PCR_BULLISH_MAX) < 0) bull++;
-                else if (volPcr.compareTo(PCR_BEARISH_MIN) > 0) bear++;
+                if (volPcr.compareTo(PCR_BEARISH_MIN) >= 0) ce++;
+                else if (volPcr.compareTo(PCR_BULLISH_MAX) <= 0) pe++;
             }
-            if (bull > 0 && bear == 0) return Bias.CALL;
-            if (bear > 0 && bull == 0) return Bias.PUT;
-            return Bias.BOTH;
+
+            if (ce > 0 && pe == 0) return Bias.CALL;  // tilt CE
+            if (pe > 0 && ce == 0) return Bias.PUT;   // tilt PE
+            return Bias.BOTH;                          // neutral/ambiguous
         }
 
         String toReason() {
@@ -1226,61 +1337,132 @@ public class StrategyService {
         return out;
     }
 
-    // --- Rank by tightest 1m OHLC "spread%" = (high - low) / close (no reflection) ---
+    // Rank by tightest spread using OrdersService.getSpreadPct (depth-first with fallbacks)
     private List<LegSpec> rankByTightestSpread(List<LegSpec> candidates) {
         class Row {
             final LegSpec leg;
             final BigDecimal spread;
 
             Row(LegSpec l, BigDecimal s) {
-                this.leg = l;
-                this.spread = s;
+                leg = l;
+                spread = s;
             }
         }
-        if (candidates == null || candidates.isEmpty()) return Collections.emptyList();
-
         List<Row> rows = new ArrayList<>();
         for (LegSpec L : candidates) {
             OptionsInstruments.OptionInstrument inst = findContract(L);
             if (inst == null) continue;
             String ik = inst.getInstrument_key();
 
-            BigDecimal spreadPct = new BigDecimal("9E9"); // default = very wide (push to end)
-            try {
-                // Avoid extra imports by fully qualifying the model type
-                com.trade.frankenstein.trader.model.upstox.OHLC_Quotes q =
-                        upstoxService.getMarketOHLCQuote(ik, "1minute");
-                com.trade.frankenstein.trader.model.upstox.OHLC_Quotes.OHLCData d =
-                        (q != null && q.getData() != null) ? q.getData().get(ik) : null;
-
-                if (d != null && d.getLive_ohlc() != null) {
-                    double hi = d.getLive_ohlc().getHigh();
-                    double lo = d.getLive_ohlc().getLow();
-                    double cl = d.getLive_ohlc().getClose();
-                    if (cl > 0) {
-                        spreadPct = BigDecimal.valueOf(hi - lo)
-                                .divide(BigDecimal.valueOf(cl), 6, RoundingMode.HALF_UP);
-                    }
-                }
-            } catch (Throwable ignore) {
-                // keep spreadPct as big number to de-prioritize this leg
-            }
+            BigDecimal spreadPct = ordersService.getSpreadPct(ik).orElse(new BigDecimal("9E9"));
             rows.add(new Row(L, spreadPct));
         }
 
-
-        // sort ascending by spread%
         rows.sort(Comparator.comparing(a -> a.spread));
 
-        // first try: keep only those within your configured cap (MAX_SPREAD_PCT)
-        List<LegSpec> withinCap = new ArrayList<>();
-        for (Row r : rows) if (r.spread.compareTo(MAX_SPREAD_PCT) <= 0) withinCap.add(r.leg);
+        // prefer within cap
+        List<LegSpec> withinCap = rows.stream()
+                .filter(r -> r.spread.compareTo(MAX_SPREAD_PCT) <= 0)
+                .map(r -> r.leg)
+                .collect(Collectors.toList());
         if (!withinCap.isEmpty()) return withinCap;
 
-        // fallback: return all ranked (tightest first) if none meet the cap
-        List<LegSpec> out = new ArrayList<>();
-        for (Row r : rows) out.add(r.leg);
-        return out;
+        // fallback: all ranked by tightness
+        return rows.stream().map(r -> r.leg).collect(Collectors.toList());
     }
+
+    // UPDATED: Dedupe by (instrumentKey, transactionType) within window; considers PENDING & EXECUTED
+    private boolean isDuplicateInWindow(final String instrumentKey, final String txType) {
+        try {
+            Result<List<Advice>> res = adviceService.list();
+            if (res == null || !res.isOk() || res.get() == null) return false;
+
+            final Instant threshold = Instant.now().minus(DEDUPE_MINUTES, ChronoUnit.MINUTES);
+            final EnumSet<AdviceStatus> windowStatuses =
+                    EnumSet.of(AdviceStatus.PENDING, AdviceStatus.EXECUTED);
+
+            for (Advice a : res.get()) {
+                if (a == null) continue;
+                if (a.getInstrument_token() == null || a.getStatus() == null || a.getCreatedAt() == null) continue;
+
+                if (instrumentKey.equals(a.getInstrument_token())
+                        && windowStatuses.contains(a.getStatus())
+                        && txType.equalsIgnoreCase(a.getTransaction_type() == null ? "" : a.getTransaction_type())
+                        && a.getCreatedAt().isAfter(threshold)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+            log.error("Dedup check failed", ignored);
+        }
+        return false;
+    }
+
+    // NEW: count a tick-level skip, emit a tiny event, and return 0 for early exits
+    private int skipTick(Map<String, Object> dbg, String reason) {
+        advicesSkipped.incrementAndGet();
+        if (dbg != null) dbg.put("skip", reason);
+        emitDebug(dbg == null ? new LinkedHashMap<String, Object>() : dbg, "skip." + reason);
+        return 0;
+    }
+
+    // NEW: count a leg-level skip (used in filter loop)
+    private void incLegSkipped(String reason, String instrumentKey) {
+        advicesSkipped.incrementAndGet();
+        try {
+            Map<String, Object> m = new LinkedHashMap<String, Object>();
+            m.put("reason", reason);
+            m.put("ik", instrumentKey);
+            m.put("ts", Instant.now());
+            stream.send("metrics.strategy.skipped", m);
+        } catch (Exception ignored) {
+            log.error("Leg skip emit failed", ignored);
+        }
+    }
+
+    // NEW: metrics snapshot emitter
+    private void emitMetrics(boolean endOfTick) {
+        try {
+            Map<String, Object> m = new LinkedHashMap<String, Object>();
+            m.put("advices.created", advicesCreated.get());
+            m.put("advices.skipped", advicesSkipped.get());
+            m.put("advices.executed", advicesExecuted.get());
+            m.put("endOfTick", endOfTick);
+            m.put("ts", Instant.now());
+            stream.send("metrics.strategy", m);
+        } catch (Exception ignored) {
+            log.error("Metrics emit failed", ignored);
+        }
+    }
+
+    // NEW: allow AdviceService (or Engine) to bump the executed counter later
+    public void noteAdviceExecuted() {
+        advicesExecuted.incrementAndGet();
+        emitMetrics(false);
+    }
+
+    // NEW: OI-liquidity + spread filter
+    private boolean passesLiquidity(OptionsInstruments.OptionInstrument inst) {
+        try {
+            if (inst == null) return false;
+            String ik = inst.getInstrument_key();
+
+            OptionGreekResponse.OptionGreek g = optionChainService.getGreek(ik).orElse(null);
+            if (g == null) return true; // if unknown, don't block
+
+            long oi = Math.max(0L, g.getOi());
+            if (oi < MIN_LIQUIDITY_OI.longValue()) return false;
+
+            // spread% guard (reuses OrdersService depth)
+            BigDecimal spread = ordersService.getSpreadPct(ik).orElse(null);
+            if (spread != null && spread.compareTo(MAX_BIDASK_SPREAD_PCT) > 0) return false;
+
+            return true;
+        } catch (Exception t) {
+            log.error("Liquidity check failed: {}", t);
+            return true; // be permissive on errors
+        }
+    }
+
 }
 

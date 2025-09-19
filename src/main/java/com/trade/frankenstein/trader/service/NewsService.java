@@ -97,8 +97,8 @@ public class NewsService {
     public void init() {
         try {
             preflightValidateFeeds(); // warm health map at startup
-        } catch (Throwable t) {
-            log.warn("Preflight validate failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("Preflight validate failed: {}", t.getMessage());
         }
     }
 
@@ -120,13 +120,13 @@ public class NewsService {
                         shortUrl(url), Boolean.valueOf(h.isOk()), Integer.valueOf(h.getHttpCode()),
                         safe(h.getContentType()), Long.valueOf(h.getApproxBytes()),
                         Boolean.valueOf(h.isXmlLike()), Long.valueOf(h.getLatencyMs()), safe(h.getFinalUrl()));
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 FeedHealth h = new FeedHealth();
                 h.setOk(false);
                 h.setError(e.getMessage());
                 h.setLastChecked(Instant.now());
                 feedHealth.put(url, h);
-                log.info("NEWS FEED HEALTH [{}]: ERROR {}", shortUrl(url), e.getMessage());
+                log.error("NEWS FEED HEALTH [{}]: ERROR {}", shortUrl(url), e);
             }
         }
     }
@@ -164,7 +164,7 @@ public class NewsService {
                 } catch (Exception ex) {
                     errorCount++;
                     markUnhealthy(u, ex);
-                    log.info("News fetch failed ({}): {}", u, ex.getMessage());
+                    log.error("News fetch failed ({}): {}", u, ex);
                 }
             }
 
@@ -178,8 +178,8 @@ public class NewsService {
                     payload.put("errors", Integer.valueOf(errorCount));
                     payload.put("skippedUnhealthy", Integer.valueOf(skippedUnhealthy));
                     stream.send("news.update", payload);
-                } catch (Throwable t) {
-                    log.info("Broadcast news.update failed: {}", t.getMessage());
+                } catch (Exception t) {
+                    log.error("Broadcast news.update failed: {}", t);
                 }
             }
             return out.isEmpty() ? Result.fail("NO_NEWS_ITEMS") : Result.ok(out);
@@ -215,7 +215,7 @@ public class NewsService {
                     markHealthy(u);
                 } catch (Exception ex) {
                     markUnhealthy(u, ex);
-                    log.info("Feed fetch failed ({}): {}", u, ex.getMessage());
+                    log.error("Feed fetch failed ({}): {}", u, ex);
                 }
             }
 
@@ -254,8 +254,8 @@ public class NewsService {
                 streamData.put("total", Integer.valueOf(total));
                 streamData.put("feeds", Integer.valueOf(successfulFeeds));
                 stream.send("sentiment.update", streamData);
-            } catch (Throwable t) {
-                log.info("WebSocket stream send failed: {}", t.getMessage());
+            } catch (Exception t) {
+                log.error("WebSocket stream send failed: {}", t);
             }
             return Result.ok(saved);
         } catch (Exception e) {
@@ -374,7 +374,7 @@ public class NewsService {
             resultCache.put(cacheKey, new CachedResult(items));
             return items;
         } catch (Exception e) {
-            log.debug("Initial fetch failed for {}, trying alternate UA", url);
+            log.error("Initial fetch failed for {}, trying alternate UA", url, e);
             String altUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0";
             String altReferer = "https://www.google.com/search?q=market+news";
 
@@ -438,7 +438,7 @@ public class NewsService {
                     count++;
                 }
             } catch (Exception e) {
-                log.debug("Error parsing SEBI news item: {}", e.getMessage());
+                log.error("Error parsing SEBI news item: {}", e);
             }
         }
         return items;
@@ -477,7 +477,7 @@ public class NewsService {
                     }
                 }
             } catch (Exception e) {
-                log.debug("Error parsing Moneycontrol card: {}", e.getMessage());
+                log.error("Error parsing Moneycontrol card: {}", e);
             }
         }
 
@@ -513,7 +513,7 @@ public class NewsService {
                     count++;
                 }
             } catch (Exception e) {
-                log.debug("Error parsing Yahoo Finance news item: {}", e.getMessage());
+                log.error("Error parsing Yahoo Finance news item: {}", e);
             }
         }
         if (items.isEmpty()) items = parseHtmlBasic(url, body, maxItems);
@@ -630,7 +630,7 @@ public class NewsService {
         if (s == null || s.trim().isEmpty()) return null;
         try {
             return ZonedDateTime.parse(s.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
             return null;
         }
     }
@@ -639,10 +639,10 @@ public class NewsService {
         if (s == null || s.trim().isEmpty()) return null;
         try {
             return Instant.parse(s.trim());
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
             try {
                 return ZonedDateTime.parse(s.trim()).toInstant();
-            } catch (Throwable ignored2) {
+            } catch (Exception ignored2) {
                 return null;
             }
         }
@@ -651,7 +651,7 @@ public class NewsService {
     private static String hostOf(String url) {
         try {
             return new URI(url).getHost();
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
             return "";
         }
     }
@@ -718,7 +718,7 @@ public class NewsService {
 
                 out.add(new NewsItem(text, "", abs, null, source));
             }
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
         }
 
         if (out.size() > maxItems) return out.subList(0, Math.max(1, maxItems));
@@ -729,7 +729,7 @@ public class NewsService {
         try {
             URI rel = new URI(href);
             return base.resolve(rel).toString();
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
             return href;
         }
     }
@@ -786,7 +786,7 @@ public class NewsService {
                     for (int i = 0; i < 10; i++) {
                         if (br.readLine() == null) break;
                     }
-                } catch (Throwable ignored) {
+                } catch (Exception ignored) {
                 }
             }
             throw new IllegalStateException("HTTP " + code);
@@ -913,7 +913,7 @@ public class NewsService {
             if (path == null) path = "";
             if (path.length() > 40) path = path.substring(0, 40) + "…";
             return (host == null ? "" : host) + path;
-        } catch (Throwable ignore) {
+        } catch (Exception ignore) {
             return u;
         }
     }
@@ -952,7 +952,7 @@ public class NewsService {
                 }
             }
             return Optional.of(count);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return Optional.of(0);
         }
     }

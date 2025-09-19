@@ -19,7 +19,7 @@ public class OrderHistoryResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OrderHistoryData {
+    public static class OrderHistoryData {
         private String exchange;
         private double price;
         private String product;

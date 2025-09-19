@@ -17,7 +17,7 @@ public class PnLMetaDataResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PnLMetaData {
+    public static class PnLMetaData {
         private int trades_count;
         private int page_size_limit;
     }

@@ -19,7 +19,7 @@ public class PortfolioResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class PortfolioData {
+    public static class PortfolioData {
         private String exchange;
         private double multiplier;
         private double value;

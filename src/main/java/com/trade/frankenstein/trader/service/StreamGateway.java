@@ -78,7 +78,7 @@ public class StreamGateway {
 
         int sent = fanOut(topic, payload, targets);
         if (sent > 0) {
-            log.debug("SSE send: topic={} -> delivered to {} subscriber(s)", topic, sent);
+            log.info("SSE send: topic={} -> delivered to {} subscriber(s)", topic, sent);
         }
     }
 
@@ -136,7 +136,7 @@ public class StreamGateway {
         try {
             emitter.send(SseEmitter.event().name("init").data("ok"));
         } catch (IOException ex) {
-            log.debug("SSE init failed for emitter={}, removing. Reason: {}", id, ex.toString());
+            log.debug("SSE init failed for emitter={}, removing. Reason: {}", id, ex);
             removeEmitter(id, "init-failed");
             return emitter;
         }

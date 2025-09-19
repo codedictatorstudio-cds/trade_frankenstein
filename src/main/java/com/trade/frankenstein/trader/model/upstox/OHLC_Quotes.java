@@ -19,7 +19,7 @@ public class OHLC_Quotes {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OHLCData {
+    public static class OHLCData {
         private double last_price;
         private String instrument_token;
         private Ohlc prev_ohlc;
@@ -29,7 +29,7 @@ public class OHLC_Quotes {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class Ohlc {
+    public static class Ohlc {
         private double open;
         private double high;
         private double low;

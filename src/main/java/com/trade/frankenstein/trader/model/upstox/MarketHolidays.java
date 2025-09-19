@@ -19,7 +19,7 @@ public class MarketHolidays {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class Holiday {
+    public static class Holiday {
         private String date;
         private String description;
         private String holiday_type;
@@ -30,7 +30,7 @@ public class MarketHolidays {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class ExchangeSession {
+    public static class ExchangeSession {
         private String exchange;
         private long start_time;
         private long end_time;

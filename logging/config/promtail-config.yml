@@ -1,0 +1,40 @@
+server:
+  http_listen_port: 9080
+  log_level: info
+
+positions:
+  filename: E:/tradefrankenstein/tradefrankenstein/logging/data/promtail-positions.yaml
+
+clients:
+  - url: http://127.0.0.1:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: tradefrank
+    static_configs:
+      - targets: [localhost]
+        labels:
+          app: tradefrank
+          host: local
+          __path__: E:/tradefrankenstein/tradefrankenstein/logs/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: timestamp
+            level: level
+            logger: logger_name
+            msg: message
+            svc: svc
+      # If svc missing, derive it from the logger package: ...service.risk.* → risk
+      - replace:
+          expression: '^(com\.trade\.frankenstein\.trader\.service\.)([^.]+).*'
+          source: logger
+          replace: '$2'
+      - template:
+          source: svc
+          template: '{{ if .svc }}{{ .svc }}{{ else }}{{ .logger }}{{ end }}'
+      - labels:
+          app:
+          host:
+          level:
+          logger:
+          svc:

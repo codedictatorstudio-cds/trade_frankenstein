@@ -19,7 +19,7 @@ public class HoldingsResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class HoldingData {
+    public static class HoldingData {
         private String isin;
         private int cnc_used_quantity;
         private String collateral_type;

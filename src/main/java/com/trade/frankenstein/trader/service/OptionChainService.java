@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.DayOfWeek;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.*;
@@ -57,32 +58,42 @@ public class OptionChainService {
      */
     public Result<List<LocalDate>> listNearestExpiries(String underlyingKey, int count) {
         if (isBlank(underlyingKey)) return Result.fail("BAD_REQUEST", "underlyingKey required");
-        OptionsInstruments resp = upstox.getOptionInstrument(underlyingKey, null);
-        List<OptionsInstruments.OptionInstrument> data = (resp == null || resp.getData() == null)
-                ? Collections.<OptionsInstruments.OptionInstrument>emptyList()
-                : resp.getData();
 
-        Set<String> distinct = new HashSet<>();
-        for (OptionsInstruments.OptionInstrument oi : data) {
-            if (oi.getExpiry() != null) distinct.add(oi.getExpiry());
-        }
+        // Probe likely weekly expiry days (Wed/Thu/Fri) over the next ~8 weeks
+        final LocalDate today = LocalDate.now();
+        final LocalDate max = today.plusDays(56);
 
-        List<LocalDate> exps = new ArrayList<>();
-        for (String s : distinct) {
-            try {
-                exps.add(LocalDate.parse(s));
-            } catch (Throwable ignored) {
+        // Use a linked set to keep order & avoid duplicates
+        Set<LocalDate> candidates = new LinkedHashSet<>();
+        for (LocalDate d = today; !d.isAfter(max); d = d.plusDays(1)) {
+            DayOfWeek dow = d.getDayOfWeek();
+            if (dow == DayOfWeek.WEDNESDAY || dow == DayOfWeek.THURSDAY || dow == DayOfWeek.FRIDAY) {
+                candidates.add(d);
             }
         }
-        LocalDate today = LocalDate.now();
 
-        List<LocalDate> out = exps.stream()
-                .filter(d -> !d.isBefore(today))
-                .sorted()
-                .limit(Math.max(1, count))
-                .collect(Collectors.toList());
-        return Result.ok(out);
+        // Ask Upstox for each candidate; keep the dates that actually have contracts
+        List<LocalDate> found = new ArrayList<>();
+        for (LocalDate d : candidates) {
+            try {
+                List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, d);
+                if (!instruments.isEmpty()) {
+                    found.add(d);
+                    if (found.size() >= Math.max(1, count)) break; // early exit once we have enough
+                }
+            } catch (Exception ignored) {
+                log.error("Moving to next date");
+            }
+        }
+
+        if (found.isEmpty()) {
+            return Result.fail("NOT_FOUND", "No upcoming expiries discovered for underlying");
+        }
+        // Sort & return up to count
+        found.sort(Comparator.naturalOrder());
+        return Result.ok(found.subList(0, Math.min(found.size(), Math.max(1, count))));
     }
+
 
     /**
      * Find a single contract by expiry, strike and CALL/PUT.
@@ -402,8 +413,8 @@ public class OptionChainService {
             OptionsInstruments resp = upstox.getOptionInstrument(underlyingKey, expiry.toString());
             if (resp == null || resp.getData() == null) return Collections.emptyList();
             return resp.getData();
-        } catch (Throwable t) {
-            log.debug("fetchInstruments failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("fetchInstruments failed: {}", t);
             return Collections.emptyList();
         }
     }
@@ -424,8 +435,8 @@ public class OptionChainService {
             try {
                 OptionGreekResponse g = upstox.getOptionGreeks(csv);
                 if (g != null && g.getData() != null) out.putAll(g.getData());
-            } catch (Throwable t) {
-                log.debug("fetchGreeksMap batch failed: {}", t.getMessage());
+            } catch (Exception t) {
+                log.error("fetchGreeksMap batch failed: {}", t);
             }
         }
         return out;
@@ -469,7 +480,8 @@ public class OptionChainService {
                     if (g != null) return Optional.of(g);
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("getGreek failed: {}", ignored);
         }
         return Optional.empty();
     }
@@ -504,7 +516,8 @@ public class OptionChainService {
                 else if ("PE".equalsIgnoreCase(side)) peOi += val;
             }
             return new OiSnapshot(BigDecimal.valueOf(ceOi), BigDecimal.valueOf(peOi), Instant.now());
-        } catch (Throwable t) {
+        } catch (Exception t) {
+            log.error("computeOiSnapshot failed: {}", t);
             return null;
         }
     }
@@ -579,8 +592,9 @@ public class OptionChainService {
             if (v instanceof BigDecimal) return ((BigDecimal) v);
             if (v instanceof Number) return BigDecimal.valueOf(v.doubleValue());
             return new BigDecimal(v.toString());
-        } catch (Throwable ignore) {
+        } catch (Exception ignore) {
             return null;
         }
     }
+
 }

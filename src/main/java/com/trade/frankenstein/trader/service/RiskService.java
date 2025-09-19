@@ -43,10 +43,6 @@ public class RiskService {
     // Rolling window for orders/min throttle (timestamps for last 60 seconds).
     private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
 
-    // =================================================================================
-    // Public API
-    // =================================================================================
-
     /**
      * Lightweight, real-time risk check for a new order.
      * Uses only constants + live data; no DB writes/reads.
@@ -75,7 +71,7 @@ public class RiskService {
         // 3) Market hygiene: live 1m bar roughness as a slippage proxy
         //    If the current 1-minute bar is too choppy, block to avoid poor fills.
         try {
-            String key = extractInstrumentKey(req);
+            String key = req.getInstrument_token();
             if (key != null) {
                 double roughnessPct = readLiveBarRoughnessPct(key); // ((H-L)/mid)*100
                 if (!Double.isNaN(roughnessPct)) {
@@ -86,9 +82,9 @@ public class RiskService {
                     }
                 }
             }
-        } catch (Throwable t) {
+        } catch (Exception t) {
             // Non-fatal — prefer allowing the order instead of failing on telemetry error
-            log.debug("checkOrder: slippage read failed: {}", t.getMessage());
+            log.error("checkOrder: slippage read failed: {}", t);
         }
 
         // 4) Daily loss cap (live PnL)
@@ -98,8 +94,8 @@ public class RiskService {
             if (lossNow >= cap - 1e-6) {
                 return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
             }
-        } catch (Throwable t) {
-            log.debug("checkOrder: PnL read failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("checkOrder: PnL read failed: {}", t);
         }
 
         return Result.ok(null);
@@ -117,7 +113,8 @@ public class RiskService {
         // Push a fresh snapshot for the UI (non-blocking)
         try {
             stream.send("risk.summary", buildSnapshot());
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("noteOrderPlaced: SSE send failed: {}", ignored);
         }
     }
 
@@ -130,10 +127,10 @@ public class RiskService {
             RiskSnapshot snap = buildSnapshot();
             try {
                 stream.send("risk.summary", snap);
-            } catch (Throwable ignored) {
+            } catch (Exception ignored) {
             }
             return Result.ok(snap);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             log.error("getSummary failed", t);
             return Result.fail(t);
         }
@@ -148,8 +145,8 @@ public class RiskService {
             if (realizedToday == null) realizedToday = BigDecimal.ZERO;
             BigDecimal lossAbs = realizedToday.signum() < 0 ? realizedToday.abs() : BigDecimal.ZERO;
             updateDailyLossAbs(lossAbs);
-        } catch (Throwable t) {
-            log.debug("refreshDailyLossFromBroker failed: {}", t.getMessage());
+        } catch (Exception t) {
+            log.error("refreshDailyLossFromBroker failed: {}", t);
         }
     }
 
@@ -161,7 +158,8 @@ public class RiskService {
         boolean tripped = isDailyCircuitTripped().orElse(false);
         try {
             stream.send("risk.circuit", tripped);
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("getCircuitState: SSE send failed: {}", ignored);
         }
         return Result.ok(tripped);
     }
@@ -173,7 +171,8 @@ public class RiskService {
         circuitTripped.set(true);
         try {
             stream.send("risk.circuit", true);
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("tripCircuit: SSE send failed: {}", ignored);
         }
         if (reason != null && !reason.isEmpty()) {
             log.warn("Risk circuit TRIPPED: {}", reason);
@@ -188,7 +187,8 @@ public class RiskService {
         circuitTripped.set(false);
         try {
             stream.send("risk.circuit", false);
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("resetCircuit: SSE send failed: {}", ignored);
         }
         log.info("Risk circuit RESET");
         return Result.ok(null);
@@ -205,7 +205,8 @@ public class RiskService {
         double loss = 0.0;
         try {
             loss = currentLossRupees();
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("buildSnapshot: PnL read failed: {}", ignored);
         }
 
         double budgetLeft = Math.max(0.0, cap - loss);
@@ -267,7 +268,7 @@ public class RiskService {
      * Live bar roughness % = ((high - low) / mid) * 100 for the current 1-minute bar.
      */
     private double readLiveBarRoughnessPct(String instrumentKey) {
-        OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "1minute");
+        OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
         if (q == null || q.getData() == null || q.getData().get(instrumentKey) == null) return Double.NaN;
         OHLC_Quotes.OHLCData d = q.getData().get(instrumentKey);
         if (d.getLive_ohlc() == null) return Double.NaN;
@@ -293,17 +294,6 @@ public class RiskService {
     }
 
     @Nullable
-    private static String extractInstrumentKey(PlaceOrderRequest req) {
-        try {
-            java.lang.reflect.Method m = PlaceOrderRequest.class.getMethod("getInstrument_token");
-            Object v = m.invoke(req);
-            if (v instanceof String) return (String) v;
-        } catch (Throwable ignored) {
-        }
-        return null;
-    }
-
-    @Nullable
     private static String extractSymbol(PlaceOrderRequest req) {
         // Try common fields first; fall back to instrument_key sans exchange prefix
         try {
@@ -318,9 +308,10 @@ public class RiskService {
                 } catch (NoSuchMethodException ignored) {
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            log.error("extractSymbol failed: {}", ignored);
         }
-        String key = extractInstrumentKey(req);
+        String key = req.getInstrument_token();
         if (key == null) return null;
         int idx = key.indexOf(':');
         return (idx >= 0 && idx + 1 < key.length()) ? key.substring(idx + 1) : key;
@@ -339,7 +330,7 @@ public class RiskService {
             java.lang.reflect.Method m = bean.getClass().getMethod(getter);
             Object v = m.invoke(bean);
             if (v instanceof Number) return ((Number) v).doubleValue();
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
         }
         return 0.0;
     }
@@ -393,7 +384,7 @@ public class RiskService {
             if (tripped) circuitTripped.set(true);
 
             return Optional.of(tripped);
-        } catch (Throwable t) {
+        } catch (Exception t) {
             // On any failure, be safe and do not trip implicitly
             return Optional.of(false);
         }

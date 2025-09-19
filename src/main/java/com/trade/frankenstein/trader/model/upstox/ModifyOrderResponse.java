@@ -16,12 +16,12 @@ public class ModifyOrderResponse {
     private PlaceOrderMetadata metadata;
 
     @Data
-    public class PlaceOrderData {
+    public static class PlaceOrderData {
         private String order_id;
     }
 
     @Data
-    public class PlaceOrderMetadata {
+    public static class PlaceOrderMetadata {
         private int latency;
     }
 }

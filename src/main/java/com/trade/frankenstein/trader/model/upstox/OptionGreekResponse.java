@@ -19,7 +19,7 @@ public class OptionGreekResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OptionGreek {
+    public static class OptionGreek {
         private double last_price;
         private String instrument_token;
         private int ltq;

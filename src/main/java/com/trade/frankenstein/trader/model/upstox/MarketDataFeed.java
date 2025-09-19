@@ -20,7 +20,7 @@ public class MarketDataFeed {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class MarketDataFeedData {
+    public static class MarketDataFeedData {
         private String mode;
         private List<String> instrumentKeys;
     }

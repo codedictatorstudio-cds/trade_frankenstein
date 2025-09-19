@@ -9,6 +9,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
@@ -19,6 +22,8 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @Service
 @Slf4j
@@ -41,9 +46,23 @@ public class UpstoxService {
     private static final Set<String> WORKING_STATUSES = new HashSet<>(
             Arrays.asList("open", "queued", "validation pending", "trigger pending", "enquiry", "partially filled"));
 
+    private static final int MAX_RETRIES = 5;
+    private static final long BASE_BACKOFF_MS = 250, MAX_BACKOFF_MS = 4000;
+    private final ConcurrentMap<String, OptionsInstruments> optionContractCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Long> optionContractCacheExpiry = new ConcurrentHashMap<>();
+    private static final long CACHE_TTL_MS = 30000;
+
     @PostConstruct
     public void init() {
         this.authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(AuthenticationResponse.builder().build());
+    }
+
+    private void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void checkAndRefreshToken() {
@@ -838,13 +857,14 @@ public class UpstoxService {
         log.info("Checking and refreshing token if needed : getOptionInstrument");
         checkAndRefreshToken();
 
-        String url = UpstoxConstants.GET_OPTIONS_CONTRACT_URL;
+        final String cacheKey = instrument_key + "|" + expiry_date;
+        final Long exp = optionContractCacheExpiry.get(cacheKey);
+        if (exp != null && exp > System.currentTimeMillis()) {
+            OptionsInstruments hit = optionContractCache.get(cacheKey);
+            if (hit != null) return hit;
+        }
 
-        URI uri = UriComponentsBuilder.fromHttpUrl(url)
-                .queryParamIfPresent("instrument_key", Optional.of(instrument_key))
-                .queryParamIfPresent("expiry_date", Optional.of(expiry_date))
-                .build()
-                .toUri();
+        String baseUrl = UpstoxConstants.GET_OPTIONS_CONTRACT_URL;
 
         // Set headers for the request
         HttpHeaders headers = new HttpHeaders();
@@ -853,16 +873,45 @@ public class UpstoxService {
 
         // Create the HTTP entity with headers
         HttpEntity<Void> entity = new HttpEntity<>(headers);
+        log.info("Getting option instrument for instrument key: {}, expiry: {}", instrument_key, expiry_date);
+        URI uri = UriComponentsBuilder.fromHttpUrl(baseUrl)
+                .queryParam("instrument_key", instrument_key)
+                .queryParamIfPresent("expiry_date", Optional.of(expiry_date)) // never null
+                .build().toUri();
 
-        log.info("Getting Option Instruments");
-
-        // Send the GET request and get the response
-        ResponseEntity<OptionsInstruments> response = template.exchange(
-                uri, HttpMethod.GET, entity, OptionsInstruments.class);
-
-        log.info("Option Instruments fetched");
-
-        return response.getBody();
+        int attempt = 0;
+        while (true) {
+            try {
+                ResponseEntity<OptionsInstruments> resp = template.exchange(uri, HttpMethod.GET, entity, OptionsInstruments.class);
+                OptionsInstruments body = resp.getBody();
+                if (body != null) {
+                    optionContractCache.put(cacheKey, body);
+                    optionContractCacheExpiry.put(cacheKey, System.currentTimeMillis() + CACHE_TTL_MS);
+                }
+                return body;
+            } catch (HttpClientErrorException.TooManyRequests e) {
+                attempt++;
+                if (attempt > MAX_RETRIES) throw e;
+                String ra = e.getResponseHeaders() != null ? e.getResponseHeaders().getFirst("Retry-After") : null;
+                long waitMs = 0L;
+                if (ra != null) {
+                    try {
+                        waitMs = Long.parseLong(ra.trim()) * 1000L;
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (waitMs <= 0) {
+                    long backoff = Math.min(MAX_BACKOFF_MS, (long) (BASE_BACKOFF_MS * Math.pow(2, attempt - 1)));
+                    waitMs = backoff + 100L; // small jitter
+                }
+                sleepQuietly(waitMs);
+            } catch (HttpServerErrorException | ResourceAccessException e) {
+                attempt++;
+                if (attempt > MAX_RETRIES) throw e;
+                long backoff = Math.min(MAX_BACKOFF_MS, (long) (BASE_BACKOFF_MS * Math.pow(2, attempt - 1)));
+                sleepQuietly(backoff + 100L);
+            }
+        }
     }
 
     // --- Convenience: amend price on an existing order (wrapper on modifyOrder) ---
@@ -889,7 +938,7 @@ public class UpstoxService {
             log.info("isOrderWorking({}) -> {} (status={})", orderId, working, s);
             return working;
         } catch (Exception e) {
-            log.warn("isOrderWorking({}) failed: {}", orderId, e.toString());
+            log.error("isOrderWorking({}) failed: {}", orderId, e);
             return false;
         }
     }
@@ -932,13 +981,21 @@ public class UpstoxService {
         return placeOrder(req);
     }
 
+    private String getFinancialYear() {
+        LocalDate now = LocalDate.now();
+        int year = now.getYear();
+        int nextYear = year + 1;
+
+        String financialYear = String.valueOf(year).substring(2) + String.valueOf(nextYear).substring(2);
+        return financialYear;
+    }
+
     public BigDecimal getRealizedPnlToday() {
         try {
             LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
-            String d = today.format(DateTimeFormatter.ISO_DATE); // yyyy-MM-dd
-
+            String d = today.format(DateTimeFormatter.ofPattern("dd-MM-yyyy")); // yyyy-MM-dd
             // Adjust this call's signature/args if your existing getPnlReports(...) differs
-            PnLReportResponse r = getPnlReports(d, d, "FO", "CURRENT", 1, 500);
+            PnLReportResponse r = getPnlReports(d, d, "FO", getFinancialYear(), 1, 500);
 
             BigDecimal sum = BigDecimal.ZERO;
             if (r != null && r.getData() != null) {
@@ -953,9 +1010,67 @@ public class UpstoxService {
             log.info("Realized PnL for {}: {}", d, sum);
             return sum;
         } catch (Exception e) {
-            log.warn("getRealizedPnlToday failed: {}", e.toString());
+            log.error("getRealizedPnlToday failed: {}", e);
             return BigDecimal.ZERO;
         }
     }
+
+    /**
+     * Best bid/ask snapshot for a single instrument.
+     */
+    public static class BestBidAsk {
+        public final double bid;
+        public final double ask;
+
+        public BestBidAsk(double bid, double ask) {
+            this.bid = bid;
+            this.ask = ask;
+        }
+    }
+
+    /**
+     * Try FULL market quote for best bid/ask; falls back to empty if not available.
+     */
+    public Optional<BestBidAsk> getBestBidAsk(String instrumentKey) {
+        try {
+            log.info("Checking and refreshing token if needed : getBestBidAsk");
+            checkAndRefreshToken();
+
+            // Upstox FULL quote endpoint (depth in response)
+            String url = "https://api.upstox.com/v2/market/quotes";
+
+            URI uri = UriComponentsBuilder.fromHttpUrl(url)
+                    .queryParam("instrument_key", instrumentKey)
+                    .queryParam("mode", "full")
+                    .build()
+                    .toUri();
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            headers.setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
+            headers.setBearerAuth(authenticationResponse.getResponse().getAccess_token());
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<JsonNode> resp = template.exchange(uri, HttpMethod.GET, entity, JsonNode.class);
+            JsonNode root = (resp != null) ? resp.getBody() : null;
+            if (root == null || root.get("data") == null) return Optional.empty();
+
+            JsonNode node = root.get("data").get(instrumentKey);
+            if (node == null) return Optional.empty();
+
+            // According to Upstox FULL schema: depth.buy/sell arrays (best at index 0)
+            JsonNode buy0 = node.path("depth").path("buy").isArray() && node.path("depth").path("buy").size() > 0 ? node.path("depth").path("buy").get(0) : null;
+            JsonNode sell0 = node.path("depth").path("sell").isArray() && node.path("depth").path("sell").size() > 0 ? node.path("depth").path("sell").get(0) : null;
+
+            double bid = (buy0 != null && buy0.has("price")) ? buy0.get("price").asDouble() : 0.0;
+            double ask = (sell0 != null && sell0.has("price")) ? sell0.get("price").asDouble() : 0.0;
+
+            if (bid > 0.0 && ask > 0.0) return Optional.of(new BestBidAsk(bid, ask));
+            return Optional.empty();
+        } catch (Exception t) {
+            return Optional.empty();
+        }
+    }
+
 
 }

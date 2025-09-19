@@ -14,6 +14,7 @@ import com.vaadin.flow.component.icon.VaadinIcon;
 
 import java.text.NumberFormat;
 import java.util.Locale;
+import java.util.function.Function;
 
 import static com.trade.frankenstein.trader.ui.shared.GridSpan.forceSingleLineFit;
 
@@ -295,39 +296,76 @@ public class RiskPanelCard extends CardSection {
         return nf.format(amount);
     }
 
-    private void applyRiskJson(JsonNode j) {
-        if (j == null) return;
+    private void applyRiskJson(JsonNode root) {
+        if (root == null || root.isNull()) return;
 
-        // Unwrap Result<RiskSnapshot> if controller returns Result<T>
-        if (j.has("ok") && j.has("data")) {
-            j = j.get("data");
-        }
+        // 1) Unwrap common envelopes
+        JsonNode j = root;
+        if (j.has("ok") && j.has("data")) j = j.get("data");
+        else if (j.has("success") && j.has("value")) j = j.get("value");
+        if (j == null || j.isNull()) return;
 
-        if (j.has("riskBudgetLeft")) setBudgetLeft(j.path("riskBudgetLeft").asDouble(Double.NaN));
+        // Small helpers (accept number or numeric text)
+        Function<JsonNode, Double> asDouble =
+                n -> n == null || n.isNull() ? Double.NaN :
+                        (n.isNumber() ? n.asDouble() :
+                                (n.isTextual() ? safeParseDouble(n.asText(), Double.NaN) : Double.NaN));
 
-        // Accept both nested and flat lots fields
+        Function<JsonNode, Integer> asInt =
+                n -> n == null || n.isNull() ? 0 :
+                        (n.isInt() ? n.asInt() :
+                                (n.isNumber() ? n.asInt() :
+                                        (n.isTextual() ? (int) safeParseDouble(n.asText(), 0) : 0)));
+
+        // 2) Budget Left (camelCase or snake_case)
+        Double budget = null;
+        if (j.has("riskBudgetLeft")) budget = asDouble.apply(j.get("riskBudgetLeft"));
+        else if (j.has("risk_budget_left")) budget = asDouble.apply(j.get("risk_budget_left"));
+        if (budget != null && !budget.isNaN()) setBudgetLeft(budget);
+
+        // 3) Lots (support nested {lotsUsed:{used,cap}} or flat lotsUsed/lotsCap; camel & snake)
         if (j.has("lotsUsed") && j.get("lotsUsed").isObject()) {
             JsonNode lu = j.get("lotsUsed");
-            int used = lu.path("used").asInt(0);
-            int cap = lu.path("cap").asInt(j.path("lotsCap").asInt(0)); // fallback to flat cap if present
+            int used = asInt.apply(lu.get("used"));
+            if (used == 0) used = asInt.apply(lu.get("lots_used"));
+            int cap = asInt.apply(lu.get("cap"));
+            if (cap == 0) {
+                cap = asInt.apply(j.get("lotsCap"));
+                if (cap == 0) cap = asInt.apply(j.get("lots_cap"));
+            }
             setLots(used, cap);
         } else {
-            int used = j.path("lotsUsed").asInt(0);
-            int cap = j.path("lotsCap").asInt(0);
+            int used = asInt.apply(j.get("lotsUsed"));
+            if (used == 0) used = asInt.apply(j.get("lots_used"));
+            int cap = asInt.apply(j.get("lotsCap"));
+            if (cap == 0) cap = asInt.apply(j.get("lots_cap"));
             setLots(used, cap);
         }
 
-        if (j.has("dailyLossPct")) setDailyLossPercent(j.path("dailyLossPct").asDouble(0));
+        // 4) Daily Loss %
+        Double dlp = null;
+        if (j.has("dailyLossPct")) dlp = asDouble.apply(j.get("dailyLossPct"));
+        else if (j.has("daily_loss_pct")) dlp = asDouble.apply(j.get("daily_loss_pct"));
+        if (dlp != null) setDailyLossPercent(dlp);
 
-        // Accept both names
-        if (j.has("ordersPerMinutePct")) {
-            setOrdersPerMinutePercent(j.path("ordersPerMinutePct").asDouble(0));
-        } else if (j.has("ordersPerMinPct")) {
-            setOrdersPerMinutePercent(j.path("ordersPerMinPct").asDouble(0));
-        }
+        // 5) Orders / minute %
+        Double opm = null;
+        if (j.has("ordersPerMinutePct")) opm = asDouble.apply(j.get("ordersPerMinutePct"));
+        else if (j.has("ordersPerMinPct")) opm = asDouble.apply(j.get("ordersPerMinPct"));
+        else if (j.has("orders_per_minute_pct")) opm = asDouble.apply(j.get("orders_per_minute_pct"));
+        else if (j.has("orders_per_min_pct")) opm = asDouble.apply(j.get("orders_per_min_pct"));
+        if (opm != null) setOrdersPerMinutePercent(opm);
     }
 
-    // === Client-callable hooks ===
+    // Safe numeric parse for textual nodes
+    private static double safeParseDouble(String s, double def) {
+        try {
+            if (s == null) return def;
+            return Double.parseDouble(s.trim());
+        } catch (Exception ignore) {
+            return def;
+        }
+    }
 
     /**
      * Called by SSE handler in the browser with JSON string payload.

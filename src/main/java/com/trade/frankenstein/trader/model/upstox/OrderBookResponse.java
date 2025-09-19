@@ -18,7 +18,7 @@ public class OrderBookResponse {
     @Data
     @AllArgsConstructor
     @NoArgsConstructor
-    public class OrderBookData {
+    public static class OrderBookData {
         private String exchange;
         private String product;
         private double price;

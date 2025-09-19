@@ -114,7 +114,7 @@ public class UpstoxController {
     }
 
     @GetMapping("/pnl/reports")
-    public PnLReportResponse getPnlReports(@RequestParam String from_date, @RequestParam String to_date, @RequestParam String segment, @RequestParam String financial_year, @RequestParam int page_number, @RequestParam int page_size) {
+    public PnLReportResponse getPnlReports(@RequestParam(required = false) String from_date, @RequestParam(required = false) String to_date, @RequestParam String segment, @RequestParam String financial_year, @RequestParam int page_number, @RequestParam int page_size) {
         return upstoxService.getPnlReports(from_date, to_date, segment, financial_year, page_number, page_size);
     }
 

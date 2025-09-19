@@ -103,7 +103,7 @@ public final class StrategyUpgrades {
                         : BIG_N;
 
                 rows.add(new SpreadRow(key, spreadPct));
-            } catch (Throwable t) {
+            } catch (Exception t) {
                 rows.add(new SpreadRow(key, BIG_N));
             }
         }

@@ -7,6 +7,8 @@ import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
+import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
+import com.trade.frankenstein.trader.model.upstox.LTP_Quotes;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -19,6 +21,8 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -53,10 +57,11 @@ public class EngineService {
     private UpstoxService upstoxService;
     @Autowired
     private PortfolioService portfolioService;
+    @Autowired
+    private OptionChainService optionChainService;
 
     private final Map<String, ExitPlan> exitPlans = new ConcurrentHashMap<>(); // key = instrument_key
     private static final Pattern EXIT_HINTS = Pattern.compile("EXIT:\\s*SL=([^,]+),\\s*TP=([^,]+),\\s*TTL=(\\d+)m", Pattern.CASE_INSENSITIVE);
-
 
     private int maxExecPerTick = 3;
 
@@ -80,8 +85,25 @@ public class EngineService {
     private volatile long lastExecuted = 0;
     private volatile String lastError = null;
 
-    // ---------------- Lifecycle ----------------
+    // --- Re-strike knobs (safe defaults) ---
+    private static final int RESTRIKE_CHECK_MINUTES = 5;
+    private static final int RESTRIKE_TRIGGER_ATM_SHIFT = 1; // strike steps (50-pt)
+    private static final int RESTRIKE_MAX_PER_HOUR = 2;
+    private static final int DO_NOT_RESTRIKE_AFTER_HHMM = 1500; // 15:00 IST
 
+    // Re-strike state
+    private volatile Instant lastRestrikeCheckAt = Instant.EPOCH;
+    private volatile int restrikeCountThisHour = 0;
+    private volatile int restrikeHourKey = -1;
+
+    // Re-strike memory for change-detection
+    private volatile Integer lastDirScoreForRestrike = null;
+
+    private enum AtrBand {QUIET, NORMAL, VOLATILE}
+
+    private volatile AtrBand lastAtrBandForRestrike = null;
+
+    // ---------------- Lifecycle ----------------
     public Result<String> startEngine() {
         if (running.get()) {
             log.warn("Engine start requested but already running");
@@ -114,7 +136,6 @@ public class EngineService {
     }
 
     // ---------------- Tick Loop ----------------
-
     @Scheduled(fixedDelayString = "${trade.engine.tick-ms:2000}")
     public void tick() {
         if (!running.get()) {
@@ -128,62 +149,91 @@ public class EngineService {
 
         try {
             riskService.refreshDailyLossFromBroker();
-        } catch (Throwable ex) {
+        } catch (Exception ex) {
             log.info("tick(): risk broker-PnL refresh failed: {}", ex.getMessage(), ex);
         }
 
         try {
             int made = strategyService.generateAdvicesNow();
             if (made > 0) log.info("tick(): strategy generated {} advice(s)", made);
-        } catch (Throwable ex) {
-            log.info("tick(): strategy generation failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("tick(): strategy generation failed: {}", ex.getMessage(), ex);
         }
 
         // Still inside tick(), after the loop that executes advices:
         try {
             manageProtectiveOrders();   // see stub below
-        } catch (Throwable ex) {
-            log.info("tick(): manageProtectiveOrders failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("tick(): manageProtectiveOrders failed: {}", ex.getMessage(), ex);
         }
 
-
-        // Market-hours and circuit checks
+        // UPDATED pre-check in tick()
         try {
-            Result<RiskSnapshot> circuitRes = riskService.getSummary();
-            RiskSnapshot circuit = (circuitRes == null) ? null : circuitRes.get();
-            if (circuit != null) {
-                boolean tripped = reflectBoolean(circuit, "isTripped", "tripped");
-                if (tripped) {
-                    String reason = reflectString(circuit, "getReason", "reason");
-                    lastError = "Circuit tripped" + (reason == null ? "" : (": " + reason));
-                    log.warn("tick(): {} — skipping execution", lastError);
-                    ticks.incrementAndGet();
-                    publishState();
-                    return;
+            Result<RiskSnapshot> res = riskService.getSummary();
+            RiskSnapshot r = (res != null && res.isOk()) ? res.get() : null;
+
+            boolean block = false;
+            StringBuilder why = new StringBuilder();
+
+            if (r != null) {
+                // 1) Budget exhausted
+                if (r.getRiskBudgetLeft() <= 0.0) {
+                    block = true;
+                    appendReason(why, "Risk budget exhausted");
+                }
+                // 2) Lots cap reached
+                Integer used = r.getLotsUsed();
+                Integer cap = r.getLotsCap();
+                if (!block && used != null && cap != null && used >= cap) {
+                    block = true;
+                    appendReason(why, "Lots cap reached (" + used + "/" + cap + ")");
+                }
+                // 3) Daily loss throttle at 100%
+                if (!block && r.getDailyLossPct() >= 100.0) {
+                    block = true;
+                    appendReason(why, "Daily loss at 100%");
+                }
+                // 4) Orders/min throttle at 100%
+                if (!block && r.getOrdersPerMinPct() >= 100.0) {
+                    block = true;
+                    appendReason(why, "Orders/min limit at 100%");
                 }
             }
-        } catch (Throwable ex) {
+
+            if (block) {
+                lastError = why.length() == 0 ? "Risk guard: blocked" : why.toString();
+                log.warn("tick(): {} — skipping execution", lastError);
+                ticks.incrementAndGet();
+                publishState();
+                return;
+            }
+        } catch (Exception ex) {
             lastError = "Pre-checks failed: " + ex.getMessage();
-            log.warn("tick(): pre-checks error", ex);
+            log.error("tick(): pre-checks error", ex);
         }
+
 
         // Refresh UI signals (lightweight)
         try {
             decisionService.getQuality();
-        } catch (Throwable ex) {
-            log.info("tick(): decision refresh failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("tick(): decision refresh failed: {}", ex.getMessage(), ex);
         }
         try {
             riskService.getSummary();
-        } catch (Throwable ex) {
-            log.info("tick(): risk refresh failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("tick(): risk refresh failed: {}", ex.getMessage(), ex);
         }
         try {
             sentimentService.getNow();
-        } catch (Throwable ex) {
+        } catch (Exception ex) {
             log.info("tick(): sentiment refresh failed: {}", ex.getMessage(), ex);
         }
-
+        try {
+            restrikeManagerTick();
+        } catch (Exception ex) {
+            log.error("tick(): re-strike manager failed: {}", ex.getMessage(), ex);
+        }
         // Execute pending advices (newest first), capped by maxExecPerTick
         int executed = 0;
         try {
@@ -204,14 +254,14 @@ public class EngineService {
                         String err = (r == null) ? "null result" : r.getError();
                         log.warn("Advice execution failed: id={}, error={}", id, err);
                     }
-                } catch (Throwable ex) {
-                    log.warn("tick(): advice id={} execution error: {}", id, ex.getMessage(), ex);
+                } catch (Exception ex) {
+                    log.error("tick(): advice id={} execution error: {}", id, ex.getMessage(), ex);
                 }
             }
             log.info("tick(): executed {} advice(s) this tick (cap={})", executed, maxExecPerTick);
-        } catch (Throwable ex) {
+        } catch (Exception ex) {
             lastError = "Advice loop failed: " + ex.getMessage();
-            log.warn("tick(): advice loop error", ex);
+            log.error("tick(): advice loop error", ex);
         } finally {
             lastExecuted = executed;
             ticks.incrementAndGet();
@@ -224,8 +274,8 @@ public class EngineService {
                     BigDecimal lossAbs = (day != null && day.signum() < 0) ? day.abs() : BigDecimal.ZERO;
                     riskService.updateDailyLossAbs(lossAbs);
                 }
-            } catch (Throwable ex) {
-                log.debug("tick(): day PnL refresh failed: {}", ex.getMessage());
+            } catch (Exception ex) {
+                log.error("tick(): day PnL refresh failed: {}", ex.getMessage());
             }
 
             publishState();
@@ -241,8 +291,8 @@ public class EngineService {
             MarketSentimentSnapshot snap = null;
             try {
                 snap = sentimentService.getNow().get();
-            } catch (Throwable t) {
-                log.debug("Engine: sentiment refresh failed: {}", t.getMessage());
+            } catch (Exception t) {
+                log.error("Engine: sentiment refresh failed: {}", t.getMessage());
             }
 
             // 2) Decision quality (pulls live PCR / momentum / slippage via dependencies)
@@ -268,12 +318,12 @@ public class EngineService {
             // 4) Push engine heartbeat (non-blocking)
             try {
                 stream.send("engine.heartbeat", hb);
-            } catch (Throwable ignored) {
-                log.info(" Engine: heartbeat stream error: {}", ignored.getMessage());
+            } catch (Exception ignored) {
+                log.error(" Engine: heartbeat stream error: {}", ignored);
             }
 
-        } catch (Throwable t) {
-            log.warn("Engine tick failed", t);
+        } catch (Exception t) {
+            log.error("Engine tick failed", t);
         }
     }
 
@@ -286,8 +336,8 @@ public class EngineService {
                     state.isRunning(), state.getTicks(), state.getLastExecuted(), safe(lastError));
             // Sticky so new SSE subscribers get the latest instantly
             stream.sendSticky("engine.state", state);
-        } catch (Throwable ex) {
-            log.info("publishState(): failed to emit engine.state: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("publishState(): failed to emit engine.state: {}", ex.getMessage(), ex);
         }
     }
 
@@ -303,8 +353,8 @@ public class EngineService {
         try {
             List<Advice> fetched = adviceRepo.findAll();
             all.addAll(fetched);
-        } catch (Throwable ex) {
-            log.warn("findPendingAdvices(): repo fetch failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("findPendingAdvices(): repo fetch failed: {}", ex.getMessage(), ex);
         }
         if (all.isEmpty()) return Collections.emptyList();
 
@@ -328,31 +378,6 @@ public class EngineService {
         List<Advice> out = new ArrayList<>(Math.min(filtered.size(), cap));
         for (int i = 0; i < filtered.size() && i < cap; i++) out.add(filtered.get(i));
         return out;
-    }
-
-    // Small reflect helpers to avoid hard-coupling to Risk DTO shape
-    private boolean reflectBoolean(Object obj, String... getters) {
-        if (obj == null) return false;
-        for (String getter : getters) {
-            try {
-                Object v = obj.getClass().getMethod(getter).invoke(obj);
-                if (v instanceof Boolean) return (Boolean) v;
-            } catch (Throwable ignored) {
-            }
-        }
-        return false;
-    }
-
-    private String reflectString(Object obj, String... getters) {
-        if (obj == null) return null;
-        for (String getter : getters) {
-            try {
-                Object v = obj.getClass().getMethod(getter).invoke(obj);
-                if (v != null) return String.valueOf(v);
-            } catch (Throwable ignored) {
-            }
-        }
-        return null;
     }
 
     private void registerExitPlanFromAdvice(Advice a) {
@@ -426,7 +451,7 @@ public class EngineService {
                 if (!slWorking && !tpWorking) {
                     exitPlans.remove(plan.instrumentKey);
                 }
-            } catch (Throwable t) {
+            } catch (Exception t) {
                 // keep engine resilient—do not throw
             }
         }
@@ -437,7 +462,7 @@ public class EngineService {
             var q = upstoxService.getMarketLTPQuote(instrumentKey);
             double px = q.getData().get(instrumentKey).getLast_price();
             return px > 0 ? new BigDecimal(px).setScale(2, RoundingMode.HALF_UP) : null;
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return null;
         }
     }
@@ -477,7 +502,7 @@ public class EngineService {
                 plan.tpOrderId = id;
             }
         } catch (Exception e) {
-            // keep engine resilient
+            log.error("onAdviceExecuted(): failed to place SL/TP: {}", e);
         }
     }
 
@@ -578,9 +603,193 @@ public class EngineService {
             // }
 
 
-        } catch (Throwable ex) {
-            log.debug("manageProtectiveOrders(): failed: {}", ex.getMessage(), ex);
+        } catch (Exception ex) {
+            log.error("manageProtectiveOrders(): failed: {}", ex.getMessage(), ex);
         }
+    }
+
+    // UPDATED: safe, conservative re-strike manager with extra triggers and atomic exit->enter
+    private void restrikeManagerTick() {
+        try {
+            // throttle checks
+            Instant now = Instant.now();
+            if (Duration.between(lastRestrikeCheckAt, now).toMinutes() < RESTRIKE_CHECK_MINUTES) return;
+            lastRestrikeCheckAt = now;
+
+            // cut-off by time (IST)
+            ZonedDateTime z = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
+            int hhmm = z.getHour() * 100 + z.getMinute();
+            if (hhmm >= DO_NOT_RESTRIKE_AFTER_HHMM) return;
+
+            // per-hour limit
+            int hourKey = z.getYear() * 1000000 + z.getDayOfYear() * 100 + z.getHour();
+            if (hourKey != restrikeHourKey) {
+                restrikeHourKey = hourKey;
+                restrikeCountThisHour = 0;
+            }
+            if (restrikeCountThisHour >= RESTRIKE_MAX_PER_HOUR) return;
+
+            // prerequisites
+            Result<List<Advice>> res = adviceService.list();
+            if (res == null || !res.isOk() || res.get() == null) return;
+
+            double spot = 0.0;
+            try {
+                LTP_Quotes q = upstoxService.getMarketLTPQuote(underlyingKey);
+                if (q != null && q.getData() != null && q.getData().get(underlyingKey) != null) {
+                    spot = q.getData().get(underlyingKey).getLast_price();
+                }
+            } catch (Exception ignored) {
+                log.error(" restrikeManagerTick(): failed to fetch LTP", ignored);
+            }
+            if (spot <= 0) return;
+
+            BigDecimal atm = optionChainService.computeAtmStrike(BigDecimal.valueOf(spot), 50);
+
+            // --- new change-detection signals ---
+            Integer currDir = getCurrentDirScoreSafe();
+            BigDecimal atrPct = getCurrentAtrPctSafe();
+            // Use the same thresholds you already use elsewhere (quiet ≤0.30%, volatile ≥1.00%).
+            AtrBand currBand = atrBandOf(atrPct, new BigDecimal("0.30"), new BigDecimal("1.00"));
+
+            boolean dirFlipTrigger = dirFlipped(lastDirScoreForRestrike, currDir, 10); // |score| ≥ 10 = directional
+            boolean atrBandTrigger = atrBandChanged(lastAtrBandForRestrike, currBand);
+
+            int triggered = 0;
+
+            // --- existing ATM-shift trigger (per executed long leg) ---
+            for (Advice a : res.get()) {
+                if (a == null || a.getStatus() != AdviceStatus.EXECUTED) continue;
+                if (!"BUY".equalsIgnoreCase(a.getTransaction_type())) continue;
+                if (a.getSymbol() == null || a.getInstrument_token() == null) continue;
+
+                Integer k = parseStrikeFromSymbol(a.getSymbol());
+                if (k == null) continue;
+
+                int steps = Math.abs(k - atm.intValue()) / 50;
+                boolean atmShiftTrigger = steps >= RESTRIKE_TRIGGER_ATM_SHIFT;
+
+                // fire if any trigger is true
+                if (atmShiftTrigger || dirFlipTrigger || atrBandTrigger) {
+                    int qty = a.getQuantity() <= 0 ? 0 : a.getQuantity();
+
+                    Advice exit = new Advice();
+                    exit.setSymbol(a.getSymbol());
+                    exit.setInstrument_token(a.getInstrument_token());
+                    exit.setTransaction_type("SELL");
+                    exit.setOrder_type("MARKET");
+                    exit.setProduct("MIS");
+                    exit.setValidity("DAY");
+                    exit.setQuantity(qty > 0 ? qty : 50);
+                    String tag = atmShiftTrigger ? ("ATM shift " + steps + " step(s)")
+                            : dirFlipTrigger ? "DIR flip" : "ATR band change";
+                    exit.setReason("RESTRIKE: " + tag);
+                    exit.setStatus(AdviceStatus.PENDING);
+                    exit.setCreatedAt(Instant.now());
+                    exit.setUpdatedAt(Instant.now());
+
+                    adviceService.create(exit);
+
+                    triggered++;
+                    restrikeCountThisHour++;
+                    if (restrikeCountThisHour >= RESTRIKE_MAX_PER_HOUR) break;
+                }
+            }
+
+            // immediately enter new legs after exits (atomic roll)
+            if (triggered > 0) {
+                try {
+                    int made = strategyService.generateAdvicesNow();
+                    log.info("restrike: exits={}, new-buys={}", triggered, made);
+                } catch (Exception ignored) {
+                    log.error(" restrikeManagerTick(): failed to generate new advices", ignored);
+                }
+            }
+
+            // remember current signals
+            lastDirScoreForRestrike = currDir;
+            lastAtrBandForRestrike = currBand;
+
+        } catch (Exception t) {
+            log.info("restrikeManagerTick(): {}", t);
+        }
+    }
+
+
+    private Integer parseStrikeFromSymbol(String sym) {
+        if (sym == null) return null;
+        try {
+            String[] parts = sym.trim().split("\\s+");
+            for (String p : parts) {
+                if (p.matches("\\d{4,5}")) return Integer.parseInt(p);
+            }
+        } catch (Exception ignored) {
+            log.error(" parseStrikeFromSymbol(): failed to parse strike from symbol {}", sym, ignored);
+        }
+        return null;
+    }
+
+    private AtrBand atrBandOf(BigDecimal atrPct, BigDecimal quietMaxPct, BigDecimal volatileMinPct) {
+        if (atrPct == null) return AtrBand.NORMAL;
+        if (quietMaxPct != null && atrPct.compareTo(quietMaxPct) <= 0) return AtrBand.QUIET;
+        if (volatileMinPct != null && atrPct.compareTo(volatileMinPct) >= 0) return AtrBand.VOLATILE;
+        return AtrBand.NORMAL;
+    }
+
+    private boolean dirFlipped(Integer prev, Integer curr, int thrAbs) {
+        if (prev == null || curr == null) return false;
+        boolean prevBull = prev >= +thrAbs, prevBear = prev <= -thrAbs;
+        boolean currBull = curr >= +thrAbs, currBear = curr <= -thrAbs;
+        return (prevBull && currBear) || (prevBear && currBull);
+    }
+
+    private boolean atrBandChanged(AtrBand before, AtrBand now) {
+        return before != null && now != null && before != now;
+    }
+
+    private Integer getCurrentDirScoreSafe() {
+        try {
+            Result<DecisionQuality> r = decisionService.getQuality();
+            return (r != null && r.isOk() && r.get() != null) ? r.get().getScore() : null;
+        } catch (Exception t) {
+            return null;
+        }
+    }
+
+    /**
+     * Compute ATR% from last 20×5m candles of the underlying (no dependency on MDS).
+     */
+    private BigDecimal getCurrentAtrPctSafe() {
+        try {
+            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(underlyingKey, "minutes", "5");
+            List<IntradayCandleResponse.Candle> cs = (ic == null) ? null : ic.toCandleList();
+            if (cs == null || cs.size() < 21) return null; // need >= 21 to have 20 TRs
+
+            // ATR over last 20 bars (simple average TR)
+            int len = cs.size();
+            int lookback = 20;
+            double sumTR = 0.0;
+            for (int i = len - lookback; i < len; i++) {
+                IntradayCandleResponse.Candle cur = cs.get(i);
+                IntradayCandleResponse.Candle prev = cs.get(i - 1);
+                double hl = cur.getHigh() - cur.getLow();
+                double hp = Math.abs(cur.getHigh() - prev.getClose());
+                double lp = Math.abs(cur.getLow() - prev.getClose());
+                sumTR += Math.max(hl, Math.max(hp, lp));
+            }
+            double atr = sumTR / lookback;
+            double last = cs.get(len - 1).getClose();
+            if (last <= 0.0) return null;
+            return BigDecimal.valueOf((atr / last) * 100.0).setScale(2, RoundingMode.HALF_UP);
+        } catch (Exception t) {
+            return null;
+        }
+    }
+
+    // put this helper anywhere private in the class
+    private static void appendReason(StringBuilder sb, String part) {
+        if (sb.length() > 0) sb.append("; ");
+        sb.append(part);
     }
 
 }
