@@ -3,8 +3,10 @@ package com.trade.frankenstein.trader.service;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.enums.OptionType;
-import com.trade.frankenstein.trader.model.upstox.OptionGreekResponse;
-import com.trade.frankenstein.trader.model.upstox.OptionsInstruments;
+import com.upstox.api.GetMarketQuoteOptionGreekResponseV3;
+import com.upstox.api.GetOptionContractResponse;
+import com.upstox.api.InstrumentData;
+import com.upstox.api.MarketQuoteOptionGreekV3;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -39,16 +41,16 @@ public class OptionChainService {
     /**
      * List all contracts in a strike range (inclusive) for a given expiry.
      */
-    public Result<List<OptionsInstruments.OptionInstrument>> listContractsByStrikeRange(
+    public Result<List<InstrumentData>> listContractsByStrikeRange(
             String underlyingKey, LocalDate expiry, BigDecimal minStrike, BigDecimal maxStrike) {
 
         if (isBlank(underlyingKey) || expiry == null || minStrike == null || maxStrike == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, minStrike, maxStrike are required");
         }
-        List<OptionsInstruments.OptionInstrument> all = fetchInstruments(underlyingKey, expiry);
-        List<OptionsInstruments.OptionInstrument> filtered = all.stream()
-                .filter(c -> c.getStrike_price() >= minStrike.intValue() && c.getStrike_price() <= maxStrike.intValue())
-                .sorted(Comparator.comparingInt(OptionsInstruments.OptionInstrument::getStrike_price))
+        List<InstrumentData> all = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> filtered = all.stream()
+                .filter(c -> c.getStrikePrice() >= minStrike.intValue() && c.getStrikePrice() <= maxStrike.intValue())
+                .sorted(Comparator.comparingDouble(InstrumentData::getStrikePrice))
                 .collect(Collectors.toList());
         return Result.ok(filtered);
     }
@@ -76,7 +78,7 @@ public class OptionChainService {
         List<LocalDate> found = new ArrayList<>();
         for (LocalDate d : candidates) {
             try {
-                List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, d);
+                List<InstrumentData> instruments = fetchInstruments(underlyingKey, d);
                 if (!instruments.isEmpty()) {
                     found.add(d);
                     if (found.size() >= Math.max(1, count)) break; // early exit once we have enough
@@ -98,20 +100,20 @@ public class OptionChainService {
     /**
      * Find a single contract by expiry, strike and CALL/PUT.
      */
-    public Result<OptionsInstruments.OptionInstrument> findContract(
+    public Result<InstrumentData> findContract(
             String underlyingKey, LocalDate expiry, BigDecimal strike, OptionType type) {
 
         if (isBlank(underlyingKey) || expiry == null || strike == null || type == null) {
             return Result.fail("BAD_REQUEST", "params required");
         }
-        List<OptionsInstruments.OptionInstrument> data = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> data = fetchInstruments(underlyingKey, expiry);
         String otp = optTypeCode(type); // "CE"/"PE"
         int k = strike.intValue();
 
-        for (OptionsInstruments.OptionInstrument oi : data) {
-            if (oi.getUnderlying_type() != null
-                    && otp.equalsIgnoreCase(oi.getUnderlying_type())
-                    && oi.getStrike_price() == k) {
+        for (InstrumentData oi : data) {
+            if (oi.getUnderlyingType() != null
+                    && otp.equalsIgnoreCase(oi.getUnderlyingType())
+                    && oi.getStrikePrice() == k) {
                 return Result.ok(oi);
             }
         }
@@ -121,7 +123,7 @@ public class OptionChainService {
     /**
      * Get a compact chain around ATM (± N strikes), using a given step (e.g. 50 for NIFTY).
      */
-    public Result<List<OptionsInstruments.OptionInstrument>> getChainAroundAtm(
+    public Result<List<InstrumentData>> getChainAroundAtm(
             String underlyingKey, LocalDate expiry, BigDecimal underlyingLtp,
             int strikesEachSide, int strikeStep) {
 
@@ -147,19 +149,19 @@ public class OptionChainService {
     public Result<BigDecimal> getOiPcr(String underlyingKey, LocalDate expiry) {
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         long ceOi = 0L, peOi = 0L;
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+        for (InstrumentData oi : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
-            long oiVal = Math.max(0, g.getOi());
-            if ("CE".equalsIgnoreCase(oi.getUnderlying_type())) ceOi += oiVal;
-            else if ("PE".equalsIgnoreCase(oi.getUnderlying_type())) peOi += oiVal;
+            long oiVal = Math.max(0, g.getOi().longValue());
+            if ("CE".equalsIgnoreCase(oi.getUnderlyingType())) ceOi += oiVal;
+            else if ("PE".equalsIgnoreCase(oi.getUnderlyingType())) peOi += oiVal;
         }
         if (ceOi == 0L) return Result.fail("DIV_BY_ZERO", "Call OI zero");
         BigDecimal pcr = new BigDecimal(peOi).divide(new BigDecimal(ceOi), 6, RoundingMode.HALF_UP);
@@ -172,19 +174,19 @@ public class OptionChainService {
     public Result<BigDecimal> getVolumePcr(String underlyingKey, LocalDate expiry) {
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         long ceVol = 0L, peVol = 0L;
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+        for (InstrumentData oi : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
             long vol = Math.max(0, g.getVolume());
-            if ("CE".equalsIgnoreCase(oi.getUnderlying_type())) ceVol += vol;
-            else if ("PE".equalsIgnoreCase(oi.getUnderlying_type())) peVol += vol;
+            if ("CE".equalsIgnoreCase(oi.getUnderlyingType())) ceVol += vol;
+            else if ("PE".equalsIgnoreCase(oi.getUnderlyingType())) peVol += vol;
         }
         if (ceVol == 0L) return Result.fail("DIV_BY_ZERO", "Call volume zero");
         BigDecimal pcr = new BigDecimal(peVol).divide(new BigDecimal(ceVol), 6, RoundingMode.HALF_UP);
@@ -197,19 +199,19 @@ public class OptionChainService {
     public Result<BigDecimal> getMaxPainStrike(String underlyingKey, LocalDate expiry) {
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         Map<Integer, Long> strikeSumOi = new HashMap<>();
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+        for (InstrumentData oi : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
-            int k = oi.getStrike_price();
+            int k = oi.getStrikePrice().intValue();
             long prev = strikeSumOi.getOrDefault(k, 0L);
-            strikeSumOi.put(k, prev + Math.max(0, g.getOi()));
+            strikeSumOi.put(k, prev + Math.max(0, g.getOi().longValue()));
         }
         if (strikeSumOi.isEmpty()) return Result.fail("NOT_FOUND", "No strike OI");
 
@@ -227,13 +229,13 @@ public class OptionChainService {
     /**
      * Raw greeks map (keyed by instrument_key) for all contracts of an expiry.
      */
-    public Result<Map<String, OptionGreekResponse.OptionGreek>> getGreeksForExpiry(String underlyingKey, LocalDate expiry) {
+    public Result<Map<String, MarketQuoteOptionGreekV3>> getGreeksForExpiry(String underlyingKey, LocalDate expiry) {
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
         return Result.ok(greeks);
     }
@@ -252,10 +254,10 @@ public class OptionChainService {
         if (isBlank(underlyingKey) || expiry == null || type == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, type required");
         }
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         String side = optTypeCode(type); // "CE" / "PE"
@@ -299,10 +301,10 @@ public class OptionChainService {
             return Result.fail("BAD_REQUEST", "params required");
         }
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         String side = optTypeCode(type);
@@ -312,15 +314,15 @@ public class OptionChainService {
         List<BigDecimal> ivs = new ArrayList<>();
         BigDecimal targetIv = null;
 
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            if (!side.equalsIgnoreCase(oi.getUnderlying_type())) continue;
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+        for (InstrumentData oi : instruments) {
+            if (!side.equalsIgnoreCase(oi.getUnderlyingType())) continue;
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
             BigDecimal iv = safeIv(g);
             if (iv == null) continue;
 
             ivs.add(iv);
-            if (oi.getStrike_price() == k) targetIv = iv;
+            if (oi.getStrikePrice() == k) targetIv = iv;
         }
 
         if (ivs.isEmpty() || targetIv == null) return Result.fail("NOT_FOUND", "IVs not available for strike/type");
@@ -349,26 +351,26 @@ public class OptionChainService {
         BigDecimal min = atm.subtract(new BigDecimal(step * strikesEachSide));
         BigDecimal max = atm.add(new BigDecimal(step * strikesEachSide));
 
-        List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
-        Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
         if (greeks == null || greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         // Collect IVs within the range by side
         List<BigDecimal> ceIvs = new ArrayList<>();
         List<BigDecimal> peIvs = new ArrayList<>();
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            int k = oi.getStrike_price();
+        for (InstrumentData oi : instruments) {
+            int k = oi.getStrikePrice().intValue();
             if (k < min.intValue() || k > max.intValue()) continue;
 
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
 
             BigDecimal iv = safeIv(g);
             if (iv == null) continue;
 
-            if ("CE".equalsIgnoreCase(oi.getUnderlying_type())) ceIvs.add(iv);
-            else if ("PE".equalsIgnoreCase(oi.getUnderlying_type())) peIvs.add(iv);
+            if ("CE".equalsIgnoreCase(oi.getUnderlyingType())) ceIvs.add(iv);
+            else if ("PE".equalsIgnoreCase(oi.getUnderlyingType())) peIvs.add(iv);
         }
 
         if (ceIvs.isEmpty() || peIvs.isEmpty()) {
@@ -408,9 +410,9 @@ public class OptionChainService {
     // Internals (live reads + batching)
     // =================================================================================
 
-    private List<OptionsInstruments.OptionInstrument> fetchInstruments(String underlyingKey, LocalDate expiry) {
+    private List<InstrumentData> fetchInstruments(String underlyingKey, LocalDate expiry) {
         try {
-            OptionsInstruments resp = upstox.getOptionInstrument(underlyingKey, expiry.toString());
+            GetOptionContractResponse resp = upstox.getOptionInstrument(underlyingKey, expiry.toString());
             if (resp == null || resp.getData() == null) return Collections.emptyList();
             return resp.getData();
         } catch (Exception t) {
@@ -422,18 +424,18 @@ public class OptionChainService {
     /**
      * Call greeks in batches to respect any CSV length limits.
      */
-    private Map<String, OptionGreekResponse.OptionGreek> fetchGreeksMap(List<OptionsInstruments.OptionInstrument> instruments) {
-        Map<String, OptionGreekResponse.OptionGreek> out = new HashMap<>();
+    private Map<String, MarketQuoteOptionGreekV3> fetchGreeksMap(List<InstrumentData> instruments) {
+        Map<String, MarketQuoteOptionGreekV3> out = new HashMap<>();
         List<String> keys = new ArrayList<>(instruments.size());
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            String k = oi.getInstrument_key();
+        for (InstrumentData oi : instruments) {
+            String k = oi.getInstrumentKey();
             if (k != null && !k.trim().isEmpty()) keys.add(k);
         }
         final int BATCH = 100; // adjust if API allows larger CSV
         for (int i = 0; i < keys.size(); i += BATCH) {
             String csv = joinCsv(keys, i, Math.min(i + BATCH, keys.size()));
             try {
-                OptionGreekResponse g = upstox.getOptionGreeks(csv);
+                GetMarketQuoteOptionGreekResponseV3 g = upstox.getOptionGreeks(csv);
                 if (g != null && g.getData() != null) out.putAll(g.getData());
             } catch (Exception t) {
                 log.error("fetchGreeksMap batch failed: {}", t);
@@ -467,16 +469,16 @@ public class OptionChainService {
     // Previously added helpers (kept)
     // =================================================================================
 
-    public Optional<OptionGreekResponse.OptionGreek> getGreek(String instrumentKey) {
+    public Optional<MarketQuoteOptionGreekV3> getGreek(String instrumentKey) {
         try {
             Result<List<LocalDate>> expsRes = listNearestExpiries(Underlyings.NIFTY, 3);
             if (expsRes == null || !expsRes.isOk() || expsRes.get() == null) return Optional.empty();
 
             for (LocalDate exp : expsRes.get()) {
-                Result<Map<String, OptionGreekResponse.OptionGreek>> opt =
+                Result<Map<String, MarketQuoteOptionGreekV3>> opt =
                         getGreeksForExpiry(Underlyings.NIFTY, exp);
                 if (opt.isOk()) {
-                    OptionGreekResponse.OptionGreek g = opt.get().get(instrumentKey);
+                    MarketQuoteOptionGreekV3 g = opt.get().get(instrumentKey);
                     if (g != null) return Optional.of(g);
                 }
             }
@@ -500,18 +502,18 @@ public class OptionChainService {
 
     private OiSnapshot computeOiSnapshot(String underlyingKey, LocalDate expiry) {
         try {
-            List<OptionsInstruments.OptionInstrument> instruments = fetchInstruments(underlyingKey, expiry);
+            List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
             if (instruments == null || instruments.isEmpty()) return null;
 
-            Map<String, OptionGreekResponse.OptionGreek> greeks = fetchGreeksMap(instruments);
+            Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
             if (greeks == null || greeks.isEmpty()) return null;
 
             long ceOi = 0L, peOi = 0L;
-            for (OptionsInstruments.OptionInstrument oi : instruments) {
-                OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+            for (InstrumentData oi : instruments) {
+                MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
                 if (g == null) continue;
-                long val = Math.max(0, g.getOi());
-                String side = oi.getUnderlying_type();
+                long val = Math.max(0, g.getOi().longValue());
+                String side = oi.getUnderlyingType();
                 if ("CE".equalsIgnoreCase(side)) ceOi += val;
                 else if ("PE".equalsIgnoreCase(side)) peOi += val;
             }
@@ -559,17 +561,17 @@ public class OptionChainService {
     // Private math helpers
     // =================================================================================
 
-    private Map<Integer, Long> oiByStrike(List<OptionsInstruments.OptionInstrument> instruments,
-                                          Map<String, OptionGreekResponse.OptionGreek> greeks,
+    private Map<Integer, Long> oiByStrike(List<InstrumentData> instruments,
+                                          Map<String, MarketQuoteOptionGreekV3> greeks,
                                           String side) {
         Map<Integer, Long> map = new HashMap<>();
-        for (OptionsInstruments.OptionInstrument oi : instruments) {
-            if (!side.equalsIgnoreCase(oi.getUnderlying_type())) continue;
-            OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+        for (InstrumentData oi : instruments) {
+            if (!side.equalsIgnoreCase(oi.getUnderlyingType())) continue;
+            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
-            int strike = oi.getStrike_price();
-            long val = Math.max(0, g.getOi());
-            map.put(strike, map.getOrDefault(strike, 0L) + val);
+            double strike = oi.getStrikePrice();
+            double val = Math.max(0.0, g.getOi());
+            map.put((int) strike, map.getOrDefault((int) strike, 0l) + (long) val);
         }
         return map;
     }
@@ -585,7 +587,7 @@ public class OptionChainService {
      * Safely read IV from greeks (supports BigDecimal/Number/String without reflection).
      * Returns null if IV not present/parsable.
      */
-    private static BigDecimal safeIv(OptionGreekResponse.OptionGreek g) {
+    private static BigDecimal safeIv(MarketQuoteOptionGreekV3 g) {
         try {
             Number v = g.getIv(); // your model exposes 'iv'; types may vary
             if (v == null) return null;

@@ -7,8 +7,7 @@ import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
-import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
+import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -17,10 +16,7 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @Slf4j
 @Service
@@ -106,7 +102,7 @@ public class DecisionService {
             // ----- Structure (ADX) for adaptive weights -----
             double adx14 = 0.0;
             try {
-                IntradayCandleResponse c5 = upstoxService.getIntradayCandleData(niftyUnderlyingKey, "minutes", "5");
+                GetIntraDayCandleResponse c5 = upstoxService.getIntradayCandleData(niftyUnderlyingKey, "minutes", "5");
                 adx14 = computeAdx14(c5); // helper below (safe on short history)
             } catch (Exception t) {
                 log.error("getQuality(): ADX unavailable: {}", t);
@@ -250,7 +246,7 @@ public class DecisionService {
         String rrTag = "RR:OK";
         try {
             // last 20 × 5-minute candles
-            IntradayCandleResponse ic =
+            GetIntraDayCandleResponse ic =
                     upstoxService.getIntradayCandleData(underlyingKey, "minutes", "5");
 
             double atr = computeAtr(ic, 20);   // absolute points
@@ -286,11 +282,11 @@ public class DecisionService {
         // ---- 2) Slippage tag (1-min live bar roughness vs MAX_SLIPPAGE_PCT) ----
         String slipTag = "LOW";
         try {
-            OHLC_Quotes q = upstoxService.getMarketOHLCQuote(underlyingKey, "I1");
+            GetMarketQuoteOHLCResponseV3 q = upstoxService.getMarketOHLCQuote(underlyingKey, "I1");
             if (q != null && q.getData() != null) {
-                OHLC_Quotes.OHLCData d = q.getData().get(underlyingKey);
-                if (d != null && d.getLive_ohlc() != null) {
-                    OHLC_Quotes.Ohlc o = d.getLive_ohlc();
+                MarketQuoteOHLCV3 d = q.getData().get(underlyingKey);
+                if (d != null && d.getLiveOhlc() != null) {
+                    OhlcV3 o = d.getLiveOhlc();
                     double high = o.getHigh();
                     double low = o.getLow();
                     double mid = (high + low) / 2.0;
@@ -328,50 +324,60 @@ public class DecisionService {
 
     // -------- IntradayCandleResponse helpers (array-of-arrays → typed list) --------
 
-    private static List<IntradayCandleResponse.Candle> candles(IntradayCandleResponse ic) {
-        if (ic == null) return java.util.Collections.<IntradayCandleResponse.Candle>emptyList();
+    private static IntraDayCandleData candles(GetIntraDayCandleResponse ic) {
+        if (ic == null) return null;
         try {
-            // Uses the converter added to IntradayCandleResponse
-            List<IntradayCandleResponse.Candle> list = ic.toCandleList();
-            return (list == null) ? java.util.Collections.<IntradayCandleResponse.Candle>emptyList() : list;
+            IntraDayCandleData list = ic.getData();
+            return (list == null) ? null : list;
         } catch (Exception t) {
             log.error("candles() parse failed: {}", t);
-            return java.util.Collections.<IntradayCandleResponse.Candle>emptyList();
+            return null;
         }
     }
 
-    private static double lastClose(IntradayCandleResponse ic) {
-        List<IntradayCandleResponse.Candle> cs = candles(ic);
-        return cs.isEmpty() ? 0.0 : cs.get(cs.size() - 1).getClose();
+    private static double lastClose(GetIntraDayCandleResponse ic) {
+        IntraDayCandleData cs = candles(ic);
+        if (cs == null) return 0.0;
+        List<List<Object>> list = cs.getCandles();
+        List<Object> last = (list == null || list.isEmpty()) ? null : list.get(list.size() - 1);
+        if (last == null || last.size() < 5) return 0.0;
+        Object closeObj = last.get(4);
+        if (!(closeObj instanceof Number)) return 0.0;
+        return ((Number) closeObj).doubleValue();
     }
 
     /**
      * Compute ATR (simple TR average) over last {@code n} candles.
      * Expects candles in chronological order.
      */
-    private static double computeAtr(IntradayCandleResponse ic, int n) {
-        List<IntradayCandleResponse.Candle> cs = candles(ic);
-        int len = cs.size();
+    private static double computeAtr(GetIntraDayCandleResponse ic, int n) {
+        IntraDayCandleData cs = candles(ic);
+        int len = cs.getCandles().size();
         if (len < 2) return 0.0;
 
-        // Use at most 'n' periods, but need a previous close → max (len - 1)
         int lookback = Math.min(n, len - 1);
-
         double sumTR = 0.0;
-        // start where (i - 1) is valid; include exactly 'lookback' TR values
-        for (int i = len - lookback; i < len; i++) {
-            IntradayCandleResponse.Candle cur = cs.get(i);
-            IntradayCandleResponse.Candle prev = cs.get(i - 1);
 
-            double highLow = cur.getHigh() - cur.getLow();
-            double highPrev = Math.abs(cur.getHigh() - prev.getClose());
-            double lowPrev = Math.abs(cur.getLow() - prev.getClose());
+        for (int i = len - lookback; i < len; i++) {
+            List<Object> cur = cs.getCandles().get(i);
+            List<Object> prev = cs.getCandles().get(i - 1);
+
+            double curHigh = ((Number) cur.get(2)).doubleValue();
+            double curLow = ((Number) cur.get(3)).doubleValue();
+
+            double prevClose = ((Number) prev.get(4)).doubleValue();
+
+
+            double highLow = curHigh - curLow;
+            double highPrev = Math.abs(curHigh - prevClose);
+            double lowPrev = Math.abs(curLow - prevClose);
 
             double tr = Math.max(highLow, Math.max(highPrev, lowPrev));
             if (tr > 0.0) sumTR += tr;
         }
-        return sumTR / lookback; // Simple moving average of TR
+        return sumTR / lookback;
     }
+
 
     private static final double ADX_TREND_MIN = 20.0;
 
@@ -410,19 +416,21 @@ public class DecisionService {
     /**
      * ADX(14) from 5m candles; safe on short history (returns 0.0 if insufficient).
      */
-    private double computeAdx14(IntradayCandleResponse ic) {
-        List<IntradayCandleResponse.Candle> cs = candles(ic);
-        if (cs == null || cs.size() < 16) return 0.0; // need prev candle + 14 window
-        // Minimal Wilder ADX implementation
-        double prevHigh = cs.get(0).getHigh();
-        double prevLow = cs.get(0).getLow();
-        double prevClose = cs.get(0).getClose();
+    private double computeAdx14(GetIntraDayCandleResponse ic) {
+        IntraDayCandleData cs = candles(ic);
+        if (cs == null || cs.getCandles().size() < 16) return 0.0;
+        List<Object> prev = cs.getCandles().get(0);
+
+        double prevClose = ((Number) prev.get(4)).doubleValue();
+        double prevHigh = ((Number) prev.get(2)).doubleValue();
+        double prevLow = ((Number) prev.get(3)).doubleValue();
+
 
         double tr14 = 0.0, plusDM14 = 0.0, minusDM14 = 0.0;
 
-        for (int i = 1; i < cs.size(); i++) {
-            double high = cs.get(i).getHigh();
-            double low = cs.get(i).getLow();
+        for (int i = 1; i < cs.getCandles().size(); i++) {
+            double high = ((Number) cs.getCandles().get(i).get(2)).doubleValue();
+            double low = ((Number) cs.getCandles().get(i).get(3)).doubleValue();
 
             double upMove = Math.max(0.0, high - prevHigh);
             double downMove = Math.max(0.0, prevLow - low);
@@ -443,7 +451,7 @@ public class DecisionService {
 
             prevHigh = high;
             prevLow = low;
-            prevClose = cs.get(i).getClose();
+            prevClose = ((Number) cs.getCandles().get(i).get(4)).doubleValue();
         }
 
         if (tr14 <= 1e-8) return 0.0;

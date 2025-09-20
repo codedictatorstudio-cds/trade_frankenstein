@@ -7,9 +7,9 @@ import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
-import com.trade.frankenstein.trader.model.upstox.LTP_Quotes;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
+import com.upstox.api.GetIntraDayCandleResponse;
+import com.upstox.api.GetMarketQuoteLastTradedPriceResponseV3;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -17,8 +17,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -270,8 +268,8 @@ public class EngineService {
             try {
                 Result<PortfolioService.PortfolioSummary> ps = portfolioService.getPortfolioSummary();
                 if (ps != null && ps.isOk() && ps.get() != null) {
-                    BigDecimal day = ps.get().getDayPnl();
-                    BigDecimal lossAbs = (day != null && day.signum() < 0) ? day.abs() : BigDecimal.ZERO;
+                    Float day = toFloat(ps.get().getDayPnl());
+                    float lossAbs = (day != null && day < 0f) ? -day : 0f;
                     riskService.updateDailyLossAbs(lossAbs);
                 }
             } catch (Exception ex) {
@@ -385,8 +383,8 @@ public class EngineService {
         Matcher m = EXIT_HINTS.matcher(a.getReason());
         if (!m.find()) return;
 
-        BigDecimal sl = toBd(m.group(1));
-        BigDecimal tp = toBd(m.group(2));
+        Float sl = Float.valueOf(m.group(1));
+        Float tp = Float.valueOf(m.group(2));
         int ttl = safeInt(m.group(3), 35);
         if (sl == null || tp == null) return;
 
@@ -397,16 +395,6 @@ public class EngineService {
         exitPlans.put(a.getInstrument_token(), new ExitPlan(a.getInstrument_token(), qty, sl, tp, ttl));
     }
 
-    private static BigDecimal toBd(String s) {
-        if (s == null) return null;
-        try {
-            String t = s.trim().replaceAll("[^0-9.\\-]", "");
-            if (t.isEmpty()) return null;
-            return new BigDecimal(t).setScale(2, RoundingMode.HALF_UP);
-        } catch (Exception e) {
-            return null;
-        }
-    }
 
     private static int safeInt(String s, int dflt) {
         try {
@@ -421,7 +409,7 @@ public class EngineService {
             try {
                 // 1) Time-stop: if expired, force exit by moving SL to (≈) market
                 if (Instant.now().isAfter(plan.expiresAt)) {
-                    BigDecimal ltp = getLtp(plan.instrumentKey);
+                    Float ltp = getLtp(plan.instrumentKey);
                     if (ltp != null && plan.slOrderId != null) {
                         // move SL to current LTP to trigger an immediate exit
                         ordersService.amendOrderPrice(plan.slOrderId, ltp);
@@ -432,13 +420,14 @@ public class EngineService {
 
                 // 2) Simple trailing: if in profit ≥ +20% from implied entry, trail SL to breakeven
                 // infer approximate entry from SL hint (slInit ≈ entry * (1 - 0.25)) ⇒ entry ≈ slInit / 0.75
-                BigDecimal entryEst = (plan.slInit != null) ? plan.slInit.divide(new BigDecimal("0.75"), 2, RoundingMode.HALF_UP) : null;
-                BigDecimal ltp = getLtp(plan.instrumentKey);
+                Float entryEst = (plan.slInit != null) ? (plan.slInit / 0.75f) : null;
+
+                Float ltp = getLtp(plan.instrumentKey);
                 if (entryEst != null && ltp != null) {
-                    BigDecimal up20 = entryEst.multiply(new BigDecimal("1.20"));
-                    if (ltp.compareTo(up20) >= 0) {
-                        BigDecimal be = entryEst; // move SL to breakeven
-                        if (plan.slOrderId != null && plan.slLive != null && be.compareTo(plan.slLive) > 0) {
+                    float up20 = entryEst * 1.20f;
+                    if (ltp >= up20) {
+                        Float be = entryEst; // move SL to breakeven
+                        if (plan.slOrderId != null && plan.slLive != null && be > plan.slLive) {
                             ordersService.amendOrderPrice(plan.slOrderId, be);
                             plan.slLive = be;
                         }
@@ -457,14 +446,20 @@ public class EngineService {
         }
     }
 
-    private BigDecimal getLtp(String instrumentKey) {
+    private Float getLtp(String instrumentKey) {
         try {
             var q = upstoxService.getMarketLTPQuote(instrumentKey);
-            double px = q.getData().get(instrumentKey).getLast_price();
-            return px > 0 ? new BigDecimal(px).setScale(2, RoundingMode.HALF_UP) : null;
+            double px = q.getData().get(instrumentKey).getLastPrice();
+            if (px <= 0) return null;
+            float f = (float) px;
+            return round2(f);
         } catch (Exception t) {
             return null;
         }
+    }
+
+    private static float round2(float v) {
+        return Math.round(v * 100f) / 100f;
     }
 
     // Add these methods inside EngineService:
@@ -490,7 +485,7 @@ public class EngineService {
             // Place SL if not placed yet
             if (plan.slOrderId == null && plan.slInit != null && qty > 0) {
                 String id = ordersService.placeStopLossOrder(plan.instrumentKey, qty, plan.slInit)
-                        .get().getData().getOrder_ids().stream().findFirst().get();
+                        .get().getData().getOrderId();
                 plan.slOrderId = id;
                 plan.slLive = plan.slInit;
             }
@@ -498,7 +493,7 @@ public class EngineService {
             // Place TP if not placed yet
             if (plan.tpOrderId == null && plan.tpInit != null && qty > 0) {
                 String id = ordersService.placeTargetOrder(plan.instrumentKey, qty, plan.tpInit)
-                        .get().getData().getOrder_ids().stream().findFirst().get();
+                        .get().getData().getOrderId();
                 plan.tpOrderId = id;
             }
         } catch (Exception e) {
@@ -545,15 +540,15 @@ public class EngineService {
     private static class ExitPlan {
         final String instrumentKey;
         final int qty;
-        final BigDecimal slInit;
-        final BigDecimal tpInit;
+        final Float slInit;
+        final Float tpInit;
         final Instant createdAt;
         final Instant expiresAt;
-        BigDecimal slLive;
+        Float slLive;
         String slOrderId;
         String tpOrderId;
 
-        ExitPlan(String instrumentKey, int qty, BigDecimal sl, BigDecimal tp, int ttlMin) {
+        ExitPlan(String instrumentKey, int qty, Float sl, Float tp, int ttlMin) {
             this.instrumentKey = instrumentKey;
             this.qty = qty;
             this.slInit = sl;
@@ -562,10 +557,6 @@ public class EngineService {
             this.createdAt = Instant.now();
             this.expiresAt = this.createdAt.plus(Duration.ofMinutes(Math.max(1, ttlMin)));
         }
-    }
-
-    private static BigDecimal nz(BigDecimal v) {
-        return v == null ? BigDecimal.ZERO : v;
     }
 
     /**
@@ -584,12 +575,12 @@ public class EngineService {
 
             PortfolioService.PortfolioSummary ps = res.get();
 
-            BigDecimal dayPnl = nz(ps.getDayPnl());
-            BigDecimal dayPnlPct = nz(ps.getDayPnlPct());
+            Float dayPnl = toFloat(ps.getDayPnl());
+            Float dayPnlPct = toFloat(ps.getDayPnlPct());
             int positions = ps.getPositionsCount();
 
             // Convert portfolio readout to absolute daily loss for RiskService
-            BigDecimal dayLossAbs = dayPnl.signum() < 0 ? dayPnl.abs() : BigDecimal.ZERO;
+            float dayLossAbs = (dayPnl != null && dayPnl < 0f) ? -dayPnl : 0f;
             riskService.updateDailyLossAbs(dayLossAbs);
 
             log.info("manageProtectiveOrders(): positions={}, dayPnl={}, dayPnlPct={}, lossAbsFedToRisk={}",
@@ -598,7 +589,7 @@ public class EngineService {
             // If your RiskService auto-trips the circuit on updateDailyLossAbs() thresholds,
             // nothing more is needed here. Engine tick will naturally respect the circuit state.
             // If you want a hard stop when any loss is detected and positions are open, uncomment:
-            // if (positions > 0 && dayLossAbs.compareTo(BigDecimal.ZERO) > 0 && riskService.isDailyCircuitTripped()) {
+            // if (positions > 0 && dayLossAbs > 0f && riskService.isDailyCircuitTripped()) {
             //     log.warn("Circuit is tripped with open positions; execution will be skipped by engine guards.");
             // }
 
@@ -635,22 +626,22 @@ public class EngineService {
 
             double spot = 0.0;
             try {
-                LTP_Quotes q = upstoxService.getMarketLTPQuote(underlyingKey);
+                GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(underlyingKey);
                 if (q != null && q.getData() != null && q.getData().get(underlyingKey) != null) {
-                    spot = q.getData().get(underlyingKey).getLast_price();
+                    spot = q.getData().get(underlyingKey).getLastPrice();
                 }
             } catch (Exception ignored) {
                 log.error(" restrikeManagerTick(): failed to fetch LTP", ignored);
             }
             if (spot <= 0) return;
 
-            BigDecimal atm = optionChainService.computeAtmStrike(BigDecimal.valueOf(spot), 50);
+            int atmStrike = computeAtmStrikeInt((float) spot, 50);
 
             // --- new change-detection signals ---
             Integer currDir = getCurrentDirScoreSafe();
-            BigDecimal atrPct = getCurrentAtrPctSafe();
+            Float atrPct = getCurrentAtrPctSafe();
             // Use the same thresholds you already use elsewhere (quiet ≤0.30%, volatile ≥1.00%).
-            AtrBand currBand = atrBandOf(atrPct, new BigDecimal("0.30"), new BigDecimal("1.00"));
+            AtrBand currBand = atrBandOf(atrPct, 0.30f, 1.00f);
 
             boolean dirFlipTrigger = dirFlipped(lastDirScoreForRestrike, currDir, 10); // |score| ≥ 10 = directional
             boolean atrBandTrigger = atrBandChanged(lastAtrBandForRestrike, currBand);
@@ -666,7 +657,7 @@ public class EngineService {
                 Integer k = parseStrikeFromSymbol(a.getSymbol());
                 if (k == null) continue;
 
-                int steps = Math.abs(k - atm.intValue()) / 50;
+                int steps = Math.abs(k - atmStrike) / 50;
                 boolean atmShiftTrigger = steps >= RESTRIKE_TRIGGER_ATM_SHIFT;
 
                 // fire if any trigger is true
@@ -729,10 +720,10 @@ public class EngineService {
         return null;
     }
 
-    private AtrBand atrBandOf(BigDecimal atrPct, BigDecimal quietMaxPct, BigDecimal volatileMinPct) {
+    private AtrBand atrBandOf(Float atrPct, Float quietMaxPct, Float volatileMinPct) {
         if (atrPct == null) return AtrBand.NORMAL;
-        if (quietMaxPct != null && atrPct.compareTo(quietMaxPct) <= 0) return AtrBand.QUIET;
-        if (volatileMinPct != null && atrPct.compareTo(volatileMinPct) >= 0) return AtrBand.VOLATILE;
+        if (quietMaxPct != null && atrPct <= quietMaxPct) return AtrBand.QUIET;
+        if (volatileMinPct != null && atrPct >= volatileMinPct) return AtrBand.VOLATILE;
         return AtrBand.NORMAL;
     }
 
@@ -759,37 +750,65 @@ public class EngineService {
     /**
      * Compute ATR% from last 20×5m candles of the underlying (no dependency on MDS).
      */
-    private BigDecimal getCurrentAtrPctSafe() {
+    private Float getCurrentAtrPctSafe() {
         try {
-            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(underlyingKey, "minutes", "5");
-            List<IntradayCandleResponse.Candle> cs = (ic == null) ? null : ic.toCandleList();
+            GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(underlyingKey, "minutes", "5");
+            List<List<Object>> cs = (ic == null) ? null : ic.getData().getCandles();
             if (cs == null || cs.size() < 21) return null; // need >= 21 to have 20 TRs
 
             // ATR over last 20 bars (simple average TR)
             int len = cs.size();
             int lookback = 20;
             double sumTR = 0.0;
+
+            // Assuming each candle is [timestamp, open, high, low, close, volume, ...]
+            // Indices for high, low, close in the candle list
+            final int HIGH_IDX = 2;
+            final int LOW_IDX = 3;
+            final int CLOSE_IDX = 4;
+
             for (int i = len - lookback; i < len; i++) {
-                IntradayCandleResponse.Candle cur = cs.get(i);
-                IntradayCandleResponse.Candle prev = cs.get(i - 1);
-                double hl = cur.getHigh() - cur.getLow();
-                double hp = Math.abs(cur.getHigh() - prev.getClose());
-                double lp = Math.abs(cur.getLow() - prev.getClose());
+                List<Object> cur = cs.get(i);
+                List<Object> prev = cs.get(i - 1);
+
+                double high = ((Number) cur.get(HIGH_IDX)).doubleValue();
+                double low = ((Number) cur.get(LOW_IDX)).doubleValue();
+                double close = ((Number) cur.get(CLOSE_IDX)).doubleValue();
+                double prevClose = ((Number) prev.get(CLOSE_IDX)).doubleValue();
+
+                double hl = high - low;
+                double hp = Math.abs(high - prevClose);
+                double lp = Math.abs(low - prevClose);
                 sumTR += Math.max(hl, Math.max(hp, lp));
             }
+
             double atr = sumTR / lookback;
-            double last = cs.get(len - 1).getClose();
+            double last = ((Number) cs.get(len - 1).get(CLOSE_IDX)).doubleValue();
             if (last <= 0.0) return null;
-            return BigDecimal.valueOf((atr / last) * 100.0).setScale(2, RoundingMode.HALF_UP);
+            float pct = (float) ((atr / last) * 100.0);
+            return round2(pct);
         } catch (Exception t) {
             return null;
         }
     }
 
-    // put this helper anywhere private in the class
     private static void appendReason(StringBuilder sb, String part) {
         if (sb.length() > 0) sb.append("; ");
         sb.append(part);
+    }
+
+    private static int computeAtmStrikeInt(float spot, int step) {
+        if (step <= 0) step = 50;
+        int rounded = Math.round(spot);
+        int rem = rounded % step;
+        int down = rounded - rem;
+        int up = down + step;
+        // closest multiple; if tie, bias to down
+        return (rounded - down) <= (up - rounded) ? down : up;
+    }
+
+    private static Float toFloat(java.math.BigDecimal v) {
+        return v == null ? null : v.floatValue();
     }
 
 }

@@ -22,6 +22,8 @@
         <vaadin.version>24.8.3</vaadin.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <loki4j.version>1.5.2</loki4j.version>
+        <logstash.encoder.version>7.4</logstash.encoder.version>
     </properties>
 
     <!-- Keep only Vaadin BOM; Spring Boot parent already manages Spring deps -->
@@ -94,14 +96,13 @@
         <dependency>
             <groupId>com.upstox.api</groupId>
             <artifactId>upstox-java-sdk</artifactId>
-            <version>1.1.0</version>
+            <version>1.17</version>
             <scope>compile</scope>
         </dependency>
 
         <dependency>
-            <groupId>net.logstash.logback</groupId>
-            <artifactId>logstash-logback-encoder</artifactId>
-            <version>7.4</version>
+            <groupId>de.codecentric</groupId>
+            <artifactId>spring-boot-admin-starter-server</artifactId>
         </dependency>
 
         <!-- Tests -->

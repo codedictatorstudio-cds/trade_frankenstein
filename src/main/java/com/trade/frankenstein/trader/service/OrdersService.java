@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
-import com.trade.frankenstein.trader.model.upstox.*;
+import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -9,7 +9,6 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.*;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,7 +47,7 @@ public class OrdersService {
         try {
             if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
 
-            if (tradeMode.isSandBox() || !req.is_amo() || !isMarketOpenNowIst()) {
+            if (tradeMode.isSandBox() || !req.isIsAmo() || !isMarketOpenNowIst()) {
                 return Result.fail("MARKET_CLOSED", "Market is closed for placing orders");
             }
 
@@ -130,7 +129,7 @@ public class OrdersService {
     // READ/ANALYTICS passthroughs (no market-hours gating) -------------------
     // =========================================================================
 
-    public Result<OrderGetResponse> getOrder(String orderId) {
+    public Result<GetOrderDetailsResponse> getOrder(String orderId) {
         try {
             if (orderId == null || orderId.trim().isEmpty()) {
                 return Result.fail("BAD_REQUEST", "orderId is required");
@@ -142,9 +141,9 @@ public class OrdersService {
         }
     }
 
-    public Result<OrderHistoryResponse> listOrders(String order_id, String tag) {
+    public Result<GetOrderResponse> listOrders(String order_id, String tag) {
         try {
-            OrderHistoryResponse response = upstox.getOrderHistory(order_id, tag);
+            GetOrderResponse response = upstox.getOrderHistory(order_id, tag);
             if (response == null || response.getData() == null) {
                 return Result.fail("No orders present");
             }
@@ -155,158 +154,6 @@ public class OrdersService {
         }
     }
 
-    public Result<OrderTradesResponse> getOrderTrades() {
-        try {
-            return Result.ok(upstox.getOrderTrades());
-        } catch (Exception t) {
-            log.error("getOrderTrades failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    public Result<OrderTradesResponse> getOrderTrades(String order_id) {
-        try {
-
-            OrderTradesResponse response = upstox.getOrderTrades();
-            String status = response.getStatus();
-
-            List<OrderTradesResponse.TradeData> filteredData = response.getData().stream()
-                    .filter(trade -> trade.getOrder_id().equalsIgnoreCase(order_id))
-                    .toList();
-
-            OrderTradesResponse filteredResponse = OrderTradesResponse.builder().status(status).data(filteredData).build();
-
-            return Result.ok(filteredResponse);
-        } catch (Exception t) {
-            log.error("getOrderTrades failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    public Result<PortfolioResponse> getPortfolio() {
-        try {
-            return Result.ok(upstox.getShortTermPositions());
-        } catch (Exception t) {
-            log.error("getPortfolio failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    public Result<HoldingsResponse> getHoldings() {
-        try {
-            return Result.ok(upstox.getLongTermHoldings());
-        } catch (Exception t) {
-            log.error("getHoldings failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    public Result<FundsResponse> getFunds(String segment) {
-        try {
-            return Result.ok(upstox.getFundAndMargin(segment));
-        } catch (Exception t) {
-            log.error("getFunds failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * CSV of instrument_keys per Upstox API, e.g. "NSE:RELIANCE-EQ,NFO:NIFTY24SEP17500CE".
-     */
-    public Result<LTP_Quotes> getLtpQuotes(String instrumentKeyCsv) {
-        try {
-            if (instrumentKeyCsv == null || instrumentKeyCsv.trim().isEmpty()) {
-                return Result.fail("BAD_REQUEST", "instrumentKeyCsv is required");
-            }
-            return Result.ok(upstox.getMarketLTPQuote(instrumentKeyCsv));
-        } catch (Exception t) {
-            log.error("getLtpQuotes failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Interval examples: "1minute","3minute","5minute","15minute".
-     */
-    public Result<OHLC_Quotes> getMarketOhlc(String instrumentKey, String interval) {
-        try {
-            if (isBlank(instrumentKey) || isBlank(interval)) {
-                return Result.fail("BAD_REQUEST", "instrumentKey and interval are required");
-            }
-            return Result.ok(upstox.getMarketOHLCQuote(instrumentKey, interval));
-        } catch (Exception t) {
-            log.error("getMarketOhlc failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Intraday candles; e.g. candleType="minute", resolution="5".
-     */
-    public Result<IntradayCandleResponse> getIntradayCandles(String instrumentKey, String candleType, String resolution) {
-        try {
-            if (isBlank(instrumentKey) || isBlank(candleType) || isBlank(resolution)) {
-                return Result.fail("BAD_REQUEST", "instrumentKey, candleType and resolution are required");
-            }
-            return Result.ok(upstox.getIntradayCandleData(instrumentKey, candleType, resolution));
-        } catch (Exception t) {
-            log.error("getIntradayCandles failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Historical candles; e.g. interval="day", from="2024-01-01", to="2024-12-31".
-     */
-    public Result<HistoricalCandleResponse> getHistoricalCandles(String instrument_key, String unit, String interval, String to_date, String from_date) {
-        try {
-            if (isBlank(instrument_key) || isBlank(interval) || isBlank(from_date) || isBlank(to_date)) {
-                return Result.fail("BAD_REQUEST", "instrumentKey, interval, from, to are required");
-            }
-            return Result.ok(upstox.getHistoricalCandleData(instrument_key, unit, interval, to_date, from_date));
-        } catch (Exception t) {
-            log.error("getHistoricalCandles failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Option instruments for an underlying; expiry can be null for all.
-     */
-    public Result<OptionsInstruments> getOptionInstruments(String underlyingKey, String expiryDateIso) {
-        try {
-            if (isBlank(underlyingKey)) return Result.fail("BAD_REQUEST", "underlyingKey is required");
-            return Result.ok(upstox.getOptionInstrument(underlyingKey, expiryDateIso));
-        } catch (Exception t) {
-            log.error("getOptionInstruments failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Greeks for CSV of instrument_keys.
-     */
-    public Result<OptionGreekResponse> getOptionGreeks(String instrumentKeyCsv) {
-        try {
-            if (isBlank(instrumentKeyCsv)) return Result.fail("BAD_REQUEST", "instrumentKeyCsv is required");
-            return Result.ok(upstox.getOptionGreeks(instrumentKeyCsv));
-        } catch (Exception t) {
-            log.error("getOptionGreeks failed", t);
-            return Result.fail(t);
-        }
-    }
-
-    /**
-     * Market depth / order book for an instrument (if your UpstoxService exposes it).
-     */
-    public Result<List<OrderBookResponse>> getOrderBook() {
-        try {
-            return Result.ok(upstox.getOrderBook());
-        } catch (Exception t) {
-            log.error("getOrderBook failed", t);
-            return Result.fail(t);
-        }
-    }
 
     // =========================================================================
     // Helpers ----------------------------------------------------------------
@@ -346,12 +193,12 @@ public class OrdersService {
                 }
             }
             // 2) Fallback: 1m OHLC proxy ((H-L)/Close)
-            OHLC_Quotes q = upstoxService.getMarketOHLCQuote(instrumentKey, "I1");
-            OHLC_Quotes.OHLCData d = (q == null || q.getData() == null) ? null : q.getData().get(instrumentKey);
-            if (d == null || d.getLive_ohlc() == null) return true; // can't evaluate → allow
-            double hi = d.getLive_ohlc().getHigh();
-            double lo = d.getLive_ohlc().getLow();
-            double cl = d.getLive_ohlc().getClose();
+            GetMarketQuoteOHLCResponseV3 q = upstoxService.getMarketOHLCQuote(instrumentKey, "I1");
+            MarketQuoteOHLCV3 d = (q == null || q.getData() == null) ? null : q.getData().get(instrumentKey);
+            if (d == null || d.getLiveOhlc() == null) return true; // can't evaluate → allow
+            double hi = d.getLiveOhlc().getHigh();
+            double lo = d.getLiveOhlc().getLow();
+            double cl = d.getLiveOhlc().getClose();
             if (cl <= 0) return true; // allow if we can't compute properly
             double spread = (hi - lo) / cl;
             return BigDecimal.valueOf(spread).compareTo(maxSpreadPct) <= 0;
@@ -361,7 +208,7 @@ public class OrdersService {
     }
 
 
-    public Result<PlaceOrderResponse> placeTargetOrder(String instrumentKey, int qty, BigDecimal targetPrice) {
+    public Result<PlaceOrderResponse> placeTargetOrder(String instrumentKey, int qty, Float targetPrice) {
         try {
             if (tradeMode.isSandBox() || !isMarketOpenNowIst()) {
                 return Result.fail("MARKET_CLOSED", "Market is closed for placing target orders");
@@ -382,7 +229,7 @@ public class OrdersService {
         }
     }
 
-    public Result<PlaceOrderResponse> placeStopLossOrder(String instrumentKey, int qty, BigDecimal triggerPrice) {
+    public Result<PlaceOrderResponse> placeStopLossOrder(String instrumentKey, int qty, Float triggerPrice) {
         try {
             if (tradeMode.isSandBox() || !isMarketOpenNowIst()) {
                 return Result.fail("MARKET_CLOSED", "Market is closed for placing stop-loss orders");
@@ -403,7 +250,7 @@ public class OrdersService {
         }
     }
 
-    public Result<ModifyOrderResponse> amendOrderPrice(String orderId, BigDecimal newPrice) {
+    public Result<ModifyOrderResponse> amendOrderPrice(String orderId, Float newPrice) {
         try {
             if (tradeMode.isSandBox() || !isMarketOpenNowIst()) {
                 return Result.fail("MARKET_CLOSED", "Market is closed for modifying orders");
@@ -458,20 +305,20 @@ public class OrdersService {
             }
 
             // OHLC mid as proxy
-            OHLC_Quotes ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "1minute");
-            OHLC_Quotes.OHLCData d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
-            if (d != null && d.getLive_ohlc() != null) {
-                double hi = d.getLive_ohlc().getHigh();
-                double lo = d.getLive_ohlc().getLow();
+            GetMarketQuoteOHLCResponseV3 ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "1minute");
+            MarketQuoteOHLCV3 d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
+            if (d != null && d.getLiveOhlc() != null) {
+                double hi = d.getLiveOhlc().getHigh();
+                double lo = d.getLiveOhlc().getLow();
                 if (hi > 0 && lo > 0) {
                     return Optional.of(BigDecimal.valueOf((hi + lo) / 2.0).setScale(2, RoundingMode.HALF_UP));
                 }
             }
 
             // Fallback: LTP
-            LTP_Quotes ltp = upstoxService.getMarketLTPQuote(instrumentKey);
+            GetMarketQuoteLastTradedPriceResponseV3 ltp = upstoxService.getMarketLTPQuote(instrumentKey);
             double px = (ltp != null && ltp.getData() != null && ltp.getData().get(instrumentKey) != null)
-                    ? ltp.getData().get(instrumentKey).getLast_price() : 0.0;
+                    ? ltp.getData().get(instrumentKey).getLastPrice() : 0.0;
             return px > 0 ? Optional.of(BigDecimal.valueOf(px).setScale(2, RoundingMode.HALF_UP)) : Optional.empty();
         } catch (Exception t) {
             return Optional.empty();
@@ -497,12 +344,12 @@ public class OrdersService {
                 }
             }
             // Fallback: 1m OHLC proxy
-            OHLC_Quotes ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "I1");
-            OHLC_Quotes.OHLCData d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
-            if (d == null || d.getLive_ohlc() == null) return Optional.empty();
-            double hi = d.getLive_ohlc().getHigh();
-            double lo = d.getLive_ohlc().getLow();
-            double cl = d.getLive_ohlc().getClose();
+            GetMarketQuoteOHLCResponseV3 ohlc = upstoxService.getMarketOHLCQuote(instrumentKey, "I1");
+            MarketQuoteOHLCV3 d = (ohlc == null || ohlc.getData() == null) ? null : ohlc.getData().get(instrumentKey);
+            if (d == null || d.getLiveOhlc() == null) return Optional.empty();
+            double hi = d.getLiveOhlc().getHigh();
+            double lo = d.getLiveOhlc().getLow();
+            double cl = d.getLiveOhlc().getClose();
             if (hi <= 0 || lo <= 0 || cl <= 0) return Optional.empty();
             double pct = (hi - lo) / cl;
             return Optional.of(BigDecimal.valueOf(pct).setScale(4, RoundingMode.HALF_UP));

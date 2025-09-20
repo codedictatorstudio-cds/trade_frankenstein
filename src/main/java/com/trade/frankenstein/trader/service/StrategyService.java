@@ -8,10 +8,7 @@ import com.trade.frankenstein.trader.enums.OptionType;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
-import com.trade.frankenstein.trader.model.upstox.LTP_Quotes;
-import com.trade.frankenstein.trader.model.upstox.OptionGreekResponse;
-import com.trade.frankenstein.trader.model.upstox.OptionsInstruments;
+import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -162,7 +159,7 @@ public class StrategyService {
 
             // 3) Intraday candles (5m) with staleness check
             log.info("Fetching 5-minute candles");
-            List<IntradayCandleResponse.Candle> c5 = candles(NIFTY, "minutes", "5");
+            IntraDayCandleData c5 = candles(NIFTY, "minutes", "5");
             if (isStale(c5, 6)) {
                 log.info("Strategy execution skipped - stale candle data");
                 return skipTick(dbg, "stale-candles");
@@ -175,7 +172,7 @@ public class StrategyService {
 
             // 5) Multi-timeframe alignment
             log.info("Performing multi-timeframe analysis");
-            List<IntradayCandleResponse.Candle> c15 = candles(NIFTY, "minutes", "15");
+            IntraDayCandleData c15 = candles(NIFTY, "minutes", "15");
             Ind ind15 = indicators(c15, spot);
             MarketRegime hrReg = marketDataService.getRegimeOn("minutes", "60").orElse(MarketRegime.NEUTRAL);
 
@@ -366,7 +363,7 @@ public class StrategyService {
             log.info("Filtering legs by delta range and slippage constraints");
             List<LegSpec> filtered = new ArrayList<>();
             for (LegSpec L : legs) {
-                OptionsInstruments.OptionInstrument inst = findContract(L);
+                InstrumentData inst = findContract(L);
                 if (inst == null) {
                     log.info("Skipping leg - contract not found: {} {} {}", L.expiry, L.strike, L.type);
                     incLegSkipped("noContract", null);
@@ -374,37 +371,37 @@ public class StrategyService {
                 }
 
                 if (!passesLiquidity(inst)) {
-                    log.info("Skipping leg - illiquid (OI/spread) {}", inst.getInstrument_key());
-                    dbg.put("skip.liquidity", inst.getInstrument_key());
-                    incLegSkipped("liquidity", inst.getInstrument_key());
+                    log.info("Skipping leg - illiquid (OI/spread) {}", inst.getInstrumentKey());
+                    dbg.put("skip.liquidity", inst.getInstrumentKey());
+                    incLegSkipped("liquidity", inst.getInstrumentKey());
                     continue;
                 }
 
                 // NEW: IV percentile cap (skip very rich options)
                 Result<BigDecimal> ivPct = optionChainService.getIvPercentile(
-                        NIFTY, expiry, bd(inst.getStrike_price()), typeOf(inst));
+                        NIFTY, expiry, bd(inst.getStrikePrice()), typeOf(inst));
 
                 if (ivPct != null && ivPct.isOk() && ivPct.get() != null
                         && ivPct.get().compareTo(IV_PCTILE_SPIKE) >= 0) {
                     log.info("Skipping leg - IV%%ile too high: {} ≥ {}", ivPct.get(), IV_PCTILE_SPIKE);
                     dbg.put("skip.ivPctile", ivPct.get());
-                    incLegSkipped("ivPctile", inst.getInstrument_key());
+                    incLegSkipped("ivPctile", inst.getInstrumentKey());
                     continue;
                 }
-                if (!deltaInRange(inst.getInstrument_key())) {
-                    log.info("Skipping leg - delta out of range: {}", inst.getInstrument_key());
-                    dbg.put("skip.delta", inst.getInstrument_key());
-                    incLegSkipped("delta", inst.getInstrument_key());
+                if (!deltaInRange(inst.getInstrumentKey())) {
+                    log.info("Skipping leg - delta out of range: {}", inst.getInstrumentKey());
+                    dbg.put("skip.delta", inst.getInstrumentKey());
+                    incLegSkipped("delta", inst.getInstrumentKey());
                     continue;
                 }
-                if (!ordersService.preflightSlippageGuard(inst.getInstrument_key(), MAX_SPREAD_PCT)) {
-                    log.info("Skipping leg - excessive slippage: {}", inst.getInstrument_key());
-                    dbg.put("skip.slippage", inst.getInstrument_key());
-                    incLegSkipped("slippage", inst.getInstrument_key());
+                if (!ordersService.preflightSlippageGuard(inst.getInstrumentKey(), MAX_SPREAD_PCT)) {
+                    log.info("Skipping leg - excessive slippage: {}", inst.getInstrumentKey());
+                    dbg.put("skip.slippage", inst.getInstrumentKey());
+                    incLegSkipped("slippage", inst.getInstrumentKey());
                     continue;
                 }
-                filtered.add(new LegSpec(L.expiry, bd(inst.getStrike_price()), typeOf(inst)));
-                log.info("Accepted leg: {} {} {}", L.expiry, inst.getStrike_price(), typeOf(inst));
+                filtered.add(new LegSpec(L.expiry, bd(inst.getStrikePrice()), typeOf(inst)));
+                log.info("Accepted leg: {} {} {}", L.expiry, inst.getStrikePrice(), typeOf(inst));
             }
 
             if (filtered.isEmpty()) {
@@ -417,24 +414,24 @@ public class StrategyService {
             List<LegSpec> ranked = rankByTightestSpread(filtered);
             int createdNow = 0;
             for (LegSpec L : ranked) {
-                OptionsInstruments.OptionInstrument inst = findContract(L);
+                InstrumentData inst = findContract(L);
                 if (inst == null) continue;
 
                 String human = humanSymbol(inst);
-                if (isDuplicateInWindow(inst.getInstrument_key(), "BUY")) {
-                    log.info("Skipping leg - duplicate advice for {} in last {} min", inst.getInstrument_key(), DEDUPE_MINUTES);
-                    incLegSkipped("dedupe", inst.getInstrument_key());
+                if (isDuplicateInWindow(inst.getInstrumentKey(), "BUY")) {
+                    log.info("Skipping leg - duplicate advice for {} in last {} min", inst.getInstrumentKey(), DEDUPE_MINUTES);
+                    incLegSkipped("dedupe", inst.getInstrumentKey());
                     continue;
                 }
 
-                int lotSize = Math.max(1, inst.getLot_size());
+                int lotSize = Math.max(1, inst.getLotSize().intValue());
 
                 // fetch option LTP
                 double optLtp = 0.0;
                 try {
-                    LTP_Quotes q = upstoxService.getMarketLTPQuote(inst.getInstrument_key());
-                    if (q != null && q.getData() != null && q.getData().get(inst.getInstrument_key()) != null) {
-                        optLtp = q.getData().get(inst.getInstrument_key()).getLast_price();
+                    GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(inst.getInstrumentKey());
+                    if (q != null && q.getData() != null && q.getData().get(inst.getInstrumentKey()) != null) {
+                        optLtp = q.getData().get(inst.getInstrumentKey()).getLastPrice();
                     }
                 } catch (Exception ignore) {
                     log.error("Failed to fetch option LTP for {}", ignore);
@@ -443,14 +440,14 @@ public class StrategyService {
                 // compute per-leg lots using budget & ATR dampener
                 int lotsForThisLeg = dynamicLots(ind5.atrPct, optLtp, lotSize, risk, freeLots);
                 if (lotsForThisLeg < 1) {
-                    log.info("Skipping leg - zero lots after budget/ATR sizing: {}", inst.getInstrument_key());
-                    incLegSkipped("zeroLots", inst.getInstrument_key());
+                    log.info("Skipping leg - zero lots after budget/ATR sizing: {}", inst.getInstrumentKey());
+                    incLegSkipped("zeroLots", inst.getInstrumentKey());
                     continue;
                 }
                 int qty = lotSize * lotsForThisLeg;
                 freeLots = Math.max(0, freeLots - lotsForThisLeg);
 
-                ExitHints x = exitHints(inst.getInstrument_key());
+                ExitHints x = exitHints(inst.getInstrumentKey());
 
                 List<String> rs = new ArrayList<>(baseReasons);
                 rs.add(taSummary(ind5));
@@ -463,7 +460,7 @@ public class StrategyService {
 
                 Advice a = new Advice();
                 a.setSymbol(human);
-                a.setInstrument_token(inst.getInstrument_key());
+                a.setInstrument_token(inst.getInstrumentKey());
                 a.setTransaction_type("BUY");
                 a.setOrder_type("MARKET");
                 a.setProduct("MIS");
@@ -481,7 +478,7 @@ public class StrategyService {
 
                     // ADD: plain log line for the created advice
                     log.info("Created advice: {} qty={} (ik={}, expiry={}, strike={}, type={})",
-                            human, qty, inst.getInstrument_key(), L.expiry, L.strike, L.type);
+                            human, qty, inst.getInstrumentKey(), L.expiry, L.strike, L.type);
 
                     dbg.put("advice", human);
                     dbg.put("qty", qty);
@@ -602,7 +599,7 @@ public class StrategyService {
 
     private boolean deltaInRange(String instrumentKey) {
         try {
-            OptionGreekResponse.OptionGreek g = optionChainService.getGreek(instrumentKey).orElse(null);
+            MarketQuoteOptionGreekV3 g = optionChainService.getGreek(instrumentKey).orElse(null);
             if (g == null) return true; // allow when greek unavailable
             if (g.getDelta() <= 0) return false;
             double d = Math.abs(g.getDelta());
@@ -619,9 +616,9 @@ public class StrategyService {
             Optional<BigDecimal> midOpt = ordersService.getBidAskMid(instrumentKey);
             BigDecimal px = midOpt.orElseGet(() -> {
                 try {
-                    LTP_Quotes q = upstoxService.getMarketLTPQuote(instrumentKey);
+                    GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(instrumentKey);
                     double ltp = (q != null && q.getData() != null && q.getData().get(instrumentKey) != null)
-                            ? q.getData().get(instrumentKey).getLast_price() : 0.0;
+                            ? q.getData().get(instrumentKey).getLastPrice() : 0.0;
                     return ltp > 0 ? BigDecimal.valueOf(ltp) : null;
                 } catch (Exception t) {
                     log.error("LTP fetch failed for {}: {}", instrumentKey, t);
@@ -657,25 +654,25 @@ public class StrategyService {
     private IvStats ivStatsNearAtm(LocalDate expiry, BigDecimal spot) {
         try {
             BigDecimal atm = optionChainService.computeAtmStrike(spot, STRIKE_STEP);
-            Result<List<OptionsInstruments.OptionInstrument>> rng =
+            Result<List<InstrumentData>> rng =
                     optionChainService.listContractsByStrikeRange(NIFTY, expiry, atm.subtract(bd(100)), atm.add(bd(100)));
 
             // FIX: getGreeksForExpiry returns Result<...>, not Optional
-            Result<Map<String, OptionGreekResponse.OptionGreek>> gRes =
+            Result<Map<String, MarketQuoteOptionGreekV3>> gRes =
                     optionChainService.getGreeksForExpiry(NIFTY, expiry);
-            Map<String, OptionGreekResponse.OptionGreek> greeks =
+            Map<String, MarketQuoteOptionGreekV3> greeks =
                     (gRes != null && gRes.isOk() && gRes.get() != null) ? gRes.get() : new HashMap<>();
 
             List<Double> ceIv = new ArrayList<>(), peIv = new ArrayList<>();
             List<Double> allIv = new ArrayList<>();
             if (rng != null && rng.isOk() && rng.get() != null) {
-                for (OptionsInstruments.OptionInstrument oi : rng.get()) {
-                    OptionGreekResponse.OptionGreek g = greeks.get(oi.getInstrument_key());
+                for (InstrumentData oi : rng.get()) {
+                    MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
                     Double iv = (g == null ? null : g.getIv());
                     if (iv == null) continue;
                     allIv.add(iv);
-                    if ("CE".equalsIgnoreCase(oi.getUnderlying_type())) ceIv.add(iv);
-                    else if ("PE".equalsIgnoreCase(oi.getUnderlying_type())) peIv.add(iv);
+                    if ("CE".equalsIgnoreCase(oi.getUnderlyingType())) ceIv.add(iv);
+                    else if ("PE".equalsIgnoreCase(oi.getUnderlyingType())) peIv.add(iv);
                 }
             }
             if (allIv.isEmpty() || ceIv.isEmpty() || peIv.isEmpty()) return null;
@@ -711,10 +708,10 @@ public class StrategyService {
             BigDecimal ceDelta = curr.totalCeOi.subtract(prev.totalCeOi);
             BigDecimal peDelta = curr.totalPeOi.subtract(prev.totalPeOi);
 
-            List<IntradayCandleResponse.Candle> c5 = candles(NIFTY, "minutes", "5");
-            if (c5 == null || c5.size() < 2) return null;
-            double c1 = c5.get(c5.size() - 2).getClose();
-            double c2 = c5.get(c5.size() - 1).getClose();
+            IntraDayCandleData c5 = candles(NIFTY, "minutes", "5");
+            if (c5 == null || c5.getCandles().size() < 2) return null;
+            double c1 = ((Number) c5.getCandles().get(c5.getCandles().size() - 2).get(4)).doubleValue();
+            double c2 = ((Number) c5.getCandles().get(c5.getCandles().size() - 1).get(4)).doubleValue();
 
             OiDelta d = new OiDelta();
             d.ceRising = ceDelta != null && ceDelta.compareTo(BigDecimal.ZERO) > 0;
@@ -731,25 +728,33 @@ public class StrategyService {
     }
 
     // -------------------- Structure filters --------------------
-    private Structure structure(List<IntradayCandleResponse.Candle> cs) {
+    private Structure structure(IntraDayCandleData cs) {
         Structure s = new Structure();
-        if (cs == null || cs.size() < 25) return s;
-        int start = cs.size() - BB_N;
+        if (cs == null) return s;
+
+        // Check if we have enough data points
+        List<List<Object>> candles = cs.getCandles();
+        if (candles == null || candles.size() < 25) return s;
+
+        int start = candles.size() - BB_N;
         double hi = -1e9, lo = 1e9;
-        for (int i = start; i < cs.size(); i++) {
-            hi = Math.max(hi, cs.get(i).getHigh());
-            lo = Math.min(lo, cs.get(i).getLow());
+        for (int i = start; i < candles.size(); i++) {
+            hi = Math.max(hi, ((Number) candles.get(i).get(2)).doubleValue()); // high at index 2
+            lo = Math.min(lo, ((Number) candles.get(i).get(3)).doubleValue()); // low at index 3
         }
         s.donHi = bd(hi);
         s.donLo = bd(lo);
+
         // Session VWAP
         double pv = 0, vv = 0;
-        for (IntradayCandleResponse.Candle k : cs) {
-            pv += k.getClose() * k.getVolume();
-            vv += k.getVolume();
+        for (List<Object> candle : candles) {
+            double close = ((Number) candle.get(4)).doubleValue(); // close at index 4
+            double volume = ((Number) candle.get(5)).doubleValue(); // volume at index 5
+            pv += close * volume;
+            vv += volume;
         }
         if (vv > 0) s.vwap = bd(pv / vv);
-        s.lastClose = bd(cs.get(cs.size() - 1).getClose());
+        s.lastClose = bd(((Number) candles.get(candles.size() - 1).get(4)).doubleValue());
         return s;
     }
 
@@ -780,9 +785,26 @@ public class StrategyService {
     }
 
     // -------------------- Indicators & data --------------------
-    private Ind indicators(List<IntradayCandleResponse.Candle> cs, BigDecimal spot) {
-        if (cs == null || cs.size() < 60) return new Ind();
-        double[] c = arrClose(cs), h = arrHigh(cs), l = arrLow(cs), v = arrVol(cs);
+    private Ind indicators(IntraDayCandleData cs, BigDecimal spot) {
+        if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 60) return new Ind();
+
+        // Extract data from IntraDayCandleData into arrays
+        List<List<Object>> candles = cs.getCandles();
+        int size = candles.size();
+        double[] c = new double[size];
+        double[] h = new double[size];
+        double[] l = new double[size];
+        double[] v = new double[size];
+
+        for (int i = 0; i < size; i++) {
+            List<Object> candle = candles.get(i);
+            // Typical candle format: [timestamp, open, high, low, close, volume, ...]
+            h[i] = ((Number) candle.get(2)).doubleValue();
+            l[i] = ((Number) candle.get(3)).doubleValue();
+            c[i] = ((Number) candle.get(4)).doubleValue();
+            v[i] = ((Number) candle.get(5)).doubleValue();
+        }
+
         Double ema20 = ema(c, EMA_FAST), ema50 = ema(c, EMA_SLOW);
         Double rsi = rsi(c, RSI_N);
         Double atr = atr(h, l, c, ATR_N);
@@ -806,20 +828,20 @@ public class StrategyService {
         return i;
     }
 
-    private List<IntradayCandleResponse.Candle> candles(String key, String unit, String interval) {
+    private IntraDayCandleData candles(String key, String unit, String interval) {
         try {
-            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(key, unit, interval);
-            return ic == null ? null : ic.toCandleList();
+            GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(key, unit, interval);
+            return ic == null ? null : ic.getData();
         } catch (Exception t) {
             log.error("Candle fetch failed for {} {}/{}: {}", key, unit, interval, t);
             return null;
         }
     }
 
-    private boolean isStale(List<IntradayCandleResponse.Candle> cs, int maxLagMin) {
+    private boolean isStale(IntraDayCandleData cs, int maxLagMin) {
         try {
-            if (cs == null || cs.isEmpty()) return true;
-            long lastEpochSec = cs.get(cs.size() - 1).getTimestamp().getEpochSecond();
+            if (cs == null) return true;
+            long lastEpochSec = ((Number) cs.getCandles().get(cs.getCandles().size() - 1).get(0)).longValue();
             Instant last = Instant.ofEpochSecond(lastEpochSec);
             return Duration.between(last, Instant.now()).toMinutes() > maxLagMin;
         } catch (Exception t) {
@@ -916,9 +938,9 @@ public class StrategyService {
     }
 
     // -------------------- Small helpers --------------------
-    private OptionsInstruments.OptionInstrument findContract(LegSpec L) {
+    private InstrumentData findContract(LegSpec L) {
         try {
-            Result<OptionsInstruments.OptionInstrument> r =
+            Result<InstrumentData> r =
                     optionChainService.findContract(NIFTY, L.expiry, L.strike, L.type);
             return (r != null && r.isOk()) ? r.get() : null;
         } catch (Exception t) {
@@ -927,13 +949,13 @@ public class StrategyService {
         }
     }
 
-    private String humanSymbol(OptionsInstruments.OptionInstrument oi) {
+    private String humanSymbol(InstrumentData oi) {
         String side = typeOf(oi).name();
-        return "NIFTY " + oi.getStrike_price() + " " + side;
+        return "NIFTY " + oi.getStrikePrice() + " " + side;
     }
 
-    private OptionType typeOf(OptionsInstruments.OptionInstrument oi) {
-        String t = oi.getUnderlying_type() == null ? "" : oi.getUnderlying_type().toUpperCase(Locale.ROOT);
+    private OptionType typeOf(InstrumentData oi) {
+        String t = oi.getUnderlyingType() == null ? "" : oi.getUnderlyingType().toUpperCase(Locale.ROOT);
         return "CE".equals(t) ? OptionType.CALL : OptionType.PUT;
     }
 
@@ -1005,20 +1027,20 @@ public class StrategyService {
     }
 
     // -------------------- Math --------------------
-    private static double[] arrClose(List<IntradayCandleResponse.Candle> cs) {
-        return cs.stream().mapToDouble(IntradayCandleResponse.Candle::getClose).toArray();
+    private static double[] arrClose(IntraDayCandleData cs) {
+        return cs.getCandles().stream().mapToDouble(candle -> ((Number) candle.get(4)).doubleValue()).toArray();
     }
 
-    private static double[] arrHigh(List<IntradayCandleResponse.Candle> cs) {
-        return cs.stream().mapToDouble(IntradayCandleResponse.Candle::getHigh).toArray();
+    private static double[] arrHigh(IntraDayCandleData cs) {
+        return cs.getCandles().stream().mapToDouble(candle -> ((Number) candle.get(2)).doubleValue()).toArray();
     }
 
-    private static double[] arrLow(List<IntradayCandleResponse.Candle> cs) {
-        return cs.stream().mapToDouble(IntradayCandleResponse.Candle::getLow).toArray();
+    private static double[] arrLow(IntraDayCandleData cs) {
+        return cs.getCandles().stream().mapToDouble(candle -> ((Number) candle.get(3)).doubleValue()).toArray();
     }
 
-    private static double[] arrVol(List<IntradayCandleResponse.Candle> cs) {
-        return cs.stream().mapToDouble(IntradayCandleResponse.Candle::getVolume).toArray();
+    private static double[] arrVol(IntraDayCandleData cs) {
+        return cs.getCandles().stream().mapToDouble(candle -> ((Number) candle.get(5)).doubleValue()).toArray();
     }
 
     private static Double ema(double[] a, int n) {
@@ -1350,9 +1372,9 @@ public class StrategyService {
         }
         List<Row> rows = new ArrayList<>();
         for (LegSpec L : candidates) {
-            OptionsInstruments.OptionInstrument inst = findContract(L);
+            InstrumentData inst = findContract(L);
             if (inst == null) continue;
-            String ik = inst.getInstrument_key();
+            String ik = inst.getInstrumentKey();
 
             BigDecimal spreadPct = ordersService.getSpreadPct(ik).orElse(new BigDecimal("9E9"));
             rows.add(new Row(L, spreadPct));
@@ -1442,15 +1464,15 @@ public class StrategyService {
     }
 
     // NEW: OI-liquidity + spread filter
-    private boolean passesLiquidity(OptionsInstruments.OptionInstrument inst) {
+    private boolean passesLiquidity(InstrumentData inst) {
         try {
             if (inst == null) return false;
-            String ik = inst.getInstrument_key();
+            String ik = inst.getInstrumentKey();
 
-            OptionGreekResponse.OptionGreek g = optionChainService.getGreek(ik).orElse(null);
+            MarketQuoteOptionGreekV3 g = optionChainService.getGreek(ik).orElse(null);
             if (g == null) return true; // if unknown, don't block
 
-            long oi = Math.max(0L, g.getOi());
+            long oi = Math.max(0L, g.getOi().longValue());
             if (oi < MIN_LIQUIDITY_OI.longValue()) return false;
 
             // spread% guard (reuses OrdersService depth)

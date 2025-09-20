@@ -3,16 +3,13 @@ package com.trade.frankenstein.trader.service;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
-import com.trade.frankenstein.trader.model.upstox.PlaceOrderRequest;
-import com.trade.frankenstein.trader.model.upstox.PortfolioResponse;
+import com.upstox.api.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.time.*;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -30,14 +27,14 @@ public class RiskService {
     private final StreamGateway stream;
 
     // --- Circuit config (percent or absolute; set via setters or config binder if you prefer) ---
-    private BigDecimal dailyDdCapPct = BigDecimal.valueOf(3.0);
-    private BigDecimal dailyDdCapAbs = BigDecimal.ZERO;
-    private BigDecimal seedStartEquity = BigDecimal.ZERO;
+    private float dailyDdCapPct = 3.0f;
+    private float dailyDdCapAbs = 0f;
+    private float seedStartEquity = 0f;
 
     // --- Circuit live state (IST day roll-over safe) ---
     private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
-    private final AtomicReference<BigDecimal> dayStartEquity = new AtomicReference<>(BigDecimal.ZERO);
-    private final AtomicReference<BigDecimal> dayLossAbs = new AtomicReference<>(BigDecimal.ZERO); // positive number
+    private final AtomicReference<Float> dayStartEquity = new AtomicReference<>(0f);
+    private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number
     private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
 
     // Rolling window for orders/min throttle (timestamps for last 60 seconds).
@@ -71,7 +68,7 @@ public class RiskService {
         // 3) Market hygiene: live 1m bar roughness as a slippage proxy
         //    If the current 1-minute bar is too choppy, block to avoid poor fills.
         try {
-            String key = req.getInstrument_token();
+            String key = req.getInstrumentToken();
             if (key != null) {
                 double roughnessPct = readLiveBarRoughnessPct(key); // ((H-L)/mid)*100
                 if (!Double.isNaN(roughnessPct)) {
@@ -141,9 +138,9 @@ public class RiskService {
      */
     public void refreshDailyLossFromBroker() {
         try {
-            BigDecimal realizedToday = upstox.getRealizedPnlToday(); // may be null/zero
-            if (realizedToday == null) realizedToday = BigDecimal.ZERO;
-            BigDecimal lossAbs = realizedToday.signum() < 0 ? realizedToday.abs() : BigDecimal.ZERO;
+            Object realizedAny = upstox.getRealizedPnlToday(); // usually BigDecimal; treat generically
+            float realized = toFloat(realizedAny);
+            float lossAbs = realized < 0f ? -realized : 0f;
             updateDailyLossAbs(lossAbs);
         } catch (Exception t) {
             log.error("refreshDailyLossFromBroker failed: {}", t);
@@ -234,7 +231,7 @@ public class RiskService {
      * Sum of negative PnL (₹); returns a positive number for current loss.
      */
     private double currentLossRupees() {
-        PortfolioResponse p = upstox.getShortTermPositions();
+        GetPositionResponse p = upstox.getShortTermPositions();
         if (p == null || p.getData() == null) return 0.0;
 
         double realised = 0.0;
@@ -268,11 +265,11 @@ public class RiskService {
      * Live bar roughness % = ((high - low) / mid) * 100 for the current 1-minute bar.
      */
     private double readLiveBarRoughnessPct(String instrumentKey) {
-        OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+        GetMarketQuoteOHLCResponseV3 q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
         if (q == null || q.getData() == null || q.getData().get(instrumentKey) == null) return Double.NaN;
-        OHLC_Quotes.OHLCData d = q.getData().get(instrumentKey);
-        if (d.getLive_ohlc() == null) return Double.NaN;
-        OHLC_Quotes.Ohlc o = d.getLive_ohlc();
+        MarketQuoteOHLCV3 d = q.getData().get(instrumentKey);
+        if (d.getLiveOhlc() == null) return Double.NaN;
+        OhlcV3 o = d.getLiveOhlc();
         double high = o.getHigh();
         double low = o.getLow();
         double mid = (high + low) / 2.0;
@@ -311,7 +308,7 @@ public class RiskService {
         } catch (Exception ignored) {
             log.error("extractSymbol failed: {}", ignored);
         }
-        String key = req.getInstrument_token();
+        String key = req.getInstrumentToken();
         if (key == null) return null;
         int idx = key.indexOf(':');
         return (idx >= 0 && idx + 1 < key.length()) ? key.substring(idx + 1) : key;
@@ -350,33 +347,30 @@ public class RiskService {
             if (stored == null || !stored.equals(todayIst)) {
                 ddDay.set(todayIst);
                 circuitTripped.set(false);
-                dayLossAbs.set(BigDecimal.ZERO);
+                dayLossAbs.set(0f);
                 // re-seed baseline if provided
-                if (seedStartEquity != null && seedStartEquity.signum() > 0) {
+                if (seedStartEquity > 0f) {
                     dayStartEquity.set(seedStartEquity);
                 } else {
-                    dayStartEquity.compareAndSet(null, BigDecimal.ZERO);
+                    dayStartEquity.set(0f);
                 }
             }
 
             // Short-circuit if already tripped
             if (circuitTripped.get()) return Optional.of(true);
 
-            BigDecimal lossAbs = dayLossAbs.get();
-            if (lossAbs == null || lossAbs.signum() < 0) lossAbs = BigDecimal.ZERO;
+            float lossAbs = nzf(dayLossAbs.get());
 
             // Absolute cap check (if configured)
-            boolean hitAbs = (dailyDdCapAbs != null && dailyDdCapAbs.signum() > 0)
-                    && (lossAbs.compareTo(dailyDdCapAbs) >= 0);
+            boolean hitAbs = (dailyDdCapAbs > 0f) && (lossAbs >= dailyDdCapAbs);
 
             // Percent cap check (if baseline available & configured)
             boolean hitPct = false;
-            if (!hitAbs && dailyDdCapPct != null && dailyDdCapPct.signum() > 0) {
-                BigDecimal base = dayStartEquity.get();
-                if (base != null && base.signum() > 0) {
-                    BigDecimal lossPct = lossAbs.multiply(BigDecimal.valueOf(100))
-                            .divide(base, 2, java.math.RoundingMode.HALF_UP);
-                    hitPct = lossPct.compareTo(dailyDdCapPct) >= 0;
+            if (!hitAbs && dailyDdCapPct > 0f) {
+                float base = nzf(dayStartEquity.get());
+                if (base > 0f) {
+                    float lossPct = round2((lossAbs * 100f) / base);
+                    hitPct = lossPct >= dailyDdCapPct;
                 }
             }
 
@@ -390,11 +384,15 @@ public class RiskService {
         }
     }
 
+    private static float nzf(Float v) {
+        return v == null ? 0f : v;
+    }
+
     /**
      * Call this from your PnL updater (Engine/Trades) to keep losses current (pass a positive loss amount).
      */
-    public void updateDailyLossAbs(BigDecimal lossAbs) {
-        if (lossAbs != null && lossAbs.signum() >= 0) {
+    public void updateDailyLossAbs(float lossAbs) {
+        if (lossAbs >= 0f) {
             dayLossAbs.set(lossAbs);
         }
     }
@@ -402,9 +400,23 @@ public class RiskService {
     /**
      * Optionally set/refresh the baseline at the start of trading day.
      */
-    public void setDayStartEquity(BigDecimal equity) {
-        if (equity != null && equity.signum() > 0) {
+    public void setDayStartEquity(float equity) {
+        if (equity > 0f) {
             dayStartEquity.set(equity);
+        }
+    }
+
+    private static float round2(float v) {
+        return Math.round(v * 100f) / 100f;
+    }
+
+    private static float toFloat(Object v) {
+        if (v == null) return 0f;
+        if (v instanceof Number) return ((Number) v).floatValue();
+        try {
+            return Float.parseFloat(String.valueOf(v));
+        } catch (Exception ignored) {
+            return 0f;
         }
     }
 }

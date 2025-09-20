@@ -2,8 +2,8 @@ package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.trade.frankenstein.trader.model.upstox.PlaceOrderRequest;
 import com.trade.frankenstein.trader.service.RiskService;
+import com.upstox.api.PlaceOrderRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;

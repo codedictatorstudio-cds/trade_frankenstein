@@ -39,17 +39,15 @@ public class Advice {
     private String order_id;          // set once executed
     private StrategyName strategy;    // optional
 
-    // --- Order draft (match PlaceOrderRequest members & names) ---
     private String instrument_token;
     private String order_type;          // MARKET/LIMIT/SL
     private String transaction_type;    // BUY/SELL
     private int quantity;
     private String product;             // MIS/NRML/CNC
     private String validity;            // DAY/IOC
-    private double price;
+    private Float price;
     private String tag;
     private int disclosed_quantity;
-    private double trigger_price;
+    private Float trigger_price;
     private boolean is_amo;
-    private boolean slice;
 }

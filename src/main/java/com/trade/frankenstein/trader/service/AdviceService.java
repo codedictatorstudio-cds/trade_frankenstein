@@ -3,18 +3,16 @@ package com.trade.frankenstein.trader.service;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
 import com.trade.frankenstein.trader.model.documents.Advice;
-import com.trade.frankenstein.trader.model.upstox.PlaceOrderRequest;
-import com.trade.frankenstein.trader.model.upstox.PlaceOrderResponse;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
+import com.upstox.api.PlaceOrderRequest;
+import com.upstox.api.PlaceOrderResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
-import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -115,7 +113,7 @@ public class AdviceService {
             }
 
             PlaceOrderResponse placed = r.get();
-            String orderId = extractOrderId(placed);
+            String orderId = placed.getData().getOrderId();
 
             // direct setters (no reflection)
             a.setOrder_id(orderId);
@@ -166,51 +164,24 @@ public class AdviceService {
 
     private PlaceOrderRequest buildUpstoxRequest(Advice a) {
         // Strategy must populate these fields on Advice before calling create()
-        BigDecimal price = toBigDecimal(a.getPrice());
-        BigDecimal trigger = toBigDecimal(a.getTrigger_price());
 
-        return PlaceOrderRequest.builder()
-                .instrument_token(a.getInstrument_token())
-                .order_type(a.getOrder_type())
-                .transaction_type(a.getTransaction_type())
-                .quantity(a.getQuantity())
-                .product(a.getProduct())
-                .validity(a.getValidity())
-                .price(price)
-                .trigger_price(trigger)
-                .disclosed_quantity(a.getDisclosed_quantity())
-                .is_amo(a.is_amo())
-                .slice(a.isSlice())
-                .tag(a.getTag())
-                .build();
-    }
-
-    @Nullable
-    public String extractOrderId(PlaceOrderResponse resp) {
-        if (resp == null) return null;
-        try {
-            return resp.getData().getOrder_ids().stream().findFirst().orElse(null);
-        } catch (Exception t) {
-            log.error("extractOrderId failed", t);
-            return null;
-        }
+        PlaceOrderRequest req = new PlaceOrderRequest();
+        req.setInstrumentToken(a.getInstrument_token());
+        req.setOrderType(PlaceOrderRequest.OrderTypeEnum.valueOf(a.getOrder_type()));
+        req.setTransactionType(PlaceOrderRequest.TransactionTypeEnum.valueOf(a.getTransaction_type()));
+        req.setQuantity(a.getQuantity());
+        req.setProduct(PlaceOrderRequest.ProductEnum.valueOf(a.getProduct()));
+        req.setValidity(PlaceOrderRequest.ValidityEnum.valueOf(a.getValidity()));
+        req.setPrice(a.getPrice());
+        req.setTriggerPrice(a.getTrigger_price());
+        req.setDisclosedQuantity(a.getDisclosed_quantity());
+        req.setIsAmo(a.is_amo());
+        req.setTag(a.getTag());
+        return req;
     }
 
     private static boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
-    }
-
-    private static BigDecimal toBigDecimal(Object v) {
-        if (v == null) return null;
-        try {
-            if (v instanceof BigDecimal) return (BigDecimal) v;
-            if (v instanceof Number) return BigDecimal.valueOf(((Number) v).doubleValue());
-            String s = String.valueOf(v).trim();
-            if (s.isEmpty()) return null;
-            return new BigDecimal(s);
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     // AdviceService.java — add this helper

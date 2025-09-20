@@ -1,8 +1,8 @@
 package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.exception.Http;
-import com.trade.frankenstein.trader.model.upstox.PlaceOrderRequest;
 import com.trade.frankenstein.trader.service.OrdersService;
+import com.upstox.api.PlaceOrderRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;

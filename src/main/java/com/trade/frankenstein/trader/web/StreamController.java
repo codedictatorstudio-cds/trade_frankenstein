@@ -1,4 +1,3 @@
-// StreamController.java
 package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.service.StreamGateway;

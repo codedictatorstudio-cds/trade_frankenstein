@@ -4,8 +4,9 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.enums.OrderSide;
 import com.trade.frankenstein.trader.enums.TradeStatus;
 import com.trade.frankenstein.trader.model.documents.Trade;
-import com.trade.frankenstein.trader.model.upstox.OrderTradesResponse;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
+import com.upstox.api.GetTradeResponse;
+import com.upstox.api.TradeData;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -158,7 +159,7 @@ public class TradesService {
     @Scheduled(fixedDelayString = "${trade.trades.reconcile-ms:45000}")
     @Transactional
     public void reconcileToday() {
-        OrderTradesResponse resp;
+        GetTradeResponse resp;
         try {
             resp = upstoxService.getTradesForDay();
         } catch (Exception t) {
@@ -167,8 +168,8 @@ public class TradesService {
         }
         if (resp == null || resp.getData() == null || resp.getData().isEmpty()) return;
 
-        for (OrderTradesResponse.TradeData td : resp.getData()) {
-            String brokerTradeId = safeNull(td.getTrade_id());
+        for (TradeData td : resp.getData()) {
+            String brokerTradeId = safeNull(td.getTradeId());
             if (isBlank(brokerTradeId)) continue;
 
             // Update existing
@@ -184,31 +185,31 @@ public class TradesService {
                         changed = true;
                     }
 
-                    double newPrice = td.getAverage_price();
+                    double newPrice = td.getAveragePrice();
                     if (Double.compare(existing.getEntryPrice(), newPrice) != 0) {
                         existing.setEntryPrice(newPrice);
                         changed = true;
                     }
 
-                    String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrument_token(), existing.getSymbol());
+                    String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrumentToken(), existing.getSymbol());
                     if (!safe(sym).equals(safe(existing.getSymbol()))) {
                         existing.setSymbol(sym);
                         changed = true;
                     }
 
-                    String ordId = safeNull(td.getOrder_id());
+                    String ordId = safeNull(td.getOrderId());
                     if (!safeNullEquals(existing.getOrder_id(), ordId)) {
                         existing.setOrder_id(ordId);
                         changed = true;
                     }
 
-                    OrderSide side = parseSide(safeNull(td.getTransaction_type()));
+                    OrderSide side = parseSide(safeNull(td.getTransactionType().getValue()));
                     if (existing.getSide() != side) {
                         existing.setSide(side);
                         changed = true;
                     }
 
-                    Instant entryTs = parseInstant(safeNull(td.getOrder_timestamp()));
+                    Instant entryTs = parseInstant(safeNull(td.getOrderTimestamp()));
                     if (!Objects.equals(existing.getEntryTime(), entryTs)) {
                         existing.setEntryTime(entryTs);
                         changed = true;
@@ -240,17 +241,17 @@ public class TradesService {
         }
     }
 
-    private Trade mapFrom(OrderTradesResponse.TradeData td) {
-        String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrument_token(), "—");
-        OrderSide side = parseSide(safeNull(td.getTransaction_type()));
+    private Trade mapFrom(TradeData td) {
+        String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrumentToken(), "—");
+        OrderSide side = parseSide(safeNull(td.getTransactionType().getValue()));
         Integer qty = td.getQuantity();
-        double avgPrice = td.getAverage_price();
-        Instant ts = parseInstant(safeNull(td.getOrder_timestamp()));
+        double avgPrice = td.getAveragePrice();
+        Instant ts = parseInstant(safeNull(td.getOrderTimestamp()));
 
         Trade t = Trade.builder()
                 .id(null) // Mongo will assign
-                .order_id(safeNull(td.getOrder_id()))
-                .brokerTradeId(safeNull(td.getTrade_id()))
+                .order_id(safeNull(td.getOrderId()))
+                .brokerTradeId(safeNull(td.getTradeId()))
                 .symbol(sym) // may be human symbol OR instrument key; we can store both later if needed
                 .side(side)
                 .quantity(qty)

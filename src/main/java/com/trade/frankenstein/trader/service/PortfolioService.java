@@ -1,8 +1,9 @@
 package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
-import com.trade.frankenstein.trader.model.upstox.HoldingsResponse;
-import com.trade.frankenstein.trader.model.upstox.PortfolioResponse;
+import com.upstox.api.GetHoldingsResponse;
+import com.upstox.api.GetPositionResponse;
+import com.upstox.api.PositionData;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -31,9 +32,9 @@ public class PortfolioService {
     // ---------------------------------------------------------------------
 
     @Transactional(readOnly = true)
-    public Result<PortfolioResponse> getPortfolio() {
+    public Result<GetPositionResponse> getPortfolio() {
         try {
-            PortfolioResponse p = upstox.getShortTermPositions();
+            GetPositionResponse p = upstox.getShortTermPositions();
             if (p == null || p.getData() == null) {
                 return Result.fail("NOT_FOUND", "No live portfolio data");
             }
@@ -45,9 +46,9 @@ public class PortfolioService {
     }
 
     @Transactional(readOnly = true)
-    public Result<HoldingsResponse> getHoldings() {
+    public Result<GetHoldingsResponse> getHoldings() {
         try {
-            HoldingsResponse h = upstox.getLongTermHoldings();
+            GetHoldingsResponse h = upstox.getLongTermHoldings();
             if (h == null || h.getData() == null) {
                 return Result.fail("NOT_FOUND", "No live holdings data");
             }
@@ -65,8 +66,8 @@ public class PortfolioService {
     @Transactional(readOnly = true)
     public Result<PortfolioSummary> getPortfolioSummary() {
         try {
-            PortfolioResponse p = upstox.getShortTermPositions();
-            List<PortfolioResponse.PortfolioData> rows =
+            GetPositionResponse p = upstox.getShortTermPositions();
+            List<PositionData> rows =
                     (p == null ? null : p.getData());
             if (rows == null || rows.isEmpty()) {
                 return Result.fail("NOT_FOUND", "No live portfolio data");
@@ -81,17 +82,17 @@ public class PortfolioService {
 
             int countedLines = 0;
 
-            for (PortfolioResponse.PortfolioData row : rows) {
+            for (PositionData row : rows) {
                 if (row == null) continue;
 
                 Integer qObj = safeInt(row.getQuantity());
                 int qty = (qObj == null ? 0 : qObj);
 
-                Double avgPriceObj = coalesce(row.getAverage_price(), row.getAverage_price());
-                Double buyPriceObj = coalesce(row.getBuy_price(), row.getBuy_price());
-                Double ltpObj = coalesce(row.getLast_price(), row.getLast_price());
-                Double closeObj = coalesce(row.getClose_price(), row.getClose_price());
-                Double realisedObj = coalesce(row.getRealised(), row.getRealised());
+                Double avgPriceObj = coalesce(row.getAveragePrice(), row.getAveragePrice()).doubleValue();
+                Double buyPriceObj = coalesce(row.getBuyPrice(), row.getBuyPrice()).doubleValue();
+                Double ltpObj = coalesce(row.getLastPrice(), row.getLastPrice()).doubleValue();
+                Double closeObj = coalesce(row.getClosePrice(), row.getClosePrice()).doubleValue();
+                Double realisedObj = coalesce(row.getRealised(), row.getRealised()).doubleValue();
 
                 double buy = nzDouble(coalesce(avgPriceObj, buyPriceObj));
                 double ltp = nzDouble(ltpObj);
@@ -202,8 +203,8 @@ public class PortfolioService {
             if (underlyingKey == null || underlyingKey.trim().isEmpty()) {
                 return Result.fail("BAD_REQUEST", "underlyingKey required");
             }
-            PortfolioResponse p = upstox.getShortTermPositions();
-            List<PortfolioResponse.PortfolioData> rows =
+            GetPositionResponse p = upstox.getShortTermPositions();
+            List<PositionData> rows =
                     (p == null ? null : p.getData());
             if (rows == null || rows.isEmpty()) {
                 return Result.ok(0);
@@ -212,10 +213,10 @@ public class PortfolioService {
             int lots = 0;
             String keyUC = underlyingKey.toUpperCase();
 
-            for (PortfolioResponse.PortfolioData row : rows) {
+            for (PositionData row : rows) {
                 if (row == null) continue;
 
-                String ts = row.getTrading_symbol();
+                String ts = row.getTradingSymbol();
                 if (ts == null) continue;
 
                 String tsUC = ts.toUpperCase();
@@ -258,6 +259,10 @@ public class PortfolioService {
     // ---------------------------------------------------------------------
 
     private static Double coalesce(Double a, Double b) {
+        return a != null ? a : b;
+    }
+
+    private static Float coalesce(Float a, Float b) {
         return a != null ? a : b;
     }
 

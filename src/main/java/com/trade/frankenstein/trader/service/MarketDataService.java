@@ -3,8 +3,9 @@ package com.trade.frankenstein.trader.service;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.enums.MarketRegime;
-import com.trade.frankenstein.trader.model.upstox.IntradayCandleResponse;
-import com.trade.frankenstein.trader.model.upstox.OHLC_Quotes;
+import com.upstox.api.GetIntraDayCandleResponse;
+import com.upstox.api.GetMarketQuoteOHLCResponseV3;
+import com.upstox.api.IntraDayCandleData;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -53,12 +54,12 @@ public class MarketDataService {
             if (instrumentKey == null || instrumentKey.trim().isEmpty()) {
                 return Result.fail("BAD_REQUEST", "instrumentKey is required");
             }
-            OHLC_Quotes q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+            GetMarketQuoteOHLCResponseV3 q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
             if (q == null || q.getData() == null || q.getData().get(instrumentKey) == null
-                    || q.getData().get(instrumentKey).getLive_ohlc() == null) {
+                    || q.getData().get(instrumentKey).getLiveOhlc() == null) {
                 return Result.fail("NOT_FOUND", "No live OHLC for " + instrumentKey);
             }
-            double close = q.getData().get(instrumentKey).getLive_ohlc().getClose();
+            double close = q.getData().get(instrumentKey).getLiveOhlc().getClose();
             return Result.ok(BigDecimal.valueOf(close));
         } catch (Exception t) {
             log.error("getLtp failed", t);
@@ -85,25 +86,24 @@ public class MarketDataService {
      * over the most recent lookback window of 5-minute closes.
      * <p>
      * Note: IntradayCandleResponse is array-of-arrays from Upstox; we rely on
-     * {@link IntradayCandleResponse#toCandleList()} to convert it to typed candles.
      */
     public Result<BigDecimal> getMomentumNow(Instant asOfIgnored) {
         try {
             // Pull recent 5-minute intraday candles; adjust resolution if you prefer
-            IntradayCandleResponse ic = upstox.getIntradayCandleData(underlyingKey, "minutes", "5");
+            GetIntraDayCandleResponse ic = upstox.getIntradayCandleData(underlyingKey, "minutes", "5");
             if (ic == null) {
                 return Result.fail("NOT_FOUND", "No intraday candle response");
             }
 
             // Convert array-of-arrays → typed candles (chronological order)
-            List<IntradayCandleResponse.Candle> candles = ic.toCandleList();
-            if (candles == null || candles.isEmpty()) {
+            IntraDayCandleData candles = ic.getData();
+            if (candles == null) {
                 return Result.fail("NOT_FOUND", "No intraday candles");
             }
 
             // If you want to avoid a possibly-partial last bar, set includeLatest = false
             final boolean includeLatest = true;
-            final int endExclusive = includeLatest ? candles.size() : Math.max(0, candles.size() - 1);
+            final int endExclusive = includeLatest ? candles.getCandles().size() : Math.max(0, candles.getCandles().size() - 1);
 
             // Up to last 60 closes, require at least 10 for a meaningful z-score
             final int K = Math.min(60, endExclusive);
@@ -114,7 +114,7 @@ public class MarketDataService {
 
             double[] closes = new double[K];
             for (int i = 0; i < K; i++) {
-                closes[i] = candles.get(start + i).getClose();
+                closes[i] = (double) candles.getCandles().get(start + i).get(4);
             }
 
             double last = closes[K - 1];
@@ -135,11 +135,11 @@ public class MarketDataService {
      */
     public Optional<BigDecimal> getMomentumOn(String unit, String interval) {
         try {
-            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(Underlyings.NIFTY, unit, interval);
-            List<IntradayCandleResponse.Candle> cs = (ic == null) ? null : ic.toCandleList();
-            if (cs == null || cs.size() < 10) return Optional.empty();
+            GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(Underlyings.NIFTY, unit, interval);
+            IntraDayCandleData cs = (ic == null) ? null : ic.getData();
+            if (cs == null || cs.getCandles().size() < 10) return Optional.empty();
 
-            double[] closes = cs.stream().mapToDouble(IntradayCandleResponse.Candle::getClose).toArray();
+            double[] closes = cs.getCandles().stream().mapToDouble(i -> (double) i.get(4)).toArray();
             double last = closes[closes.length - 1];
             double m = mean(closes);
             double sd = stddev(closes, m);
@@ -266,17 +266,17 @@ public class MarketDataService {
     public Optional<StrategyService.PDRange> getPreviousDayRange(String instrumentKey) {
         try {
             // Try daily bars via the same candle endpoint (many brokers accept unit="day", interval="1")
-            IntradayCandleResponse ic = upstoxService.getIntradayCandleData(
+            GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(
                     (instrumentKey == null || instrumentKey.isEmpty()) ? Underlyings.NIFTY : instrumentKey,
                     "day",
                     "1"
             );
-            List<IntradayCandleResponse.Candle> daily = (ic == null) ? null : ic.toCandleList();
-            if (daily == null || daily.size() < 2) return Optional.empty();
+            IntraDayCandleData daily = (ic == null) ? null : ic.getData();
+            if (daily == null || daily.getCandles().size() < 2) return Optional.empty();
 
-            IntradayCandleResponse.Candle y = daily.get(daily.size() - 2); // yesterday
-            BigDecimal pdh = BigDecimal.valueOf(y.getHigh());
-            BigDecimal pdl = BigDecimal.valueOf(y.getLow());
+            List<Object> y = daily.getCandles().get(daily.getCandles().size() - 2); // yesterday
+            BigDecimal pdh = BigDecimal.valueOf((Long) y.get(2));
+            BigDecimal pdl = BigDecimal.valueOf((Long) y.get(3));
 
             return Optional.of(new com.trade.frankenstein.trader.service.StrategyService.PDRange(pdh, pdl));
         } catch (Exception t) {
