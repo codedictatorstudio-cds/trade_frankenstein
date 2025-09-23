@@ -1,6 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
+import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
@@ -13,6 +14,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -24,10 +26,13 @@ public class AdviceService {
     @Autowired
     private AdviceRepo adviceRepo;
     @Autowired
-    private OrdersService ordersService;   // risk checks + Upstox call
+    private OrdersService ordersService;     // risk checks + Upstox call
     @Autowired
     private StreamGateway stream;
+    @Autowired
+    private FastStateStore fast;             // Step-3: fast guards/dedupe
 
+    // ---------- READ ----------
     @Transactional(readOnly = true)
     public Result<List<Advice>> list() {
         try {
@@ -44,9 +49,7 @@ public class AdviceService {
     @Transactional(readOnly = true)
     public Result<Advice> get(String adviceId) {
         try {
-            if (adviceId == null || adviceId.trim().isEmpty()) {
-                return Result.fail("BAD_REQUEST", "adviceId is required");
-            }
+            if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
             Optional<Advice> opt = adviceRepo.findById(adviceId);
             return opt.map(Result::ok).orElseGet(() -> Result.fail("NOT_FOUND", "Advice not found"));
         } catch (Exception t) {
@@ -55,28 +58,35 @@ public class AdviceService {
         }
     }
 
+    // ---------- WRITE ----------
+
     /**
-     * Persist a new Advice and emit advice.new
+     * Persist a new Advice and emit advice.new (Step-3 dedupe on (instrumentToken, side) for 60s).
      */
     @Transactional
     public Result<Advice> create(Advice draft) {
         try {
             if (draft == null) return Result.fail("BAD_REQUEST", "Advice payload required");
-            if (isBlank(draft.getSymbol())) return Result.fail("BAD_REQUEST", "Symbol is required");
-            if (draft.getTransaction_type() == null)
-                return Result.fail("BAD_REQUEST", "Transaction type (BUY/SELL) is required");
-            if (draft.getQuantity() <= 0) return Result.fail("BAD_REQUEST", "Quantity must be > 0");
 
+            // defaults + validation
             if (draft.getStatus() == null) draft.setStatus(AdviceStatus.PENDING);
-            // direct timestamp setters (no reflection)
-            draft.setCreatedAt(Instant.now());
-            draft.setUpdatedAt(Instant.now());
-            // AdviceService.create(...) — before saving:
+            if (draft.getProduct() == null) draft.setProduct("MIS");
+            if (draft.getValidity() == null) draft.setValidity("DAY");
             assertReadyForCreationOrExecution(draft);
 
+            // Step-3: dedupe window (60s) to avoid duplicate PENDING advices
+            String side = String.valueOf(draft.getTransaction_type());
+            String token = nullToEmpty(draft.getInstrument_token());
+            String key = "adv:d:" + token + ":" + side;
+            boolean first = fast.setIfAbsent(key, "1", Duration.ofSeconds(60));
+            if (!first) {
+                return Result.fail("DUPLICATE", "Similar advice exists (60s window)");
+            }
+
+            draft.setCreatedAt(Instant.now());
+            draft.setUpdatedAt(Instant.now());
             Advice saved = adviceRepo.save(draft);
 
-            // stream entity directly (no mapper)
             stream.send("advice.new", saved);
 
             return Result.ok(saved);
@@ -87,46 +97,37 @@ public class AdviceService {
     }
 
     /**
-     * Execute a PENDING advice: build typed PlaceOrderRequest, place it,
-     * update Advice → EXECUTED with orderId (if available), then emit advice.updated.
+     * Execute a PENDING advice: build typed PlaceOrderRequest, place it via OrdersService,
+     * mark EXECUTED with broker orderId if available, emit advice.updated, and notify engine.
      */
     @Transactional
     public Result<Advice> execute(String adviceId) {
         try {
             if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
 
-            Optional<Advice> opt = adviceRepo.findById(adviceId);
-            if (opt.isEmpty()) return Result.fail("NOT_FOUND", "Advice not found");
-
-            Advice a = opt.get();
+            Advice a = adviceRepo.findById(adviceId).orElse(null);
+            if (a == null) return Result.fail("NOT_FOUND", "Advice not found");
             if (a.getStatus() != AdviceStatus.PENDING) {
                 log.info("advice.execute: {} not PENDING (status={}), skip", adviceId, a.getStatus());
                 return Result.ok(a);
             }
+            assertReadyForCreationOrExecution(a);
 
             PlaceOrderRequest req = buildUpstoxRequest(a);
             Result<PlaceOrderResponse> r = ordersService.placeOrder(req);
-            if (r == null || !r.isOk() || r.get() == null) {
+            if (r == null || !r.isOk() || r.get() == null || r.get().getData() == null) {
                 String err = (r == null) ? "Order placement failed"
                         : (r.getError() == null ? "Order placement failed" : r.getError());
                 return Result.fail((r == null || r.getErrorCode() == null) ? "ORDER_ERROR" : r.getErrorCode(), err);
             }
 
-            PlaceOrderResponse placed = r.get();
-            String orderId = placed.getData().getOrderId();
-
-            // direct setters (no reflection)
+            String orderId = r.get().getData().getOrderId();
             a.setOrder_id(orderId);
             a.setStatus(AdviceStatus.EXECUTED);
             a.setUpdatedAt(Instant.now());
 
             Advice saved = adviceRepo.save(a);
-            // AdviceService.execute(...) — after fetching the entity and before placing the order:
-            assertReadyForCreationOrExecution(a);
-
-            // stream entity directly (no mapper)
             stream.send("advice.updated", saved);
-
             log.info("advice.execute: placed order {} for {}", orderId, a.getSymbol());
             return Result.ok(saved);
         } catch (Exception t) {
@@ -136,16 +137,14 @@ public class AdviceService {
     }
 
     /**
-     * Mark advice as DISMISSED and emit advice.updated.
+     * Mark DISMISSED and emit advice.updated.
      */
     @Transactional
     public Result<Advice> dismiss(String adviceId) {
         try {
             if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
-            Optional<Advice> opt = adviceRepo.findById(adviceId);
-            if (opt.isEmpty()) return Result.fail("NOT_FOUND", "Advice not found");
-
-            Advice a = opt.get();
+            Advice a = adviceRepo.findById(adviceId).orElse(null);
+            if (a == null) return Result.fail("NOT_FOUND", "Advice not found");
             if (a.getStatus() == AdviceStatus.DISMISSED) return Result.ok(a);
 
             a.setStatus(AdviceStatus.DISMISSED);
@@ -160,11 +159,9 @@ public class AdviceService {
         }
     }
 
-    // =========================== Helpers ===========================
-
+    // ---------- Helpers ----------
     private PlaceOrderRequest buildUpstoxRequest(Advice a) {
-        // Strategy must populate these fields on Advice before calling create()
-
+        // Uses Upstox SDK enums directly from Advice string fields (must match SDK enum names).
         PlaceOrderRequest req = new PlaceOrderRequest();
         req.setInstrumentToken(a.getInstrument_token());
         req.setOrderType(PlaceOrderRequest.OrderTypeEnum.valueOf(a.getOrder_type()));
@@ -184,19 +181,24 @@ public class AdviceService {
         return s == null || s.trim().isEmpty();
     }
 
-    // AdviceService.java — add this helper
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
+    }
+
+    /**
+     * Strict checks so OrdersService doesn’t receive half-filled payloads.
+     */
     private void assertReadyForCreationOrExecution(Advice a) {
         if (a == null) throw new IllegalArgumentException("Advice is null");
-        if (a.getInstrument_token() == null || a.getInstrument_token().trim().isEmpty())
+        if (isBlank(a.getInstrument_token()))
             throw new IllegalStateException("instrumentToken is required on Advice");
-        if (a.getSymbol() == null || a.getSymbol().trim().isEmpty())
+        if (isBlank(a.getSymbol()))
             throw new IllegalStateException("tradingSymbol is required on Advice");
-        if (a.getOrder_type() == null || a.getOrder_type().trim().isEmpty())
+        if (isBlank(a.getOrder_type()))
             throw new IllegalStateException("orderType is required on Advice");
         if (a.getTransaction_type() == null)
             throw new IllegalStateException("transactionType (BUY/SELL) is required on Advice");
         if (a.getQuantity() <= 0)
             throw new IllegalStateException("quantity must be > 0 on Advice");
     }
-
 }

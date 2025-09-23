@@ -11,13 +11,16 @@ import java.time.Instant;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@EqualsAndHashCode(of = {"symbol", "ts"})
 public class Tick {
 
     private @Id String id;
 
     private String symbol;
+
     private Instant ts;
 
     private double ltp;
+
     private Long quantity;
 }

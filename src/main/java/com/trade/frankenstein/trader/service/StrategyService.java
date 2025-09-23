@@ -9,10 +9,22 @@ import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.upstox.api.*;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.ta4j.core.BarSeries;
+import org.ta4j.core.BaseBar;
+import org.ta4j.core.BaseBarSeriesBuilder;
+import org.ta4j.core.indicators.ATRIndicator;
+import org.ta4j.core.indicators.EMAIndicator;
+import org.ta4j.core.indicators.RSIIndicator;
+import org.ta4j.core.indicators.SMAIndicator;
+import org.ta4j.core.indicators.adx.ADXIndicator;
+import org.ta4j.core.indicators.helpers.ClosePriceIndicator;
+import org.ta4j.core.indicators.statistics.StandardDeviationIndicator;
+import org.ta4j.core.indicators.volume.VWAPIndicator;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -522,7 +534,7 @@ public class StrategyService {
 
     // -------------------- Bias, legs, delta & exits --------------------
 
-    private enum Bias {CALL, PUT, BOTH}
+    public enum Bias {CALL, PUT, BOTH}
 
     private Bias mapTrendBias(String t) {
         return switch (t) {
@@ -555,7 +567,7 @@ public class StrategyService {
     }
 
     // UPDATED: build legs using ladder/straddle/strangle rules
-    private List<LegSpec> chooseLegs(Bias b, LocalDate expiry, BigDecimal atm, int stepsOut, BigDecimal atrPct) {
+    public List<LegSpec> chooseLegs(Bias b, LocalDate expiry, BigDecimal atm, int stepsOut, BigDecimal atrPct) {
         List<LegSpec> out = new ArrayList<>();
         if (expiry == null || atm == null) return out;
 
@@ -785,48 +797,151 @@ public class StrategyService {
     }
 
     // -------------------- Indicators & data --------------------
-    private Ind indicators(IntraDayCandleData cs, BigDecimal spot) {
-        if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 60) return new Ind();
+    // === UPDATED: compute indicators with ta4j ===
+    public Ind indicators(IntraDayCandleData cs, BigDecimal spot) {
+        // Rewritten to use ta4j (no reflection, Java 8). Falls back safely on errors.
+        Ind out = new Ind();
+        try {
+            if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 10) return out;
 
-        // Extract data from IntraDayCandleData into arrays
-        List<List<Object>> candles = cs.getCandles();
-        int size = candles.size();
-        double[] c = new double[size];
-        double[] h = new double[size];
-        double[] l = new double[size];
-        double[] v = new double[size];
+            Duration timeframe = inferTimeframe(cs);
+            BarSeries series = toBarSeries(cs, timeframe);
+            if (series == null || series.getBarCount() == 0
+                    || series.getBarCount() < Math.max(EMA_SLOW, Math.max(RSI_N, Math.max(ATR_N, ADX_N)))) {
+                return out;
+            }
 
-        for (int i = 0; i < size; i++) {
-            List<Object> candle = candles.get(i);
-            // Typical candle format: [timestamp, open, high, low, close, volume, ...]
-            h[i] = ((Number) candle.get(2)).doubleValue();
-            l[i] = ((Number) candle.get(3)).doubleValue();
-            c[i] = ((Number) candle.get(4)).doubleValue();
-            v[i] = ((Number) candle.get(5)).doubleValue();
+            final int end = series.getEndIndex();
+
+            ClosePriceIndicator close =
+                    new ClosePriceIndicator(series);
+            EMAIndicator emaFastInd =
+                    new EMAIndicator(close, EMA_FAST);
+            EMAIndicator emaSlowInd =
+                    new EMAIndicator(close, EMA_SLOW);
+            RSIIndicator rsiInd =
+                    new RSIIndicator(close, RSI_N);
+            ADXIndicator adxInd =
+                    new ADXIndicator(series, ADX_N);
+            ATRIndicator atrInd =
+                    new ATRIndicator(series, ATR_N);
+
+            // Bollinger Bands via SMA & StdDev: middle ± K * stdev
+            SMAIndicator sma =
+                    new SMAIndicator(close, BB_N);
+            StandardDeviationIndicator stdev =
+                    new StandardDeviationIndicator(close, BB_N);
+            double mid = sma.getValue(end).doubleValue();
+            double sd = stdev.getValue(end).doubleValue();
+            double bbU = mid + (BB_K * sd);
+            double bbL = mid - (BB_K * sd);
+
+            // VWAP (rolling 30)
+            VWAPIndicator vwapInd =
+                    new VWAPIndicator(series, 30);
+
+            out.ema20 = bd(emaFastInd.getValue(end).doubleValue());
+            out.ema50 = bd(emaSlowInd.getValue(end).doubleValue());
+            out.rsi = bd(rsiInd.getValue(end).doubleValue());
+            out.adx = bd(adxInd.getValue(end).doubleValue());
+            out.atr = bd(atrInd.getValue(end).doubleValue());
+            out.bbU = bd(bbU);
+            out.bbL = bd(bbL);
+            out.vwap = bd(vwapInd.getValue(end).doubleValue());
+            out.close = bd(close.getValue(end).doubleValue());
+
+            if (out.atr != null && spot != null && spot.compareTo(BigDecimal.ZERO) > 0) {
+                out.atrPct = out.atr.multiply(bd(100)).divide(spot, 2, java.math.RoundingMode.HALF_UP);
+            }
+        } catch (Throwable t) {
+            log.warn("indicators(): ta4j computation failed, returning partial: {}", t.toString());
         }
-
-        Double ema20 = ema(c, EMA_FAST), ema50 = ema(c, EMA_SLOW);
-        Double rsi = rsi(c, RSI_N);
-        Double atr = atr(h, l, c, ATR_N);
-        Double adx = adx(h, l, c, ADX_N);
-        Boll bb = boll(c, BB_N, BB_K);
-        Double vwap = vwap(c, v);
-
-        Ind i = new Ind();
-        i.ema20 = bd(ema20);
-        i.ema50 = bd(ema50);
-        i.rsi = bd(rsi);
-        i.atr = bd(atr);
-        i.adx = bd(adx);
-        i.bbU = bd(bb.upper);
-        i.bbL = bd(bb.lower);
-        i.vwap = bd(vwap);
-        i.close = bd(c[c.length - 1]);
-        if (i.atr != null && spot != null && spot.compareTo(BigDecimal.ZERO) > 0) {
-            i.atrPct = i.atr.multiply(bd(100)).divide(spot, 2, RoundingMode.HALF_UP);
-        }
-        return i;
+        return out;
     }
+
+// === NEW: convert Upstox candles to a ta4j BarSeries ===
+
+    /**
+     * Build a ta4j BarSeries from Upstox IntraDayCandleData.
+     */
+    private BarSeries toBarSeries(IntraDayCandleData cs, Duration timeframe) {
+        try {
+            BarSeries series =
+                    new BaseBarSeriesBuilder().withName("NIFTY-" + timeframe).build();
+            ZoneId zone = ZoneId.of("Asia/Kolkata");
+            List<List<Object>> rows = cs.getCandles();
+            for (List<Object> row : rows) {
+                if (row == null || row.size() < 6) continue;
+                long epochMs = toEpochMillis(row.get(0));
+                if (epochMs <= 0L) continue;
+
+                java.time.ZonedDateTime endZdt =
+                        java.time.ZonedDateTime.ofInstant(java.time.Instant.ofEpochMilli(epochMs), zone);
+                double open = row.get(1) instanceof Number ? ((Number) row.get(1)).doubleValue() : 0d;
+                double high = row.get(2) instanceof Number ? ((Number) row.get(2)).doubleValue() : open;
+                double low = row.get(3) instanceof Number ? ((Number) row.get(3)).doubleValue() : open;
+                double close = row.get(4) instanceof Number ? ((Number) row.get(4)).doubleValue() : open;
+                double vol = row.get(5) instanceof Number ? ((Number) row.get(5)).doubleValue() : 0d;
+
+                series.addBar(new BaseBar(timeframe, endZdt, open, high, low, close, vol));
+            }
+            return series;
+        } catch (Throwable t) {
+            log.warn("toBarSeries(): failed to convert candles to BarSeries: {}", t.toString());
+            return null;
+        }
+    }
+
+// === NEW: infer timeframe from candle timestamps (fallback 5m) ===
+
+    /**
+     * Infer timeframe from Upstox candle timestamps. Defaults to 5 minutes if unknown.
+     */
+    private java.time.Duration inferTimeframe(IntraDayCandleData cs) {
+        try {
+            java.util.List<java.util.List<Object>> rows = cs.getCandles();
+            int n = rows == null ? 0 : rows.size();
+            if (n >= 2) {
+                long t1 = toEpochMillis(rows.get(n - 2).get(0));
+                long t2 = toEpochMillis(rows.get(n - 1).get(0));
+                long diffMs = Math.abs(t2 - t1);
+                if (diffMs >= 60_000L && diffMs <= fourHoursMs()) {
+                    return java.time.Duration.ofMillis(diffMs);
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return java.time.Duration.ofMinutes(5);
+    }
+
+    private long fourHoursMs() {
+        return 4L * 60L * 60L * 1000L;
+    }  // helper upper bound
+
+// === NEW: robust timestamp parsing (Number or String) ===
+
+    /**
+     * Extract epoch millis from Upstox candle timestamp cell (Number or String).
+     */
+    private long toEpochMillis(Object ts) {
+        try {
+            if (ts instanceof Number) {
+                long v = ((Number) ts).longValue();
+                // Heuristic: if in seconds (< 10^12), convert to ms
+                if (v < 1_000_000_000_000L) return v * 1000L;
+                return v;
+            } else if (ts instanceof String) {
+                String s = (String) ts;
+                if (s.length() == 0) return -1L;
+                long v = Long.parseLong(s.trim());
+                if (v < 1_000_000_000_000L) return v * 1000L;
+                return v;
+            }
+        } catch (Throwable ignore) {
+        }
+        return -1L;
+    }
+
 
     private IntraDayCandleData candles(String key, String unit, String interval) {
         try {
@@ -1186,8 +1301,8 @@ public class StrategyService {
     }
 
     // -------------------- Inners --------------------
-    private static class Ind {
-        BigDecimal ema20, ema50, rsi, adx, atr, atrPct, bbU, bbL, vwap, close;
+    public static class Ind {
+        public BigDecimal ema20, ema50, rsi, adx, atr, atrPct, bbU, bbL, vwap, close;
     }
 
     private static class Structure {
@@ -1277,7 +1392,8 @@ public class StrategyService {
         }
     }
 
-    private static class LegSpec {
+    @Data
+    public static class LegSpec {
         final LocalDate expiry;
         final BigDecimal strike;
         final OptionType type;

@@ -2,15 +2,21 @@ package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
+import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.upstox.api.*;
+import com.upstox.api.GetMarketQuoteOHLCResponseV3;
+import com.upstox.api.MarketQuoteOHLCV3;
+import com.upstox.api.OhlcV3;
+import com.upstox.api.PlaceOrderRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Locale;
@@ -25,99 +31,97 @@ public class RiskService {
 
     private final UpstoxService upstox;
     private final StreamGateway stream;
+    private final FastStateStore fast; // Redis/in-mem per config
 
-    // --- Circuit config (percent or absolute; set via setters or config binder if you prefer) ---
-    private float dailyDdCapPct = 3.0f;
-    private float dailyDdCapAbs = 0f;
-    private float seedStartEquity = 0f;
+    // --- Circuit config (can be externalized later) ---
+    private float dailyDdCapPct = 3.0f;   // percent-of-equity cap (optional)
+    private float dailyDdCapAbs = 0f;     // absolute rupee cap (optional)
+    private float seedStartEquity = 0f;   // baseline for pct cap (optional)
 
     // --- Circuit live state (IST day roll-over safe) ---
     private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
     private final AtomicReference<Float> dayStartEquity = new AtomicReference<>(0f);
-    private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number
+    private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number if losing
     private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
 
-    // Rolling window for orders/min throttle (timestamps for last 60 seconds).
+    // Local fallback for orders/min when Redis is unavailable
     private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
 
-    /**
-     * Lightweight, real-time risk check for a new order.
-     * Uses only constants + live data; no DB writes/reads.
-     */
+    // =====================================================================
+    // ORDER CHECK
+    // =====================================================================
     @Transactional(readOnly = true)
     public Result<Void> checkOrder(PlaceOrderRequest req) {
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
 
-        // 0) Global kill-switch (daily circuit)
+        // 0) Daily circuit
         if (isDailyCircuitTripped().orElse(false)) {
             return Result.fail("CIRCUIT_TRIPPED", "Daily risk circuit is active");
         }
 
-        // 1) Blacklist (by trading symbol if available; else instrument_key trimmed to symbol part)
-        String symbol = normalizeSymbol(extractSymbol(req));
-        if (symbol != null && RiskConstants.BLACKLIST_SYMBOLS.contains(symbol)) {
-            return Result.fail("SYMBOL_BLOCKED", "Symbol is blacklisted: " + symbol);
+        // 1) Basic symbol blacklist — match by instrument token (no reflection)
+        String instrumentKey = req.getInstrumentToken();
+        if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains)) {
+            return Result.fail("SYMBOL_BLOCKED", "Blocked instrument: " + instrumentKey);
         }
 
-        // 2) Throttle: orders per rolling minute
-        double ordPct = getOrdersPerMinutePct(); // computed on the fly
+        // 2) Throttle: orders/minute (Redis-backed with local fallback)
+        double ordPct = getOrdersPerMinutePct();
         if (ordPct >= 100.0) {
             return Result.fail("THROTTLED", "Orders per minute throttle reached");
         }
 
         // 3) Market hygiene: live 1m bar roughness as a slippage proxy
-        //    If the current 1-minute bar is too choppy, block to avoid poor fills.
         try {
-            String key = req.getInstrumentToken();
-            if (key != null) {
-                double roughnessPct = readLiveBarRoughnessPct(key); // ((H-L)/mid)*100
-                if (!Double.isNaN(roughnessPct)) {
-                    double maxSlip = RiskConstants.MAX_SLIPPAGE_PCT.doubleValue();
-                    if (roughnessPct > maxSlip) {
-                        return Result.fail("SLIPPAGE_HIGH", String.format(Locale.ROOT,
-                                "Live bar roughness %.2f%% exceeds %.2f%%", roughnessPct, maxSlip));
-                    }
+            if (instrumentKey != null && !instrumentKey.isEmpty()) {
+                double roughnessPct = readLiveBarRoughnessPct(instrumentKey); // ((H-L)/mid)*100
+                double maxSlip = RiskConstants.MAX_SLIPPAGE_PCT.doubleValue();
+                if (!Double.isNaN(roughnessPct) && roughnessPct > maxSlip) {
+                    return Result.fail(
+                            "SLIPPAGE_HIGH",
+                            String.format(Locale.ROOT, "Live bar roughness %.2f%% exceeds %.2f%%", roughnessPct, maxSlip)
+                    );
                 }
             }
         } catch (Exception t) {
-            // Non-fatal — prefer allowing the order instead of failing on telemetry error
-            log.error("checkOrder: slippage read failed: {}", t);
+            log.warn("checkOrder: slippage read failed (allowing order): {}", t.toString());
         }
 
-        // 4) Daily loss cap (live PnL)
+        // 4) Daily loss cap (realized only, unless you add unrealized in UpstoxService later)
         try {
-            double lossNow = currentLossRupees(); // positive number if losing
+            double lossNow = currentLossRupees(); // positive if losing
             double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
             if (lossNow >= cap - 1e-6) {
                 return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
             }
         } catch (Exception t) {
-            log.error("checkOrder: PnL read failed: {}", t);
+            log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
         }
 
         return Result.ok(null);
     }
 
     /**
-     * Call this AFTER a successful placeOrder to advance the rolling throttle.
+     * Call AFTER a successful placeOrder to advance the rolling throttle.
      */
     public void noteOrderPlaced() {
         Instant now = Instant.now();
-        synchronized (orderTimestamps) {
+        try {
+            fast.incr("orders_per_min", Duration.ofSeconds(60));
+        } catch (Exception e) {
+            // Fallback: local rolling window (best-effort)
             orderTimestamps.addLast(now);
             evictOlderThan(now.minusSeconds(60));
         }
-        // Push a fresh snapshot for the UI (non-blocking)
         try {
             stream.send("risk.summary", buildSnapshot());
         } catch (Exception ignored) {
-            log.error("noteOrderPlaced: SSE send failed: {}", ignored);
         }
     }
 
-    /**
-     * Real-time risk summary (ephemeral).
-     */
+    // =====================================================================
+    // SUMMARIES & CIRCUIT
+    // =====================================================================
     @Transactional(readOnly = true)
     public Result<RiskSnapshot> getSummary() {
         try {
@@ -134,67 +138,52 @@ public class RiskService {
     }
 
     /**
-     * Convenience: pull live PnL from broker and refresh the internal loss counter used by the circuit.
+     * Refresh today's realized PnL from broker and update loss (positive if losing).
+     * (Unrealized can be added later if your UpstoxService exposes it — we intentionally
+     * do NOT fake unrealized by reusing realized.)
      */
     public void refreshDailyLossFromBroker() {
         try {
-            Object realizedAny = upstox.getRealizedPnlToday(); // usually BigDecimal; treat generically
-            float realized = toFloat(realizedAny);
+            float realized = toFloat(upstox.getRealizedPnlToday()); // +ve profit, -ve loss
             float lossAbs = realized < 0f ? -realized : 0f;
             updateDailyLossAbs(lossAbs);
         } catch (Exception t) {
-            log.error("refreshDailyLossFromBroker failed: {}", t);
+            log.warn("refreshDailyLossFromBroker failed: {}", t.toString());
         }
     }
 
-
-    /**
-     * Read-only circuit state for Strategy/Engine/UI; also emits SSE.
-     */
     public Result<Boolean> getCircuitState() {
         boolean tripped = isDailyCircuitTripped().orElse(false);
         try {
             stream.send("risk.circuit", tripped);
         } catch (Exception ignored) {
-            log.error("getCircuitState: SSE send failed: {}", ignored);
         }
         return Result.ok(tripped);
     }
 
-    /**
-     * Manually trip the circuit (e.g., on regime flip/drawdown breach outside this service).
-     */
     public Result<Void> tripCircuit(String reason) {
         circuitTripped.set(true);
         try {
             stream.send("risk.circuit", true);
         } catch (Exception ignored) {
-            log.error("tripCircuit: SSE send failed: {}", ignored);
         }
-        if (reason != null && !reason.isEmpty()) {
-            log.warn("Risk circuit TRIPPED: {}", reason);
-        }
+        if (reason != null && !reason.isEmpty()) log.warn("Risk circuit TRIPPED: {}", reason);
         return Result.ok(null);
     }
 
-    /**
-     * Reset the circuit (e.g., after review or next day).
-     */
     public Result<Void> resetCircuit() {
         circuitTripped.set(false);
         try {
             stream.send("risk.circuit", false);
         } catch (Exception ignored) {
-            log.error("resetCircuit: SSE send failed: {}", ignored);
         }
         log.info("Risk circuit RESET");
         return Result.ok(null);
     }
 
-    // =================================================================================
-    // Snapshot builder (no DB, no static placeholders)
-    // =================================================================================
-
+    // =====================================================================
+    // SNAPSHOT
+    // =====================================================================
     private RiskSnapshot buildSnapshot() {
         Instant now = Instant.now();
 
@@ -203,14 +192,13 @@ public class RiskService {
         try {
             loss = currentLossRupees();
         } catch (Exception ignored) {
-            log.error("buildSnapshot: PnL read failed: {}", ignored);
         }
 
         double budgetLeft = Math.max(0.0, cap - loss);
         double dailyLossPct = (cap > 0.0) ? Math.min(100.0, (loss / cap) * 100.0) : 0.0;
         double ordersPerMinPct = getOrdersPerMinutePct();
 
-        Integer lotsCap = Integer.valueOf(RiskConstants.MAX_LOTS);
+        Integer lotsCap = RiskConstants.MAX_LOTS;
         Integer lotsUsed = null; // derive from live positions when lot sizes are wired
 
         return RiskSnapshot.builder()
@@ -223,52 +211,50 @@ public class RiskService {
                 .build();
     }
 
-    // =================================================================================
-    // Live computations
-    // =================================================================================
+    // =====================================================================
+    // LIVE COMPUTATIONS (no reflection)
+    // =====================================================================
 
     /**
-     * Sum of negative PnL (₹); returns a positive number for current loss.
+     * Positive rupee loss today (0 if flat/profit).
      */
     private double currentLossRupees() {
-        GetPositionResponse p = upstox.getShortTermPositions();
-        if (p == null || p.getData() == null) return 0.0;
-
-        double realised = 0.0;
-        double unrealised = 0.0;
-        for (Object o : p.getData()) {
-            // Defensive access against SDK variations
-            realised += getDouble(o, "getRealised");
-            unrealised += getDouble(o, "getUnrealised");
-            // If your payload exposes day PnL/MTM methods, add here similarly.
+        // Realized only for now (unrealized can be integrated when available)
+        float realized = 0f;
+        try {
+            realized = toFloat(upstox.getRealizedPnlToday());
+        } catch (Throwable ignored) {
         }
-        double pnl = realised + unrealised;   // positive = profit, negative = loss
-        return (pnl < 0.0) ? -pnl : 0.0;
+        double pnl = realized; // +ve profit, -ve loss
+        return pnl < 0.0 ? -pnl : 0.0;
     }
 
     /**
-     * Rolling 60s orders-per-minute usage as a percentage of the configured cap.
+     * Orders/minute usage as % of cap; prefers Redis count, falls back to local deque.
      */
     private double getOrdersPerMinutePct() {
         final int cap = Math.max(1, RiskConstants.ORDERS_PER_MINUTE);
-        Instant threshold = Instant.now().minusSeconds(60);
-        int count;
-        synchronized (orderTimestamps) {
-            evictOlderThan(threshold);
-            count = orderTimestamps.size();
-        }
-        double pct = (count * 100.0) / cap;
-        return Math.max(0.0, Math.min(100.0, pct));
+        try {
+            Optional<String> v = fast.get("orders_per_min");
+            if (v.isPresent()) {
+                long count = Long.parseLong(v.get());
+                return clamp01((count * 100.0) / cap);
+            }
+        } catch (Exception ignored) { /* fall back */ }
+        evictOlderThan(Instant.now().minusSeconds(60));
+        int count = orderTimestamps.size();
+        return clamp01((count * 100.0) / cap);
     }
 
     /**
      * Live bar roughness % = ((high - low) / mid) * 100 for the current 1-minute bar.
+     * Uses SDK v3 OHLC (open/high/low/close). No LTP here by design.
      */
     private double readLiveBarRoughnessPct(String instrumentKey) {
         GetMarketQuoteOHLCResponseV3 q = upstox.getMarketOHLCQuote(instrumentKey, "I1");
-        if (q == null || q.getData() == null || q.getData().get(instrumentKey) == null) return Double.NaN;
+        if (q == null || q.getData() == null) return Double.NaN;
         MarketQuoteOHLCV3 d = q.getData().get(instrumentKey);
-        if (d.getLiveOhlc() == null) return Double.NaN;
+        if (d == null || d.getLiveOhlc() == null) return Double.NaN;
         OhlcV3 o = d.getLiveOhlc();
         double high = o.getHigh();
         double low = o.getLow();
@@ -277,66 +263,19 @@ public class RiskService {
         return ((high - low) / mid) * 100.0;
     }
 
-    // =================================================================================
-    // Small helpers
-    // =================================================================================
+    // =====================================================================
+    // HELPERS (no reflection)
+    // =====================================================================
+    private static double clamp01(double pct) {
+        return Math.max(0.0, Math.min(100.0, pct));
+    }
 
     private void evictOlderThan(Instant threshold) {
-        while (!orderTimestamps.isEmpty()) {
+        while (true) {
             Instant head = orderTimestamps.peekFirst();
-            if (head != null && head.isBefore(threshold)) {
-                orderTimestamps.removeFirst();
-            } else break;
+            if (head == null || !head.isBefore(threshold)) break;
+            orderTimestamps.pollFirst();
         }
-    }
-
-    @Nullable
-    private static String extractSymbol(PlaceOrderRequest req) {
-        // Try common fields first; fall back to instrument_key sans exchange prefix
-        try {
-            for (String getter : new String[]{"getTrading_symbol", "getTradingsymbol", "getSymbol"}) {
-                try {
-                    java.lang.reflect.Method m = PlaceOrderRequest.class.getMethod(getter);
-                    Object v = m.invoke(req);
-                    if (v instanceof String) {
-                        String s = ((String) v).trim();
-                        if (!s.isEmpty()) return s;
-                    }
-                } catch (NoSuchMethodException ignored) {
-                }
-            }
-        } catch (Exception ignored) {
-            log.error("extractSymbol failed: {}", ignored);
-        }
-        String key = req.getInstrumentToken();
-        if (key == null) return null;
-        int idx = key.indexOf(':');
-        return (idx >= 0 && idx + 1 < key.length()) ? key.substring(idx + 1) : key;
-    }
-
-    @Nullable
-    private static String normalizeSymbol(@Nullable String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        if (t.isEmpty()) return null;
-        return t.toUpperCase(Locale.ROOT);
-    }
-
-    private static double getDouble(Object bean, String getter) {
-        try {
-            java.lang.reflect.Method m = bean.getClass().getMethod(getter);
-            Object v = m.invoke(bean);
-            if (v instanceof Number) return ((Number) v).doubleValue();
-        } catch (Exception ignored) {
-        }
-        return 0.0;
-    }
-
-    // (Optional) If you want to quickly check IST now (for logs/debugging)
-    @SuppressWarnings("unused")
-    private static String nowIst() {
-        ZonedDateTime z = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
-        return z.toLocalDate() + " " + LocalTime.from(z);
     }
 
     public Optional<Boolean> isDailyCircuitTripped() {
@@ -348,23 +287,14 @@ public class RiskService {
                 ddDay.set(todayIst);
                 circuitTripped.set(false);
                 dayLossAbs.set(0f);
-                // re-seed baseline if provided
-                if (seedStartEquity > 0f) {
-                    dayStartEquity.set(seedStartEquity);
-                } else {
-                    dayStartEquity.set(0f);
-                }
+                dayStartEquity.set(seedStartEquity > 0f ? seedStartEquity : 0f);
             }
 
-            // Short-circuit if already tripped
             if (circuitTripped.get()) return Optional.of(true);
 
             float lossAbs = nzf(dayLossAbs.get());
-
-            // Absolute cap check (if configured)
             boolean hitAbs = (dailyDdCapAbs > 0f) && (lossAbs >= dailyDdCapAbs);
 
-            // Percent cap check (if baseline available & configured)
             boolean hitPct = false;
             if (!hitAbs && dailyDdCapPct > 0f) {
                 float base = nzf(dayStartEquity.get());
@@ -379,7 +309,6 @@ public class RiskService {
 
             return Optional.of(tripped);
         } catch (Exception t) {
-            // On any failure, be safe and do not trip implicitly
             return Optional.of(false);
         }
     }
@@ -389,7 +318,7 @@ public class RiskService {
     }
 
     /**
-     * Call this from your PnL updater (Engine/Trades) to keep losses current (pass a positive loss amount).
+     * Call from your PnL updater to keep losses current (pass a positive loss amount).
      */
     public void updateDailyLossAbs(float lossAbs) {
         if (lossAbs >= 0f) {

@@ -11,16 +11,24 @@ import java.time.Instant;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@EqualsAndHashCode(of = {"symbol", "openTime"})
 public class Candle {
 
-    private @Id String id;
+    @Id
+    private String id;
 
+    @NonNull
     private String symbol;
+
+    @NonNull
     private Instant openTime;   // start of minute
 
     private double openPrice;
+
     private double highPrice;
+
     private double lowPrice;
+
     private double closePrice;
 
     private Long volume;

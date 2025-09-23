@@ -1,4 +1,3 @@
-// src/main/java/com/trade/frankenstein/trader/service/streaming/StreamGateway.java
 package com.trade.frankenstein.trader.service;
 
 import lombok.extern.slf4j.Slf4j;

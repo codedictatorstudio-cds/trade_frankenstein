@@ -34,7 +34,8 @@ public class CustomConfig {
         mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
         mapper.setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
         mapper.configure(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES, true);
-
+        mapper.configure(DeserializationFeature.ACCEPT_EMPTY_ARRAY_AS_NULL_OBJECT, true);
+        mapper.configure(DeserializationFeature.READ_ENUMS_USING_TO_STRING, true);
         return mapper;
     }
 
