@@ -1,11 +1,13 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
+import com.trade.frankenstein.trader.common.constants.BotConsts;
+import com.trade.frankenstein.trader.common.enums.FlagName;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
-import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
 import com.upstox.api.GetIntraDayCandleResponse;
@@ -57,6 +59,8 @@ public class EngineService {
     private PortfolioService portfolioService;
     @Autowired
     private OptionChainService optionChainService;
+    @Autowired
+    private FlagsService flags;
 
     private final Map<String, ExitPlan> exitPlans = new ConcurrentHashMap<>(); // key = instrument_key
     private static final Pattern EXIT_HINTS = Pattern.compile("EXIT:\\s*SL=([^,]+),\\s*TP=([^,]+),\\s*TTL=(\\d+)m", Pattern.CASE_INSENSITIVE);
@@ -103,6 +107,10 @@ public class EngineService {
 
     // ---------------- Lifecycle ----------------
     public Result<String> startEngine() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         if (running.get()) {
             log.warn("Engine start requested but already running");
             return Result.ok("engine:already-running");
@@ -116,6 +124,10 @@ public class EngineService {
     }
 
     public Result<String> stopEngine() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         if (!running.get()) {
             log.warn("Engine stop requested but already stopped");
             return Result.ok("engine:already-stopped");
@@ -127,15 +139,24 @@ public class EngineService {
     }
 
     public Result<EngineState> getEngineState() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         EngineState state = new EngineState(
                 running.get(), startedAt, lastTickAt, ticks.get(), lastExecuted, lastError, Instant.now()
         );
         return Result.ok(state);
     }
 
+
     // ---------------- Tick Loop ----------------
     @Scheduled(fixedDelayString = "${trade.engine.tick-ms:2000}")
     public void tick() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         if (!running.get()) {
             log.debug("tick(): engine not running, skip");
             return;
@@ -145,73 +166,93 @@ public class EngineService {
         lastExecuted = 0;
         lastError = null;
 
+        // -------- Evaluate flags (auto policy) --------
+        FlagsService.Inputs in = new FlagsService.Inputs();
+        in.now = java.time.LocalDateTime.now();
+
+        RiskSnapshot rs = null;
+        try {
+            Result<RiskSnapshot> res = riskService.getSummary();
+            if (res != null && res.isOk()) rs = res.get();
+        } catch (Exception ignore) {
+        }
+
+        // Risk-derived inputs
+        in.circuitTripped = isCircuitLikeTripped(rs);
+        in.dailyLossPct = (rs != null && rs.getDailyLossPct() <= 0) ? rs.getDailyLossPct() : 0.0;
+        if (rs != null && rs.getOrdersPerMinPct() <= 0) {
+            in.ordersPerMinLoad = Math.max(0.0, Math.min(1.0, rs.getOrdersPerMinPct() / 100.0));
+        }
+        // Headroom: budget left, lots cap, throttle, daily loss
+        boolean headroom = true;
+        if (rs != null) {
+            Double budgetLeft = rs.getRiskBudgetLeft();
+            Integer used = rs.getLotsUsed();
+            Integer cap = rs.getLotsCap();
+            Double ordPct = rs.getOrdersPerMinPct();
+            headroom = (budgetLeft == null || budgetLeft > 0.0)
+                    && (cap == null || used == null || used < cap)
+                    && (ordPct == null || ordPct < 100.0)
+                    && in.dailyLossPct < BotConsts.Risk.MAX_DAILY_LOSS_PCT;
+        }
+        in.riskHeadroomOk = headroom;
+
+        // Signals (safe fallbacks)
+        in.trendOk = true;
+        in.momentumConfirmed = true;
+        in.pcr = null; // can be wired from MarketDataService later
+        in.atrPct = 0.0;
+        Float atrPctNow = getCurrentAtrPctSafe();
+        if (atrPctNow != null) in.atrPct = atrPctNow;
+        in.vix = null; // optional
+        in.majorNewsSoon = false; // wire from NewsService if available
+        in.intradayRangePct = 0.0; // wire when available
+        in.atrJump5mPct = 0.0;     // wire when available
+        in.regimeQuiet = (atrPctNow != null && atrPctNow <= BotConsts.Quiet.ATR_MAX_PCT);
+        in.minutesSinceLastSl = 999;  // can wire from TradesService later
+        in.restrikesToday = 0;        // can wire from TradesService later
+        in.paperTradingMode = false;  // wire from router if you have a paper mode
+
+        try {
+            flags.evaluateAutoFlags(in);
+        } catch (Exception e) {
+            log.warn("tick(): evaluateAutoFlags failed: {}", e.getMessage());
+        }
+
+        final boolean blockNewEntries =
+                flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
+                        || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
+                        || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
+                        || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
+                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF);
+
+        // -------- Keep risk PnL in sync --------
         try {
             riskService.refreshDailyLossFromBroker();
         } catch (Exception ex) {
             log.info("tick(): risk broker-PnL refresh failed: {}", ex.getMessage(), ex);
         }
 
-        try {
-            int made = strategyService.generateAdvicesNow();
-            if (made > 0) log.info("tick(): strategy generated {} advice(s)", made);
-        } catch (Exception ex) {
-            log.error("tick(): strategy generation failed: {}", ex.getMessage(), ex);
+        // -------- Generate new advices (only if allowed) --------
+        if (!blockNewEntries) {
+            try {
+                int made = strategyService.generateAdvicesNow();
+                if (made > 0) log.info("tick(): strategy generated {} advice(s)", made);
+            } catch (Exception ex) {
+                log.error("tick(): strategy generation failed: {}", ex.getMessage(), ex);
+            }
+        } else {
+            log.debug("tick(): new entries blocked by flags; skipping strategy generation");
         }
 
-        // Still inside tick(), after the loop that executes advices:
+        // -------- Portfolio-level protective step (always runs) --------
         try {
-            manageProtectiveOrders();   // see stub below
+            manageProtectiveOrders();
         } catch (Exception ex) {
             log.error("tick(): manageProtectiveOrders failed: {}", ex.getMessage(), ex);
         }
 
-        // UPDATED pre-check in tick()
-        try {
-            Result<RiskSnapshot> res = riskService.getSummary();
-            RiskSnapshot r = (res != null && res.isOk()) ? res.get() : null;
-
-            boolean block = false;
-            StringBuilder why = new StringBuilder();
-
-            if (r != null) {
-                // 1) Budget exhausted
-                if (r.getRiskBudgetLeft() <= 0.0) {
-                    block = true;
-                    appendReason(why, "Risk budget exhausted");
-                }
-                // 2) Lots cap reached
-                Integer used = r.getLotsUsed();
-                Integer cap = r.getLotsCap();
-                if (!block && used != null && cap != null && used >= cap) {
-                    block = true;
-                    appendReason(why, "Lots cap reached (" + used + "/" + cap + ")");
-                }
-                // 3) Daily loss throttle at 100%
-                if (!block && r.getDailyLossPct() >= 100.0) {
-                    block = true;
-                    appendReason(why, "Daily loss at 100%");
-                }
-                // 4) Orders/min throttle at 100%
-                if (!block && r.getOrdersPerMinPct() >= 100.0) {
-                    block = true;
-                    appendReason(why, "Orders/min limit at 100%");
-                }
-            }
-
-            if (block) {
-                lastError = why.length() == 0 ? "Risk guard: blocked" : why.toString();
-                log.warn("tick(): {} — skipping execution", lastError);
-                ticks.incrementAndGet();
-                publishState();
-                return;
-            }
-        } catch (Exception ex) {
-            lastError = "Pre-checks failed: " + ex.getMessage();
-            log.error("tick(): pre-checks error", ex);
-        }
-
-
-        // Refresh UI signals (lightweight)
+        // -------- Lightweight UI refresh --------
         try {
             decisionService.getQuality();
         } catch (Exception ex) {
@@ -227,24 +268,37 @@ public class EngineService {
         } catch (Exception ex) {
             log.info("tick(): sentiment refresh failed: {}", ex.getMessage(), ex);
         }
+
+        // -------- Re-strike manager (independent of new entry block) --------
         try {
             restrikeManagerTick();
         } catch (Exception ex) {
             log.error("tick(): re-strike manager failed: {}", ex.getMessage(), ex);
         }
-        // Execute pending advices (newest first), capped by maxExecPerTick
+
+        // -------- Execute pending advices (cap by maxExecPerTick) --------
         int executed = 0;
         try {
             List<Advice> pending = findPendingAdvices(scanLimit);
             log.debug("tick(): pending advices fetched={}", pending.size());
 
+            final boolean newEntriesBlockedNow = blockNewEntries;
+
             for (int i = 0; i < pending.size() && executed < maxExecPerTick; i++) {
                 Advice a = pending.get(i);
-                String id = a == null ? null : a.getId();
+                if (a == null) continue;
+
+                // If blocked, still allow SELL exits; skip BUY entries
+                if (newEntriesBlockedNow && "BUY".equalsIgnoreCase(a.getTransaction_type())) {
+                    log.debug("tick(): skipping BUY advice id={} due to entry block", a.getId());
+                    continue;
+                }
+
+                String id = a.getId();
                 if (id == null) continue;
 
                 try {
-                    Result<?> r = adviceService.execute(id);   // String id (Mongo)
+                    Result<?> r = adviceService.execute(id);
                     if (r != null && r.isOk()) {
                         executed++;
                         log.info("Advice executed: id={}", id);
@@ -264,7 +318,7 @@ public class EngineService {
             lastExecuted = executed;
             ticks.incrementAndGet();
 
-            // -- Live day PnL feed into RiskService (for circuit/budget) --
+            // Feed today's PnL into RiskService (circuit/budget)
             try {
                 Result<PortfolioService.PortfolioSummary> ps = portfolioService.getPortfolioSummary();
                 if (ps != null && ps.isOk() && ps.get() != null) {
@@ -282,57 +336,17 @@ public class EngineService {
         engineExitTick();
     }
 
-    @Scheduled(fixedDelayString = "${trade.engine.analysis-ms:15000}")
-    public void runAnalysisTick() {
-        try {
-            // 1) Real-time sentiment refresh (persists + broadcasts on "sentiment.update")
-            MarketSentimentSnapshot snap = null;
-            try {
-                snap = sentimentService.getNow().get();
-            } catch (Exception t) {
-                log.error("Engine: sentiment refresh failed: {}", t.getMessage());
-            }
-
-            // 2) Decision quality (pulls live PCR / momentum / slippage via dependencies)
-            Result<DecisionQuality> qRes = decisionService.getQuality();
-
-            // 3) Build heartbeat (no new DTOs exposed; we use a tiny inner POJO for SSE only)
-            EngineHeartbeat hb = new EngineHeartbeat();
-            hb.setAsOf(Instant.now());
-
-            if (snap != null) {
-                hb.setSentimentScore(nzi(snap.getScore()));
-                hb.setSentimentLabel(nullSafe(snap.getSentiment()));
-            }
-
-            if (qRes != null && qRes.isOk() && qRes.get() != null) {
-                DecisionQuality q = qRes.get();
-                hb.setDecisionScore(q.getScore());
-                hb.setTrend(nullSafe(q.getTrend().name()));
-                hb.setTags(List.of(q.getRr(), q.getSlippage(), q.getThrottle()));
-                hb.setReasons(q.getReasons());
-            }
-
-            // 4) Push engine heartbeat (non-blocking)
-            try {
-                stream.send("engine.heartbeat", hb);
-            } catch (Exception ignored) {
-                log.error(" Engine: heartbeat stream error: {}", ignored);
-            }
-
-        } catch (Exception t) {
-            log.error("Engine tick failed", t);
-        }
-    }
-
     // ---------------- Helpers ----------------
 
     private void publishState() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         try {
             EngineState state = getEngineState().get();
             log.info("engine.state -> running={}, ticks={}, lastExecuted={}, lastError={}",
                     state.isRunning(), state.getTicks(), state.getLastExecuted(), safe(lastError));
-            // Sticky so new SSE subscribers get the latest instantly
             stream.sendSticky("engine.state", state);
         } catch (Exception ex) {
             log.error("publishState(): failed to emit engine.state: {}", ex.getMessage(), ex);
@@ -347,6 +361,10 @@ public class EngineService {
 
 
     private List<Advice> findPendingAdvices(int limit) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return java.util.Collections.emptyList();
+        }
         List<Advice> all = new ArrayList<>();
         try {
             List<Advice> fetched = adviceRepo.findAll();
@@ -354,9 +372,8 @@ public class EngineService {
         } catch (Exception ex) {
             log.error("findPendingAdvices(): repo fetch failed: {}", ex.getMessage(), ex);
         }
-        if (all.isEmpty()) return Collections.emptyList();
+        if (all.isEmpty()) return java.util.Collections.emptyList();
 
-        // Filter PENDING, sort by createdAt desc, cap to limit
         List<Advice> filtered = new ArrayList<>();
         for (Advice a : all) {
             if (a != null && a.getStatus() == AdviceStatus.PENDING) {
@@ -369,7 +386,7 @@ public class EngineService {
             if (a1 == null && a2 == null) return 0;
             if (a1 == null) return 1;
             if (a2 == null) return -1;
-            return a2.compareTo(a1); // newest first
+            return a2.compareTo(a1);
         });
 
         int cap = Math.max(1, limit);
@@ -388,7 +405,6 @@ public class EngineService {
         int ttl = safeInt(m.group(3), 35);
         if (sl == null || tp == null) return;
 
-        // use Advice.quantity as the working qty
         int qty = Optional.ofNullable(a.getQuantity()).orElse(0);
         if (qty <= 0) return;
 
@@ -407,26 +423,20 @@ public class EngineService {
     private void engineExitTick() {
         for (ExitPlan plan : exitPlans.values()) {
             try {
-                // 1) Time-stop: if expired, force exit by moving SL to (≈) market
                 if (Instant.now().isAfter(plan.expiresAt)) {
                     Float ltp = getLtp(plan.instrumentKey);
                     if (ltp != null && plan.slOrderId != null) {
-                        // move SL to current LTP to trigger an immediate exit
                         ordersService.amendOrderPrice(plan.slOrderId, ltp);
                     }
-                    // after forcing, we can let normal order-state listeners clean up the plan
                     continue;
                 }
 
-                // 2) Simple trailing: if in profit ≥ +20% from implied entry, trail SL to breakeven
-                // infer approximate entry from SL hint (slInit ≈ entry * (1 - 0.25)) ⇒ entry ≈ slInit / 0.75
                 Float entryEst = (plan.slInit != null) ? (plan.slInit / 0.75f) : null;
-
                 Float ltp = getLtp(plan.instrumentKey);
                 if (entryEst != null && ltp != null) {
                     float up20 = entryEst * 1.20f;
                     if (ltp >= up20) {
-                        Float be = entryEst; // move SL to breakeven
+                        Float be = entryEst;
                         if (plan.slOrderId != null && plan.slLive != null && be > plan.slLive) {
                             ordersService.amendOrderPrice(plan.slOrderId, be);
                             plan.slLive = be;
@@ -434,25 +444,24 @@ public class EngineService {
                     }
                 }
 
-                // 3) Clean-up heuristic: if neither SL nor TP order is working anymore, drop plan
                 boolean slWorking = plan.slOrderId != null && ordersService.isOrderWorking(plan.slOrderId).get();
                 boolean tpWorking = plan.tpOrderId != null && ordersService.isOrderWorking(plan.tpOrderId).get();
                 if (!slWorking && !tpWorking) {
                     exitPlans.remove(plan.instrumentKey);
                 }
             } catch (Exception t) {
-                // keep engine resilient—do not throw
+                // keep resilient
             }
         }
     }
 
     private Float getLtp(String instrumentKey) {
         try {
-            var q = upstoxService.getMarketLTPQuote(instrumentKey);
+            GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(instrumentKey);
             double px = q.getData().get(instrumentKey).getLastPrice();
             if (px <= 0) return null;
             float f = (float) px;
-            return round2(f);
+            return Math.round(f * 100f) / 100f;
         } catch (Exception t) {
             return null;
         }
@@ -465,32 +474,33 @@ public class EngineService {
     // Add these methods inside EngineService:
 
     public void onAdviceCreated(Advice a) {
-        try {
-            // Parse and register EXIT: SL/TP/TTL hints from Advice.reason
-            registerExitPlanFromAdvice(a);
-        } catch (Exception e) {
-            // keep engine resilient
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
         }
+        try {
+            registerExitPlanFromAdvice(a);
+        } catch (Exception e) { /* keep resilient */ }
     }
 
     public void onAdviceExecuted(Advice a) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         try {
             if (a == null || a.getInstrument_token() == null) return;
             ExitPlan plan = exitPlans.get(a.getInstrument_token());
             if (plan == null) return;
 
-            // Use advice quantity if provided (fallback to plan qty)
             int qty = Optional.ofNullable(a.getQuantity()).orElse(plan.qty);
 
-            // Place SL if not placed yet
             if (plan.slOrderId == null && plan.slInit != null && qty > 0) {
                 String id = ordersService.placeStopLossOrder(plan.instrumentKey, qty, plan.slInit)
                         .get().getData().getOrderId();
                 plan.slOrderId = id;
                 plan.slLive = plan.slInit;
             }
-
-            // Place TP if not placed yet
             if (plan.tpOrderId == null && plan.tpInit != null && qty > 0) {
                 String id = ordersService.placeTargetOrder(plan.instrumentKey, qty, plan.tpInit)
                         .get().getData().getOrderId();
@@ -566,34 +576,22 @@ public class EngineService {
      * - Leaves per-position SL/TP management to a position-aware path
      */
     private void manageProtectiveOrders() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         try {
             Result<PortfolioService.PortfolioSummary> res = portfolioService.getPortfolioSummary();
             if (res == null || !res.isOk() || res.get() == null) {
                 log.debug("manageProtectiveOrders(): portfolio summary not available");
                 return;
             }
-
             PortfolioService.PortfolioSummary ps = res.get();
-
             Float dayPnl = toFloat(ps.getDayPnl());
-            Float dayPnlPct = toFloat(ps.getDayPnlPct());
-            int positions = ps.getPositionsCount();
-
-            // Convert portfolio readout to absolute daily loss for RiskService
             float dayLossAbs = (dayPnl != null && dayPnl < 0f) ? -dayPnl : 0f;
             riskService.updateDailyLossAbs(dayLossAbs);
-
-            log.info("manageProtectiveOrders(): positions={}, dayPnl={}, dayPnlPct={}, lossAbsFedToRisk={}",
-                    positions, dayPnl, dayPnlPct, dayLossAbs);
-
-            // If your RiskService auto-trips the circuit on updateDailyLossAbs() thresholds,
-            // nothing more is needed here. Engine tick will naturally respect the circuit state.
-            // If you want a hard stop when any loss is detected and positions are open, uncomment:
-            // if (positions > 0 && dayLossAbs > 0f && riskService.isDailyCircuitTripped()) {
-            //     log.warn("Circuit is tripped with open positions; execution will be skipped by engine guards.");
-            // }
-
-
+            log.info("manageProtectiveOrders(): positions={}, dayPnl={}, fedLossAbs={}",
+                    ps.getPositionsCount(), dayPnl, dayLossAbs);
         } catch (Exception ex) {
             log.error("manageProtectiveOrders(): failed: {}", ex.getMessage(), ex);
         }
@@ -601,18 +599,20 @@ public class EngineService {
 
     // UPDATED: safe, conservative re-strike manager with extra triggers and atomic exit->enter
     private void restrikeManagerTick() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         try {
-            // throttle checks
+            // original logic unchanged except guard added
             Instant now = Instant.now();
             if (Duration.between(lastRestrikeCheckAt, now).toMinutes() < RESTRIKE_CHECK_MINUTES) return;
             lastRestrikeCheckAt = now;
 
-            // cut-off by time (IST)
             ZonedDateTime z = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
             int hhmm = z.getHour() * 100 + z.getMinute();
             if (hhmm >= DO_NOT_RESTRIKE_AFTER_HHMM) return;
 
-            // per-hour limit
             int hourKey = z.getYear() * 1000000 + z.getDayOfYear() * 100 + z.getHour();
             if (hourKey != restrikeHourKey) {
                 restrikeHourKey = hourKey;
@@ -620,7 +620,6 @@ public class EngineService {
             }
             if (restrikeCountThisHour >= RESTRIKE_MAX_PER_HOUR) return;
 
-            // prerequisites
             Result<List<Advice>> res = adviceService.list();
             if (res == null || !res.isOk() || res.get() == null) return;
 
@@ -637,18 +636,15 @@ public class EngineService {
 
             int atmStrike = computeAtmStrikeInt((float) spot, 50);
 
-            // --- new change-detection signals ---
             Integer currDir = getCurrentDirScoreSafe();
             Float atrPct = getCurrentAtrPctSafe();
-            // Use the same thresholds you already use elsewhere (quiet ≤0.30%, volatile ≥1.00%).
             AtrBand currBand = atrBandOf(atrPct, 0.30f, 1.00f);
 
-            boolean dirFlipTrigger = dirFlipped(lastDirScoreForRestrike, currDir, 10); // |score| ≥ 10 = directional
+            boolean dirFlipTrigger = dirFlipped(lastDirScoreForRestrike, currDir, 10);
             boolean atrBandTrigger = atrBandChanged(lastAtrBandForRestrike, currBand);
 
             int triggered = 0;
 
-            // --- existing ATM-shift trigger (per executed long leg) ---
             for (Advice a : res.get()) {
                 if (a == null || a.getStatus() != AdviceStatus.EXECUTED) continue;
                 if (!"BUY".equalsIgnoreCase(a.getTransaction_type())) continue;
@@ -660,7 +656,6 @@ public class EngineService {
                 int steps = Math.abs(k - atmStrike) / 50;
                 boolean atmShiftTrigger = steps >= RESTRIKE_TRIGGER_ATM_SHIFT;
 
-                // fire if any trigger is true
                 if (atmShiftTrigger || dirFlipTrigger || atrBandTrigger) {
                     int qty = a.getQuantity() <= 0 ? 0 : a.getQuantity();
 
@@ -687,7 +682,6 @@ public class EngineService {
                 }
             }
 
-            // immediately enter new legs after exits (atomic roll)
             if (triggered > 0) {
                 try {
                     int made = strategyService.generateAdvicesNow();
@@ -697,7 +691,6 @@ public class EngineService {
                 }
             }
 
-            // remember current signals
             lastDirScoreForRestrike = currDir;
             lastAtrBandForRestrike = currBand;
 
@@ -705,7 +698,6 @@ public class EngineService {
             log.info("restrikeManagerTick(): {}", t);
         }
     }
-
 
     private Integer parseStrikeFromSymbol(String sym) {
         if (sym == null) return null;
@@ -754,15 +746,12 @@ public class EngineService {
         try {
             GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(underlyingKey, "minutes", "5");
             List<List<Object>> cs = (ic == null) ? null : ic.getData().getCandles();
-            if (cs == null || cs.size() < 21) return null; // need >= 21 to have 20 TRs
+            if (cs == null || cs.size() < 21) return null;
 
-            // ATR over last 20 bars (simple average TR)
             int len = cs.size();
             int lookback = 20;
             double sumTR = 0.0;
 
-            // Assuming each candle is [timestamp, open, high, low, close, volume, ...]
-            // Indices for high, low, close in the candle list
             final int HIGH_IDX = 2;
             final int LOW_IDX = 3;
             final int CLOSE_IDX = 4;
@@ -770,7 +759,6 @@ public class EngineService {
             for (int i = len - lookback; i < len; i++) {
                 List<Object> cur = cs.get(i);
                 List<Object> prev = cs.get(i - 1);
-
                 double high = ((Number) cur.get(HIGH_IDX)).doubleValue();
                 double low = ((Number) cur.get(LOW_IDX)).doubleValue();
                 double close = ((Number) cur.get(CLOSE_IDX)).doubleValue();
@@ -786,7 +774,7 @@ public class EngineService {
             double last = ((Number) cs.get(len - 1).get(CLOSE_IDX)).doubleValue();
             if (last <= 0.0) return null;
             float pct = (float) ((atr / last) * 100.0);
-            return round2(pct);
+            return Math.round(pct * 100f) / 100f;
         } catch (Exception t) {
             return null;
         }
@@ -811,4 +799,21 @@ public class EngineService {
         return v == null ? null : v.floatValue();
     }
 
+    private boolean isCircuitLikeTripped(RiskSnapshot rs) {
+        if (rs == null) return false;
+
+        // 1) Out of budget or fully exhausted daily loss
+        if (rs.getRiskBudgetLeft() <= 0.0) return true;
+        if (rs.getDailyLossPct() >= 100.0) return true;
+
+        // 2) Lots guardrail breached
+        Integer used = rs.getLotsUsed();
+        Integer cap = rs.getLotsCap();
+        if (used != null && cap != null && cap > 0 && used >= cap) return true;
+
+        // 3) Order rate limiter blown
+        if (rs.getOrdersPerMinPct() >= 100.0) return true;
+
+        return false;
+    }
 }

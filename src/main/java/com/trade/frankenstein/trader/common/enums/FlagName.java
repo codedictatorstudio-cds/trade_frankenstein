@@ -1,0 +1,58 @@
+package com.trade.frankenstein.trader.common.enums;
+
+public enum FlagName {
+
+    // --- Safety / Guardrails ---
+    KILL_SWITCH_OPEN_NEW,
+    CIRCUIT_BREAKER_LOCKOUT,
+    DAILY_LOSS_GUARD,
+    MAX_ORDERS_PER_MIN_GUARD,
+    SL_COOLDOWN_ENABLED,
+    DISABLE_REENTRY_AFTER_2_SL,
+
+    // --- Time Windows ---
+    OPENING_5M_BLACKOUT,
+    NOON_PAUSE_WINDOW,
+    LATE_ENTRY_CUTOFF,
+
+    // --- Strategy Modes ---
+    BREAKOUT_MODE_ENABLED,
+    MEAN_REVERT_MODE_ENABLED,
+    ATM_STRADDLE_QUIET,
+    STRANGLE_PM_PLUS1,
+
+    // --- Signals & Filters ---
+    TREND_FILTER_EMA_ADX,
+    MOMENTUM_CONFIRMATION,
+    PCR_TILT,
+    PCR_SMOOTHING_ENABLED,
+    OI_FILTER_ENABLED,
+    IV_SKEW_FILTER_ENABLED,
+    EVENT_AVOIDANCE_ENABLED,
+
+    // --- Day Bias / Rules ---
+    WEEKLY_EXPIRY_BIAS,
+    EXPIRY_DAY_SCALP_ONLY,
+
+    // --- Sizing / Structure ---
+    OTM_WINGS_AUTO_WIDTH,
+    RESTRIKE_ENABLED,
+
+    // --- Hedging ---
+    AUTO_HEDGE_ON_VOL_SPIKE,
+    DELTA_TARGET_HEDGE,
+
+    // --- Execution / Broker ---
+    PAPER_TRADING_MODE,
+    USE_MARKET_ON_ENTRY,
+    PLACE_BO_WITH_SLTP,
+    CANCEL_REPLACE_ON_SLIPPAGE,
+    AVOID_PARTIAL_FILLS,
+    AGGRESSIVE_RETRY_ENABLED,
+    UPSTOX_RATE_LIMITER_ENABLED,
+
+    // --- Data / Ops ---
+    OPTION_CHAIN_CACHE_ENABLED,
+    SESSION_AUTO_REFRESH,
+    SSE_MINIMIZED
+}

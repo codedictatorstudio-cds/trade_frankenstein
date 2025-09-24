@@ -22,8 +22,7 @@
         <vaadin.version>24.8.3</vaadin.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <loki4j.version>1.5.2</loki4j.version>
-        <logstash.encoder.version>7.4</logstash.encoder.version>
+        <togglz.version>4.4.0</togglz.version>
     </properties>
 
     <!-- Keep only Vaadin BOM; Spring Boot parent already manages Spring deps -->
@@ -201,6 +200,19 @@
             <artifactId>mockito-junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <dependency>
+            <groupId>org.togglz</groupId>
+            <artifactId>togglz-spring-boot-starter</artifactId>
+            <version>${togglz.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.togglz</groupId>
+            <artifactId>togglz-console-spring-boot-starter</artifactId>
+            <version>${togglz.version}</version>
+        </dependency>
+
     </dependencies>
 
     <build>

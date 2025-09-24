@@ -1,7 +1,10 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
+import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
+import com.trade.frankenstein.trader.common.enums.FlagName;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.upstox.api.GetMarketQuoteOHLCResponseV3;
@@ -31,7 +34,8 @@ public class RiskService {
 
     private final UpstoxService upstox;
     private final StreamGateway stream;
-    private final FastStateStore fast; // Redis/in-mem per config
+    private final FastStateStore fast;
+    private final FlagsService flags;
 
     // --- Circuit config (can be externalized later) ---
     private float dailyDdCapPct = 3.0f;   // percent-of-equity cap (optional)
@@ -52,6 +56,10 @@ public class RiskService {
     // =====================================================================
     @Transactional(readOnly = true)
     public Result<Void> checkOrder(PlaceOrderRequest req) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
 
         // 0) Daily circuit
@@ -59,19 +67,37 @@ public class RiskService {
             return Result.fail("CIRCUIT_TRIPPED", "Daily risk circuit is active");
         }
 
-        // 1) Basic symbol blacklist — match by instrument token (no reflection)
+        // 1) Basic symbol blacklist — match by instrument token
         String instrumentKey = req.getInstrumentToken();
         if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains)) {
             return Result.fail("SYMBOL_BLOCKED", "Blocked instrument: " + instrumentKey);
         }
 
-        // 2) Throttle: orders/minute (Redis-backed with local fallback)
-        double ordPct = getOrdersPerMinutePct();
-        if (ordPct >= 100.0) {
-            return Result.fail("THROTTLED", "Orders per minute throttle reached");
+        // 2) Throttle: orders/minute — apply only if flag enabled
+        if (flags.isOn(FlagName.MAX_ORDERS_PER_MIN_GUARD)) {
+            double ordPct = getOrdersPerMinutePct(); // 0..100
+            if (ordPct >= 100.0) {
+                return Result.fail("THROTTLED", "Orders per minute throttle reached");
+            }
         }
 
-        // 3) Market hygiene: live 1m bar roughness as a slippage proxy
+        // 3) SL cool-down — apply only if flag enabled
+        if (flags.isOn(FlagName.SL_COOLDOWN_ENABLED) && instrumentKey != null) {
+            int mins = getMinutesSinceLastSl(instrumentKey);
+            if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES) {
+                return Result.fail("SL_COOLDOWN", "Wait " + (BotConsts.Risk.SL_COOLDOWN_MINUTES - mins) + "m after last SL");
+            }
+        }
+
+        // 4) Disable re-entry after 2 SL — apply only if flag enabled
+        if (flags.isOn(FlagName.DISABLE_REENTRY_AFTER_2_SL) && instrumentKey != null) {
+            int rsToday = getRestrikesToday(instrumentKey);
+            if (rsToday >= 2) {
+                return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
+            }
+        }
+
+        // 5) Market hygiene: live 1m bar roughness as slippage proxy
         try {
             if (instrumentKey != null && !instrumentKey.isEmpty()) {
                 double roughnessPct = readLiveBarRoughnessPct(instrumentKey); // ((H-L)/mid)*100
@@ -87,24 +113,31 @@ public class RiskService {
             log.warn("checkOrder: slippage read failed (allowing order): {}", t.toString());
         }
 
-        // 4) Daily loss cap (realized only, unless you add unrealized in UpstoxService later)
-        try {
-            double lossNow = currentLossRupees(); // positive if losing
-            double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
-            if (lossNow >= cap - 1e-6) {
-                return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
+        // 6) Daily loss guard — apply only if flag enabled
+        if (flags.isOn(FlagName.DAILY_LOSS_GUARD)) {
+            try {
+                double lossNow = currentLossRupees(); // positive if losing
+                double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
+                if (cap > 0.0 && lossNow >= cap - 1e-6) {
+                    return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
+                }
+            } catch (Exception t) {
+                log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
             }
-        } catch (Exception t) {
-            log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
         }
 
         return Result.ok(null);
     }
 
+
     /**
      * Call AFTER a successful placeOrder to advance the rolling throttle.
      */
     public void noteOrderPlaced() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info("User not logged in");
+            return;
+        }
         Instant now = Instant.now();
         try {
             fast.incr("orders_per_min", Duration.ofSeconds(60));
@@ -119,16 +152,22 @@ public class RiskService {
         }
     }
 
+
     // =====================================================================
     // SUMMARIES & CIRCUIT
     // =====================================================================
     @Transactional(readOnly = true)
     public Result<RiskSnapshot> getSummary() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info("User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             RiskSnapshot snap = buildSnapshot();
             try {
                 stream.send("risk.summary", snap);
             } catch (Exception ignored) {
+                log.error("stream.send failed", ignored);
             }
             return Result.ok(snap);
         } catch (Exception t) {
@@ -137,22 +176,40 @@ public class RiskService {
         }
     }
 
+
     /**
      * Refresh today's realized PnL from broker and update loss (positive if losing).
      * (Unrealized can be added later if your UpstoxService exposes it — we intentionally
      * do NOT fake unrealized by reusing realized.)
      */
     public void refreshDailyLossFromBroker() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         try {
             float realized = toFloat(upstox.getRealizedPnlToday()); // +ve profit, -ve loss
             float lossAbs = realized < 0f ? -realized : 0f;
             updateDailyLossAbs(lossAbs);
+
+            // Auto-trip circuit if needed (drives KILL_SWITCH_OPEN_NEW)
+            if (isDailyCircuitTripped().orElse(false)) {
+                try {
+                    stream.send("risk.circuit", true);
+                } catch (Exception ignored) {
+                }
+            }
         } catch (Exception t) {
             log.warn("refreshDailyLossFromBroker failed: {}", t.toString());
         }
     }
 
+
     public Result<Boolean> getCircuitState() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         boolean tripped = isDailyCircuitTripped().orElse(false);
         try {
             stream.send("risk.circuit", tripped);
@@ -161,25 +218,6 @@ public class RiskService {
         return Result.ok(tripped);
     }
 
-    public Result<Void> tripCircuit(String reason) {
-        circuitTripped.set(true);
-        try {
-            stream.send("risk.circuit", true);
-        } catch (Exception ignored) {
-        }
-        if (reason != null && !reason.isEmpty()) log.warn("Risk circuit TRIPPED: {}", reason);
-        return Result.ok(null);
-    }
-
-    public Result<Void> resetCircuit() {
-        circuitTripped.set(false);
-        try {
-            stream.send("risk.circuit", false);
-        } catch (Exception ignored) {
-        }
-        log.info("Risk circuit RESET");
-        return Result.ok(null);
-    }
 
     // =====================================================================
     // SNAPSHOT
@@ -279,6 +317,10 @@ public class RiskService {
     }
 
     public Optional<Boolean> isDailyCircuitTripped() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Optional.of(false);
+        }
         try {
             // Reset on new trading day (IST)
             LocalDate todayIst = LocalDate.now(ZoneId.of("Asia/Kolkata"));
@@ -313,6 +355,7 @@ public class RiskService {
         }
     }
 
+
     private static float nzf(Float v) {
         return v == null ? 0f : v;
     }
@@ -321,17 +364,12 @@ public class RiskService {
      * Call from your PnL updater to keep losses current (pass a positive loss amount).
      */
     public void updateDailyLossAbs(float lossAbs) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
         if (lossAbs >= 0f) {
             dayLossAbs.set(lossAbs);
-        }
-    }
-
-    /**
-     * Optionally set/refresh the baseline at the start of trading day.
-     */
-    public void setDayStartEquity(float equity) {
-        if (equity > 0f) {
-            dayStartEquity.set(equity);
         }
     }
 
@@ -348,4 +386,80 @@ public class RiskService {
             return 0f;
         }
     }
+
+    public int getMinutesSinceLastSl(String instrumentKey) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return -1;
+        }
+        if (instrumentKey == null || instrumentKey.isEmpty()) return -1;
+        try {
+            Optional<String> v = fast.get("sl:last:" + instrumentKey);
+            if (!v.isPresent()) return -1;
+            long epochSec = Long.parseLong(v.get());
+            Instant ts = Instant.ofEpochSecond(epochSec);
+            long mins = Duration.between(ts, Instant.now()).toMinutes();
+            return (int) Math.max(mins, 0);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    public int getRestrikesToday(String instrumentKey) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return 0;
+        }
+        if (instrumentKey == null || instrumentKey.isEmpty()) return 0;
+        try {
+            LocalDate d = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+            String key = "sl:count:" + instrumentKey + ":" + d.toString();
+            Optional<String> v = fast.get(key);
+            return v.isPresent() ? Integer.parseInt(v.get()) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    public boolean hasHeadroom(double minBudgetPct) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return false;
+        }
+        try {
+            double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
+            double loss = currentLossRupees();
+            double budgetLeft = Math.max(0.0, cap - loss);
+            double budgetPctLeft = (cap > 0.0) ? (budgetLeft * 100.0 / cap) : 100.0;
+
+            double ordPct = getOrdersPerMinutePct(); // 0..100
+            boolean throttleOk = !flags.isOn(FlagName.MAX_ORDERS_PER_MIN_GUARD) || ordPct < 100.0;
+
+            return budgetPctLeft >= Math.max(0.0, minBudgetPct) && throttleOk && !isDailyCircuitTripped().orElse(false);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public void recordStopLoss(String instrumentKey) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
+        if (instrumentKey == null || instrumentKey.isEmpty()) return;
+
+        try {
+            // Store last SL timestamp (secs) with a 24h TTL
+            fast.put("sl:last:" + instrumentKey, String.valueOf(Instant.now().getEpochSecond()), Duration.ofHours(24));
+        } catch (Exception ignored) { /* best-effort */ }
+
+        try {
+            // Increment today's re-strike count with TTL until midnight IST
+            LocalDate d = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+            String key = "sl:count:" + instrumentKey + ":" + d.toString();
+            // Approx: 16 hours TTL covers trading day; adjust if you have midnight computation
+            fast.incr(key, Duration.ofHours(16));
+        } catch (Exception ignored) { /* best-effort */ }
+    }
+
 }
