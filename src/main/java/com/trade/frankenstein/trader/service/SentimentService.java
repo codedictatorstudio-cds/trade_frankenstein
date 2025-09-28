@@ -25,35 +25,37 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 @Slf4j
 public class SentimentService {
 
-    @Autowired
-    private MarketDataService marketDataService;
-
-    @Autowired(required = false)
-    private NewsService newsService;
-
-    @Autowired
-    private MarketSentimentSnapshotRepo sentimentRepo;
-
-    @Autowired
-    private StreamGateway stream;
-
     // ------------------------------------------------------------------------
     // Tunables (safe defaults; can be wired from properties later)
     // ------------------------------------------------------------------------
-    private int windowMinutes = 60;       // rolling window for in-memory samples
-    private int halfLifeMinutes = 20;     // exponential decay half-life for weights
-    private int newsWindowMin = 10;       // minutes to look back for "burst" penalty
-    private int newsPenaltyPerItem = 3;   // points to subtract per news item (capped)
-    private int newsPenaltyCap = 15;      // max total news penalty
-
+    private final int windowMinutes = 60;       // rolling window for in-memory samples
+    private final int halfLifeMinutes = 20;     // exponential decay half-life for weights
+    private final int newsWindowMin = 10;       // minutes to look back for "burst" penalty
+    private final int newsPenaltyPerItem = 3;   // points to subtract per news item (capped)
+    private final int newsPenaltyCap = 15;      // max total news penalty
     /**
      * Rolling in-memory window of sentiment samples (raw scores already in 0..100).
      */
     private final Deque<SentSample> sentimentSamples = new ConcurrentLinkedDeque<>();
+    @Autowired
+    private MarketDataService marketDataService;
+    @Autowired(required = false)
+    private NewsService newsService;
+    @Autowired
+    private MarketSentimentSnapshotRepo sentimentRepo;
+    @Autowired
+    private StreamGateway stream;
 
     // =========================================================================
     // Public API
     // =========================================================================
+
+    private static BigDecimal clip(BigDecimal v, BigDecimal lo, BigDecimal hi) {
+        if (v == null) return null;
+        if (v.compareTo(lo) < 0) return lo;
+        if (v.compareTo(hi) > 0) return hi;
+        return v;
+    }
 
     /**
      * Primary read used by DecisionService.
@@ -100,6 +102,10 @@ public class SentimentService {
         }
     }
 
+    // =========================================================================
+    // Internal computation & scheduled aggregator
+    // =========================================================================
+
     /**
      * External feeder: push a new sentiment observation into the rolling window.
      * Expected value domain is 0..100 (50 = neutral).
@@ -110,10 +116,6 @@ public class SentimentService {
         sentimentSamples.addLast(new SentSample(Instant.now(), clipped));
         trimWindow();
     }
-
-    // =========================================================================
-    // Internal computation & scheduled aggregator
-    // =========================================================================
 
     /**
      * Compute the instantaneous sentiment score (0..100) from price momentum and news bursts,
@@ -163,6 +165,10 @@ public class SentimentService {
         }
     }
 
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
     /**
      * Every ~30s–60s, synthesize a new snapshot from price/news; persist & broadcast.
      */
@@ -195,10 +201,6 @@ public class SentimentService {
             log.error("refresh() failed: {}", t);
         }
     }
-
-    // =========================================================================
-    // Helpers
-    // =========================================================================
 
     private void trimWindow() {
         final Instant now = Instant.now();
@@ -248,20 +250,6 @@ public class SentimentService {
         return BigDecimal.valueOf(vSum / wSum);
     }
 
-    private static BigDecimal clip(BigDecimal v, BigDecimal lo, BigDecimal hi) {
-        if (v == null) return null;
-        if (v.compareTo(lo) < 0) return lo;
-        if (v.compareTo(hi) > 0) return hi;
-        return v;
-    }
-
-    private static class SentSample {
-        final Instant ts;
-        final BigDecimal score;
-
-        SentSample(Instant ts, BigDecimal score) {
-            this.ts = ts;
-            this.score = score;
-        }
+    private record SentSample(Instant ts, BigDecimal score) {
     }
 }

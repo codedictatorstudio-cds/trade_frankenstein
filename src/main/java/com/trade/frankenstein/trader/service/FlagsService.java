@@ -1,7 +1,10 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
-import com.trade.frankenstein.trader.common.enums.FlagName;
+import com.trade.frankenstein.trader.enums.FlagName;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -14,9 +17,12 @@ import java.util.Map;
  * - Uses BotConsts for thresholds/windows.
  * - Call evaluateAutoFlags(...) on every engine tick.
  * - Read via isOn(flag) inside Strategy/Risk/Orders/Decision code paths.
+ * Java 8 only, no reflection.
  */
 @Component
 public class FlagsService {
+
+    private static final Logger log = LoggerFactory.getLogger(FlagsService.class);
 
     private final EnumMap<FlagName, Boolean> state = new EnumMap<>(FlagName.class);
 
@@ -78,6 +84,15 @@ public class FlagsService {
      * Main policy: recompute dynamic flags each tick. Provide cheap scalars only.
      */
     public void evaluateAutoFlags(Inputs in) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return;
+        }
+        if (in == null) {
+            log.warn("evaluateAutoFlags called with null Inputs");
+            return;
+        }
+
         // --- Now/time windows ---
         final LocalTime nowT = in.now.toLocalTime();
         final LocalTime open = BotConsts.Market.OPEN;
@@ -169,6 +184,10 @@ public class FlagsService {
      * Returns current ON/OFF for a flag.
      */
     public boolean isOn(FlagName f) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return false;
+        }
         final Boolean v = state.get(f);
         return v != null && v;
     }
@@ -177,6 +196,10 @@ public class FlagsService {
      * Snapshot view for debugging/telemetry.
      */
     public Map<FlagName, Boolean> snapshot() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return new EnumMap<>(FlagName.class);
+        }
         return new EnumMap<>(state);
     }
 

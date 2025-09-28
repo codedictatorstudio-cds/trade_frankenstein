@@ -1,6 +1,11 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
+import com.trade.frankenstein.trader.enums.FlagName;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.lang.Nullable;
 import org.springframework.scheduling.TaskScheduler;
@@ -8,312 +13,442 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * SSE hub for UI-v2 topics.
+ * StreamGateway — SSE fan-out layer.
  * <p>
- * Features:
- * - send(topic, payload): broadcast to exact and wildcard subscribers.
- * - sendSticky(topic, payload): broadcast + remember last payload for replay.
- * - subscribe(timeoutMs, topics): topics can be exact (e.g. "risk.summary") or wildcard ("advice.*").
- * - Heartbeat: optional, if a TaskScheduler is available.
- * <p>
- * Notes:
- * - This is single-node. For multi-node, back with a pub/sub backplane (e.g., Redis).
- * - Java 8 compatible (no Duration APIs).
+ * Java 8, no reflection. Additive methods only.
+ * Now supports subscribing to multiple topics in a single call.
  */
-@Service
 @Slf4j
+@Service
 public class StreamGateway {
 
-    private static final long DEFAULT_TIMEOUT_MS = 30L * 60L * 1000L;  // 30 minutes
-    private static final long HEARTBEAT_MS = 20_000L;                  // 20 seconds
+    private static final long DEFAULT_EMITTER_TIMEOUT_MS = 0L; // never timeout; we manage it
+    private static final long HEARTBEAT_MS = 15000L;           // 15s
+
+    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<String, SseEmitter>();
+    private final Map<String, Set<String>> topicSubs = new ConcurrentHashMap<String, Set<String>>();
+    private final Set<String> csvEmitters = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private final AtomicBoolean heartbeatStarted = new AtomicBoolean(false);
+
+    // Step-10: Kafka consumer → SSE fan-out (advice, trade, risk)
+    private final AtomicBoolean kafkaStarted = new AtomicBoolean(false);
+    private ExecutorService kafkaExec;
+
 
     @Autowired(required = false)
-    @Nullable
-    private TaskScheduler taskScheduler;
+    private TaskScheduler taskScheduler; // optional; if missing, heartbeat won't start
 
-    private final AtomicBoolean heartbeatScheduled = new AtomicBoolean(false);
-
-    // ---- Registries ----
-    /**
-     * Emitter id → emitter
-     */
-    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
-    /**
-     * Emitter id → exact topics (e.g., "risk.summary")
-     */
-    private final Map<String, Set<String>> emitterExactTopics = new ConcurrentHashMap<>();
-    /**
-     * Emitter id → wildcard prefixes (store without the final '*', e.g., "advice.")
-     */
-    private final Map<String, Set<String>> emitterPrefixes = new ConcurrentHashMap<>();
-    /**
-     * Exact topic → emitter ids subscribed to it (fast exact routing)
-     */
-    private final Map<String, Set<String>> topicToEmitters = new ConcurrentHashMap<>();
-    /**
-     * Optional in-memory "last event" cache for replay (topic → payload)
-     */
-    private final Map<String, Object> stickyByTopic = new ConcurrentHashMap<>();
-
-    // ========================= Public API =========================
+    // ------------------------ SUBSCRIBE ------------------------
 
     /**
-     * Broadcast a payload to all subscribers of the given topic.
+     * NEW: Subscribe with multiple topics.
+     * If topics is null/empty, the emitter is created but not subscribed to any topic yet.
      */
-    public <T> void send(String topic, T payload) {
-        if (!StringUtils.hasText(topic)) return;
+    public @Nullable SseEmitter subscribe(@Nullable String id, @Nullable List<String> topics) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return null;
+        }
+        final String emitterId = (StringUtils.hasText(id) ? id : UUID.randomUUID().toString());
+        final SseEmitter emitter = new SseEmitter(DEFAULT_EMITTER_TIMEOUT_MS);
 
-        final Set<String> targets = collectTargets(topic);
-        if (targets.isEmpty()) {
-            log.trace("SSE send: no subscribers for topic={}", topic);
-            return;
+        final SseEmitter previous = emitters.put(emitterId, emitter);
+        if (previous != null) {
+            try {
+                previous.complete();
+            } catch (Throwable ignore) { /* no-op */ }
         }
 
-        int sent = fanOut(topic, payload, targets);
-        if (sent > 0) {
-            log.info("SSE send: topic={} -> delivered to {} subscriber(s)", topic, sent);
-        }
-    }
-
-    /**
-     * Broadcast + remember the payload for replay to new subscribers.
-     */
-    public <T> void sendSticky(String topic, T payload) {
-        if (!StringUtils.hasText(topic)) return;
-        stickyByTopic.put(topic, payload);
-        send(topic, payload);
-    }
-
-    /**
-     * Create and register a new SSE emitter with given topic subscriptions.
-     *
-     * @param timeoutMs     null or <= 0 uses default (30m)
-     * @param subscriptions topics like "risk.summary" and/or "advice.*"
-     */
-    public SseEmitter subscribe(@Nullable Long timeoutMs, Collection<String> subscriptions) {
-        final long to = (timeoutMs == null || timeoutMs <= 0) ? DEFAULT_TIMEOUT_MS : timeoutMs;
-        final SseEmitter emitter = new SseEmitter(to);
-        final String id = UUID.randomUUID().toString();
-
-        emitters.put(id, emitter);
-
-        // Parse subscriptions into exact topics vs wildcard prefixes
-        final Set<String> exact = new LinkedHashSet<>();
-        final Set<String> prefixes = new LinkedHashSet<>();
-        if (subscriptions != null) {
-            for (String s : subscriptions) {
-                if (!StringUtils.hasText(s)) continue;
-                s = s.trim();
-                if (s.endsWith(".*")) {
-                    // keep trailing dot for prefix matching (e.g., "advice.")
-                    prefixes.add(s.substring(0, s.length() - 1));
-                } else {
-                    exact.add(s);
+        // Subscribe to provided topics (if any)
+        if (topics != null) {
+            for (String t : topics) {
+                if (StringUtils.hasText(t)) {
+                    addSubscription(emitterId, t.trim());
                 }
             }
         }
-        emitterExactTopics.put(id, exact);
-        emitterPrefixes.put(id, prefixes);
 
-        // Back-references for fast exact-topic routing
-        for (String t : exact) {
-            topicToEmitters.computeIfAbsent(t, k -> ConcurrentHashMap.newKeySet()).add(id);
-        }
+        emitter.onCompletion(new Runnable() {
+            @Override
+            public void run() {
+                removeEmitter(emitterId, "completion");
+            }
+        });
+        emitter.onTimeout(new Runnable() {
+            @Override
+            public void run() {
+                removeEmitter(emitterId, "timeout");
+            }
+        });
 
-        // Cleanup hooks
-        emitter.onCompletion(() -> removeEmitter(id, "completion"));
-        emitter.onTimeout(() -> removeEmitter(id, "timeout"));
-        emitter.onError(e -> removeEmitter(id, "error: " + (e == null ? "unknown" : e.getClass().getSimpleName())));
-
-        // Initial hello
         try {
-            emitter.send(SseEmitter.event().name("init").data("ok"));
-        } catch (IOException ex) {
-            log.debug("SSE init failed for emitter={}, removing. Reason: {}", id, ex);
-            removeEmitter(id, "init-failed");
-            return emitter;
+            emitter.send(SseEmitter.event().name("connected").data(emitterId));
+        } catch (IOException | IllegalStateException ex) {
+            log.warn("SSE send(connect) failed for id={}, removing. cause={}", emitterId, ex.toString());
+            removeEmitter(emitterId, "io-on-connect");
         }
 
-        // Optional replay of sticky events for immediate UI hydration
-        int replayCount = replaySticky(id, exact, prefixes);
-
-        log.info("SSE subscribed: id={}, exact={}, prefixes={}, replayed={} nowTotal={}",
-                id, exact, prefixes, replayCount, emitters.size());
-
-        // Start heartbeat loop (if scheduler exists)
         startHeartbeatIfNeeded();
-
         return emitter;
     }
 
     /**
-     * Convenience: subscribe via comma-separated topic list.
+     * BACKWARD-COMPAT: Single-topic variant kept to avoid breaking callers.
+     * Delegates to the multi-topic overload.
      */
-    public SseEmitter subscribeCsv(@Nullable Long timeoutMs, @Nullable String csvTopics) {
-        final List<String> subs = new ArrayList<>();
-        if (StringUtils.hasText(csvTopics)) {
-            final String[] parts = csvTopics.split(",");
-            for (int i = 0; i < parts.length; i++) {
-                final String s = parts[i] == null ? null : parts[i].trim();
-                if (StringUtils.hasText(s)) subs.add(s);
+    public @Nullable SseEmitter subscribe(@Nullable String id, @Nullable String topic) {
+        List<String> topics = null;
+        if (StringUtils.hasText(topic)) {
+            topics = java.util.Collections.singletonList(topic);
+        }
+        return subscribe(id, topics);
+    }
+
+    /**
+     * NEW: CSV variant with multiple topics.
+     */
+    public @Nullable SseEmitter subscribeCsv(@Nullable String id, @Nullable List<String> topics) {
+        final SseEmitter emitter = subscribe(id, topics);
+        if (emitter == null) return null;
+
+        final String emitterId = findIdByEmitter(emitter);
+        if (emitterId != null) {
+            csvEmitters.add(emitterId);
+        }
+        return emitter;
+    }
+
+    /**
+     * BACKWARD-COMPAT: CSV single-topic variant.
+     */
+    public @Nullable SseEmitter subscribeCsv(@Nullable String id, @Nullable String topic) {
+        List<String> topics = null;
+        if (StringUtils.hasText(topic)) {
+            topics = java.util.Collections.singletonList(topic);
+        }
+        return subscribeCsv(id, topics);
+    }
+
+
+    /**
+     * Generic local send for in-process producers (kept for backward-compat with existing services).
+     * Example topic: "advice.new" → eventName "advice".
+     */
+    public void send(String topic, Object payload) {
+        if (!org.springframework.util.StringUtils.hasText(topic)) return;
+        final String eventName;
+        final int dot = topic.indexOf('.');
+        if (dot > 0) {
+            eventName = topic.substring(0, dot);
+        } else {
+            eventName = topic;
+        }
+        publish(topic, eventName, payload);
+    }
+
+    // ------------------------ PUBLISH ------------------------
+
+    private String normalizeTopic(String base, String subTopic) {
+        if (!org.springframework.util.StringUtils.hasText(subTopic)) return base;
+        final String t = subTopic.trim();
+        if (t.startsWith(base + ".")) return t;
+        return base + "." + t;
+    }
+
+    public void publishDecision(String subTopic, Object payload) {
+        final String topic = normalizeTopic("decision", subTopic);
+        publish(topic, "decision", payload);
+    }
+
+    public void publishRisk(String subTopic, Object payload) {
+        final String topic = normalizeTopic("risk", subTopic);
+        publish(topic, "risk", payload);
+    }
+
+    public void publishAdvice(String subTopic, Object payload) {
+        final String topic = normalizeTopic("advice", subTopic);
+        publish(topic, "advice", payload);
+    }
+
+    public void publishOrder(String subTopic, Object payload) {
+        final String topic = normalizeTopic("order", subTopic);
+        publish(topic, "order", payload);
+    }
+
+
+    public void publishTrade(String subTopic, Object payload) {
+        final String topic = normalizeTopic("trade", subTopic);
+        publish(topic, "trade", payload);
+    }
+
+    public void publishFlagsSnapshot(Map<FlagName, Boolean> flags) {
+        publish("flags", "flags.updated", flags);
+    }
+
+    public void publish(String topic, String eventName, Object payload) {
+        if (!StringUtils.hasText(topic)) {
+            log.debug("publish ignored: blank topic");
+            return;
+        }
+        final Set<String> ids = topicSubs.get(topic);
+        if (ids == null || ids.isEmpty()) {
+            return;
+        }
+        final List<String> toRemove = new ArrayList<String>();
+
+        for (String id : ids) {
+            final SseEmitter emitter = emitters.get(id);
+            if (emitter == null) {
+                toRemove.add(id);
+                continue;
+            }
+            try {
+                final boolean asCsv = csvEmitters.contains(id);
+                Object data = asCsv ? toCsv(payload) : payload;
+                emitter.send(SseEmitter.event().name(eventName).data(data));
+            } catch (IOException | IllegalStateException ex) {
+                log.warn("SSE send failed for id={} topic={} event={}, removing. cause={}", id, topic, eventName, ex.toString());
+                toRemove.add(id);
             }
         }
-        return subscribe(timeoutMs, subs);
+        for (String deadId : toRemove) {
+            removeEmitter(deadId, "send-failed:" + topic);
+        }
     }
+
+
+    // ------------------------ KAFKA CONSUMER (Step-10) ------------------------
 
     /**
-     * Diagnostics/testing helper.
+     * On startup, create a lightweight KafkaConsumer that subscribes to advice.*, trade.*, risk.*
+     * and fans-out each consumed record to SSE subscribers.
      */
-    public int subscriberCount() {
-        return emitters.size();
-    }
-
-    /**
-     * Clears the sticky cache (useful for tests or reboots).
-     */
-    public void clearSticky() {
-        stickyByTopic.clear();
-        log.info("SSE sticky cache cleared");
-    }
-
-    // ========================= Internals =========================
-
-    private Set<String> collectTargets(String topic) {
-        final Set<String> targets = new LinkedHashSet<>();
-
-        // Exact matches
-        final Set<String> exact = topicToEmitters.get(topic);
-        if (exact != null && !exact.isEmpty()) targets.addAll(exact);
-
-        // Prefix (wildcard) matches
-        for (Map.Entry<String, Set<String>> e : emitterPrefixes.entrySet()) {
-            final String emitterId = e.getKey();
-            final Set<String> prefixes = e.getValue();
-            if (prefixes == null || prefixes.isEmpty()) continue;
-            for (String p : prefixes) {
-                if (topic.startsWith(p)) {
-                    targets.add(emitterId);
-                    break;
+    @PostConstruct
+    public void startKafkaFanout() {
+        if (kafkaStarted.compareAndSet(false, true)) {
+            kafkaExec = Executors.newSingleThreadExecutor();
+            kafkaExec.submit(new Runnable() {
+                @Override
+                public void run() {
+                    runKafkaLoop();
                 }
-            }
+            });
         }
-        return targets;
     }
 
-    private <T> int fanOut(String topic, T payload, Set<String> targets) {
-        int delivered = 0;
-        for (String id : targets) {
-            final SseEmitter em = emitters.get(id);
-            if (em == null) continue;
-            try {
-                em.send(SseEmitter.event().name(topic).data(payload));
-                delivered++;
-            } catch (IOException | IllegalStateException ex) {
-                log.warn("SSE send failed; pruning emitter id={}, topic={}, reason={}", id, topic, ex.toString());
-                removeEmitter(id, "send-failed");
-            }
-        }
-        return delivered;
-    }
-
-    private int replaySticky(String emitterId, Set<String> exact, Set<String> prefixes) {
-        int replayed = 0;
-        if (stickyByTopic.isEmpty()) return 0;
-
-        // Exact topics first
-        for (String t : exact) {
-            final Object payload = stickyByTopic.get(t);
-            if (payload == null) continue;
-            final SseEmitter em = emitters.get(emitterId);
-            if (em == null) break;
-            try {
-                em.send(SseEmitter.event().name(t).data(payload));
-                replayed++;
-            } catch (IOException | IllegalStateException ex) {
-                log.debug("replaySticky : SSE replay failed; pruning emitter id={}, topic={}, reason={}", emitterId, t, ex.toString());
-                removeEmitter(emitterId, "replay-failed");
-                return replayed;
-            }
-        }
-
-        // Wildcard topics (prefixes)
-        if (!prefixes.isEmpty()) {
-            final SseEmitter em = emitters.get(emitterId);
-            if (em != null) {
-                for (Map.Entry<String, Object> entry : stickyByTopic.entrySet()) {
-                    final String topic = entry.getKey();
-                    if (topic == null) continue;
-                    if (matchesAnyPrefix(topic, prefixes)) {
-                        try {
-                            em.send(SseEmitter.event().name(topic).data(entry.getValue()));
-                            replayed++;
-                        } catch (IOException | IllegalStateException ex) {
-                            log.debug("SSE replay failed; pruning emitter id={}, topic={}, reason={}", emitterId, topic, ex.toString());
-                            removeEmitter(emitterId, "replay-failed");
-                            return replayed;
-                        }
+    private void runKafkaLoop() {
+        java.util.Properties p = new java.util.Properties();
+        try {
+            // Load defaults from classpath (same file as EventPublisher)
+            java.io.InputStream in = StreamGateway.class.getResourceAsStream("/event-bus.properties");
+            if (in != null) {
+                try {
+                    p.load(in);
+                } finally {
+                    try {
+                        in.close();
+                    } catch (Exception ignore) {
                     }
                 }
             }
-        }
-        return replayed;
-    }
+        } catch (Exception ignore) { /* no-op */ }
 
-    private boolean matchesAnyPrefix(String topic, Set<String> prefixes) {
-        for (String p : prefixes) {
-            if (topic.startsWith(p)) return true;
+        // Minimal sane defaults
+        if (!p.containsKey("bootstrap.servers")) {
+            String brokers = System.getenv("KAFKA_BROKERS");
+            if (brokers != null && brokers.trim().length() > 0) p.put("bootstrap.servers", brokers);
         }
-        return false;
-    }
+        p.put("group.id", p.getProperty("group.id", "stream-gateway"));
+        p.put("enable.auto.commit", p.getProperty("enable.auto.commit", "true"));
+        p.put("auto.offset.reset", p.getProperty("auto.offset.reset", "latest"));
+        p.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        p.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
 
-    private void removeEmitter(String id, String reason) {
-        final SseEmitter em = emitters.remove(id);
-        if (em != null) {
+        KafkaConsumer<String, String> consumer = null;
+        try {
+            consumer = new KafkaConsumer<String, String>(p);
+
+            // Prefer regex subscription if available
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(advice|trade|risk|decision)\\..+?$");
             try {
-                em.complete();
-            } catch (Throwable ignored) {
+                consumer.subscribe(pattern);
+            } catch (Throwable t) {
+                // Fallback to static topic list
+                java.util.List<String> topics = new java.util.ArrayList<String>();
+                topics.add("advice");
+                topics.add("trade");
+                topics.add("risk");
+                topics.add("decision");
+                consumer.subscribe(topics);
             }
-        }
 
-        final Set<String> exact = emitterExactTopics.remove(id);
-        if (exact != null) {
-            for (String t : exact) {
-                final Set<String> ids = topicToEmitters.get(t);
-                if (ids != null) {
-                    ids.remove(id);
-                    if (ids.isEmpty()) topicToEmitters.remove(t);
+            while (!Thread.currentThread().isInterrupted()) {
+                ConsumerRecords<String, String> records = consumer.poll(1000);
+                if (records == null) continue;
+                for (ConsumerRecord<String, String> r : records) {
+                    try {
+                        onKafkaMessage(r.topic(), r.key(), r.value());
+                    } catch (Throwable t) {
+                        // swallow to keep loop alive
+                    }
                 }
             }
+        } catch (Throwable t) {
+            // If broken, log once and stop silently (SSE still works for in-process send(...))
+            try {
+                log.error("Kafka fan-out loop failed: {}", t.toString());
+            } catch (Throwable ignore) {
+            }
+        } finally {
+            try {
+                if (consumer != null) consumer.close();
+            } catch (Throwable ignore) {
+            }
         }
-        emitterPrefixes.remove(id);
+    }
 
-        log.info("SSE unsubscribed: id={}, reason={}, nowTotal={}", id, reason, emitters.size());
+    /**
+     * Map a Kafka topic into SSE topic+event and publish to subscribers.
+     */
+    private void onKafkaMessage(String topic, String key, String value) {
+        if (topic == null || value == null) return;
+        final String eventName;
+        final int dot = topic.indexOf('.');
+        if (dot > 0) {
+            eventName = topic.substring(0, dot);
+        } else {
+            eventName = topic;
+        }
+        publish(topic, eventName, value);
+    }
+// ------------------------ SUBSCRIPTIONS ------------------------
+
+    public void addSubscription(String emitterId, String topic) {
+        if (!StringUtils.hasText(topic) || !emitters.containsKey(emitterId)) return;
+        topicSubs.computeIfAbsent(topic, new java.util.function.Function<String, Set<String>>() {
+            @Override
+            public Set<String> apply(String k) {
+                return new CopyOnWriteArraySet<String>();
+            }
+        }).add(emitterId);
+    }
+
+    public void removeSubscription(String emitterId, String topic) {
+        if (!StringUtils.hasText(topic)) return;
+        final Set<String> set = topicSubs.get(topic);
+        if (set != null) {
+            set.remove(emitterId);
+            if (set.isEmpty()) {
+                topicSubs.remove(topic);
+            }
+        }
+    }
+
+    // ------------------------ UTILITIES ------------------------
+
+    public void removeEmitter(String id, String reason) {
+        final SseEmitter emitter = emitters.remove(id);
+        csvEmitters.remove(id);
+        for (Map.Entry<String, Set<String>> e : topicSubs.entrySet()) {
+            e.getValue().remove(id);
+        }
+        if (emitter != null) {
+            try {
+                emitter.complete();
+            } catch (Throwable ignore) { /* no-op */ }
+        }
+        log.debug("Emitter removed id={}, reason={}", id, reason);
+    }
+
+    private String findIdByEmitter(SseEmitter emitter) {
+        for (Map.Entry<String, SseEmitter> e : emitters.entrySet()) {
+            if (e.getValue() == emitter) return e.getKey();
+        }
+        return null;
     }
 
     private void startHeartbeatIfNeeded() {
-        if (taskScheduler == null) return;
-        if (heartbeatScheduled.compareAndSet(false, true)) {
-            taskScheduler.scheduleAtFixedRate(() -> {
-                if (emitters.isEmpty()) return;
-                final List<String> toRemove = new ArrayList<>();
-                for (Map.Entry<String, SseEmitter> e : emitters.entrySet()) {
-                    try {
-                        e.getValue().send(SseEmitter.event().name("heartbeat").data("♥"));
-                    } catch (IOException | IllegalStateException ex) {
-                        toRemove.add(e.getKey());
+        if (taskScheduler == null) {
+            if (heartbeatStarted.compareAndSet(false, false)) {
+                log.info("No TaskScheduler bean found; SSE heartbeat disabled.");
+            }
+            return;
+        }
+        if (heartbeatStarted.compareAndSet(false, true)) {
+            taskScheduler.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    final List<String> toRemove = new ArrayList<String>();
+                    for (Map.Entry<String, SseEmitter> e : emitters.entrySet()) {
+                        try {
+                            e.getValue().send(SseEmitter.event().name("heartbeat").data("♥"));
+                        } catch (IOException | IllegalStateException ex) {
+                            toRemove.add(e.getKey());
+                        }
                     }
-                }
-                for (String s : toRemove) {
-                    removeEmitter(s, "heartbeat-failed");
+                    for (String id : toRemove) {
+                        removeEmitter(id, "heartbeat-failed");
+                    }
                 }
             }, HEARTBEAT_MS);
             log.info("SSE heartbeat scheduled every {} ms", HEARTBEAT_MS);
         }
     }
+
+    private String toCsv(Object payload) {
+        if (payload == null) return "";
+        if (payload instanceof CharSequence) return payload.toString();
+        if (payload instanceof Number || payload instanceof Boolean) return String.valueOf(payload);
+        if (payload instanceof Map map) {
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (Object k : map.keySet()) {
+                if (!first) sb.append(',');
+                Object v = map.get(k);
+                sb.append(escapeCsv(String.valueOf(k))).append(',').append(escapeCsv(String.valueOf(v)));
+                first = false;
+            }
+            return sb.toString();
+        }
+        if (payload instanceof java.lang.Iterable) {
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (Object v : (Iterable) payload) {
+                if (!first) sb.append(',');
+                sb.append(escapeCsv(String.valueOf(v)));
+                first = false;
+            }
+            return sb.toString();
+        }
+        return escapeCsv(String.valueOf(payload));
+    }
+
+    private String escapeCsv(String s) {
+        if (s == null) return "";
+        boolean needsQuotes = s.indexOf(',') >= 0 || s.indexOf('"') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0;
+        if (!needsQuotes) return s;
+        return '"' + s.replace("\"", "\"\"") + '"';
+    }
+
+    @PreDestroy
+    public void stopKafkaFanout() {
+        try {
+            if (kafkaExec != null) {
+                kafkaExec.shutdownNow();
+            }
+        } catch (Throwable ignore) {
+        }
+    }
+
 }

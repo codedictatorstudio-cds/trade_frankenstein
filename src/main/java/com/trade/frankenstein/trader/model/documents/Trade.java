@@ -30,9 +30,9 @@ public class Trade {
     private OrderSide side;          // BUY/SELL
     private Integer quantity;
 
-    private double entryPrice;
-    private double currentPrice;
-    private double pnl;
+    private Double entryPrice;
+    private Double currentPrice;
+    private Double pnl;
 
     private TradeStatus status;      // OPEN/CLOSED/PARTIAL/CANCELLED
 

@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.test.service;
 
 import com.trade.frankenstein.trader.common.Result;
-import com.trade.frankenstein.trader.core.FastStateStore;
+import com.trade.frankenstein.trader.service.FlagsService;
 import com.trade.frankenstein.trader.service.RiskService;
 import com.trade.frankenstein.trader.service.StreamGateway;
 import com.trade.frankenstein.trader.service.UpstoxService;
@@ -21,11 +21,12 @@ class RiskServiceThrottleTest {
         UpstoxService upstox = mock(UpstoxService.class);
         StreamGateway stream = mock(StreamGateway.class);
         FastStateStore fast = mock(FastStateStore.class);
+        FlagsService flags = mock(FlagsService.class);
 
         // Simulate Redis counter already >= cap (by returning a big number string)
         when(fast.get("orders_per_min")).thenReturn(Optional.of("9999"));
 
-        RiskService risk = new RiskService(upstox, stream, fast);
+        RiskService risk = new RiskService(upstox, stream, fast, flags);
         PlaceOrderRequest draft = new PlaceOrderRequest();
         draft.setInstrumentToken("token");
 

@@ -31,10 +31,11 @@ public class StreamController {
     private final StreamGateway stream;
 
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@RequestParam(name = "timeoutMs", required = false) Long timeoutMs,
+    public SseEmitter stream(@RequestParam(name = "timeoutMs", required = false) String timeoutMs,
                              @RequestParam(name = "topics", required = false) String topics) {
 
         if (!StringUtils.hasText(topics) || "*".equals(topics.trim())) {
+
             return stream.subscribe(timeoutMs, DEFAULT_TOPICS);
         }
         return stream.subscribeCsv(timeoutMs, topics);

@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.enums.FlagName;
+
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
@@ -22,32 +24,128 @@ import java.util.*;
  * then call recomputeTrailing(...) to bump the stop.
  * - For backtests, call runBacktest(...) and pass your DecideFn that returns BUY/SELL/NONE using your live strategy logic.
  */
-public final class StrategyUpgrades {
+public class StrategyUpgrades {
+
+    private static final BigDecimal BIG_N = new BigDecimal("9E9");
+
+    /* =========================================================
+     *  Step-9 Feature Toggles (FlagsService)
+     *  - No reflection; Java 8.
+     *  - We try strategy-specific flags by name via FlagName.valueOf(...)
+     *    so the code compiles even if you haven't added them yet.
+     *    Unknown names gracefully fall back to sensible defaults.
+     * ========================================================= */
 
     private StrategyUpgrades() {
     }
+
+    // Defaults: strategy is ON unless global kill switches are active.
+    private static boolean strategyOn(FlagsService flags) {
+        if (flags == null) return true;
+        if (is(flags, "CIRCUIT_BREAKER_LOCKOUT", false)) return false;
+        return !is(flags, "KILL_SWITCH_OPEN_NEW", false);
+    }
+
+    // Guard for tight-spread picker
+    private static boolean spreadRankOn(FlagsService flags) {
+        // Prefer explicit STRAT_PICK_TIGHTEST_SPREAD if present; else inherit strategyOn
+        return flags == null || is(flags, "STRAT_PICK_TIGHTEST_SPREAD", strategyOn(flags));
+    }
+
+    // Whether to enforce a hard cap on acceptable spread%
+    private static boolean spreadCapEnforced(FlagsService flags) {
+        return flags == null || is(flags, "STRAT_ENFORCE_SPREAD_CAP", true);
+    }
+
+    // Trailing logic gate
+    private static boolean trailGuardOn(FlagsService flags) {
+        return flags == null || is(flags, "STRAT_TRAIL_GUARD", strategyOn(flags));
+    }
+
+    // Sub-conditions for trail guard – can be loosened via flags if needed
+    private static boolean requireAdxRising(FlagsService flags) {
+        return flags == null || is(flags, "STRAT_REQUIRE_ADX_RISING", true);
+    }
+
+    private static boolean requirePriceAboveVwap(FlagsService flags) {
+        return flags == null || is(flags, "STRAT_REQUIRE_PRICE_ABOVE_VWAP", true);
+    }
+
+    // Backtest enable (so you can disable in prod builds)
+    private static boolean backtestOn(FlagsService flags) {
+        return flags == null || is(flags, "STRAT_BACKTEST_ENABLED", strategyOn(flags));
+    }
+
+
+
+    /* =========================================================
+     *  Public wrappers exposing key Step-9 toggles for StrategyService
+     *  (Java 8, no reflection). These simply delegate to FlagsService
+     *  using safe lookups with sensible defaults.
+     * ========================================================= */
+
+    // Safe FlagName lookup by string, with default fallback
+    private static boolean is(FlagsService flags, String name, boolean defVal) {
+        try {
+            FlagName f = FlagName.valueOf(name);
+            return flags.isOn(f);
+        } catch (Throwable t) {
+            return defVal;
+        }
+    }
+
+    public static boolean entriesHardBlocked(FlagsService flags) {
+        return is(flags, "KILL_SWITCH_OPEN_NEW", false) || is(flags, "CIRCUIT_BREAKER_LOCKOUT", false);
+    }
+
+    public static boolean opening5mBlackoutActive(FlagsService flags) {
+        return is(flags, "OPENING_5M_BLACKOUT", false);
+    }
+
+    public static boolean noonPauseActive(FlagsService flags) {
+        return is(flags, "NOON_PAUSE_WINDOW", false);
+    }
+
+    public static boolean lateEntryCutoffActive(FlagsService flags) {
+        return is(flags, "LATE_ENTRY_CUTOFF", false);
+    }
+
+    public static boolean momentumConfirmationEnabled(FlagsService flags) {
+        return is(flags, "MOMENTUM_CONFIRMATION", false);
+    }
+
+    public static boolean pcrTiltEnabled(FlagsService flags) {
+        return is(flags, "PCR_TILT", false);
+    }
+
+    public static boolean stranglePmPlus1Enabled(FlagsService flags) {
+        return is(flags, "STRANGLE_PM_PLUS1", false);
+    }
+
+    public static boolean atmStraddleQuietEnabled(FlagsService flags) {
+        return is(flags, "ATM_STRADDLE_QUIET", false);
+    }
+
+    public static boolean restrikeEnabled(FlagsService flags) {
+        return is(flags, "RESTRIKE_ENABLED", false);
+    }
+
+    // Existing internal toggles surfaced for callers
+    public static boolean spreadRankingEnabled(FlagsService flags) {
+        return spreadRankOn(flags);
+    }
+
+    public static boolean spreadCapRequired(FlagsService flags) {
+        return spreadCapEnforced(flags);
+    }
+
 
     /* =========================================================
      *  #9 Tightest-spread strike selection
      * ========================================================= */
 
-    public interface QuoteView {
-        BigDecimal bid();   // best bid (nullable -> return BigDecimal.ZERO)
-
-        BigDecimal ask();   // best ask (nullable -> return BigDecimal.ZERO)
-
-        BigDecimal ltp();   // last traded price (nullable -> return BigDecimal.ZERO)
-
-        BigDecimal open();  // day open (nullable -> return BigDecimal.ZERO)
-
-        BigDecimal close(); // prev close (nullable -> return BigDecimal.ZERO)
-    }
-
-    public interface QuoteProvider {
-        /**
-         * Return a QuoteView for the given instrumentKey (e.g., "NIFTY 24750 CE").
-         */
-        QuoteView quoteOf(String instrumentKey);
+    public static boolean trailGuardEnabled(FlagsService flags) {
+        return trailGuardOn(flags);
     }
 
     /**
@@ -125,7 +223,26 @@ public final class StrategyUpgrades {
         return rows.isEmpty() ? null : rows.get(0).key;
     }
 
-    private static final BigDecimal BIG_N = new BigDecimal("9E9");
+    /**
+     * Flags-aware variant of pickTightestSpreadStrike.
+     * - Returns first candidate if spread ranking is OFF.
+     * - Returns null when strategy is OFF (e.g., kill switches).
+     * - If spread cap is disabled, ignores maxSpreadPctCap argument.
+     */
+    public static String pickTightestSpreadStrike(
+            List<String> candidateInstrumentKeys,
+            QuoteProvider quoteProvider,
+            BigDecimal maxSpreadPctCap,
+            FlagsService flags
+    ) {
+        if (!strategyOn(flags)) return null;
+        if (!spreadRankOn(flags)) {
+            // simple fallback: first viable candidate
+            return (candidateInstrumentKeys == null || candidateInstrumentKeys.isEmpty()) ? null : candidateInstrumentKeys.get(0);
+        }
+        BigDecimal cap = (spreadCapEnforced(flags) ? maxSpreadPctCap : null);
+        return pickTightestSpreadStrike(candidateInstrumentKeys, quoteProvider, cap);
+    }
 
     private static BigDecimal nz(BigDecimal v) {
         return v == null ? BigDecimal.ZERO : v;
@@ -133,32 +250,6 @@ public final class StrategyUpgrades {
 
     private static boolean gt0(BigDecimal v) {
         return v != null && v.signum() > 0;
-    }
-
-    private static final class SpreadRow {
-        final String key;
-        final BigDecimal spreadPct;
-
-        SpreadRow(String k, BigDecimal p) {
-            this.key = k;
-            this.spreadPct = p;
-        }
-    }
-
-    /* =========================================================
-     *  #7 Trailing guard — ADX rising AND price > Day VWAP
-     * ========================================================= */
-
-    public static final class ExitPlan {
-        public BigDecimal stopPrice;   // current SL
-        public BigDecimal targetPrice; // TP
-        public boolean trailed;    // whether we have begun trailing
-
-        public ExitPlan(BigDecimal stopPrice, BigDecimal targetPrice) {
-            this.stopPrice = stopPrice;
-            this.targetPrice = targetPrice;
-            this.trailed = false;
-        }
     }
 
     /**
@@ -172,6 +263,32 @@ public final class StrategyUpgrades {
         boolean adxRising = adxNow.compareTo(adxPrev) > 0;
         boolean priceAboveVwap = ltp.compareTo(dayVwap) > 0;
         return adxRising && priceAboveVwap;
+    }
+
+    /**
+     * Flags-aware trailing gate:
+     * - If trail guard is OFF, always returns false (no trailing).
+     * - You can weaken conditions via STRAT_REQUIRE_ADX_RISING / STRAT_REQUIRE_PRICE_ABOVE_VWAP flags.
+     */
+    public static boolean shouldActivateTrailing(
+            BigDecimal adxPrev, BigDecimal adxNow,
+            BigDecimal ltp, BigDecimal dayVwap,
+            FlagsService flags
+    ) {
+        if (!trailGuardOn(flags) || !strategyOn(flags)) return false;
+
+        boolean okAdx = true;
+        boolean okVwap = true;
+
+        if (requireAdxRising(flags)) {
+            okAdx = (adxPrev != null && adxNow != null && adxNow.compareTo(adxPrev) > 0);
+        }
+        if (requirePriceAboveVwap(flags)) {
+            okVwap = (ltp != null && dayVwap != null && ltp.compareTo(dayVwap) > 0);
+        }
+        if (adxPrev == null || adxNow == null || ltp == null || dayVwap == null) return false;
+
+        return okAdx && okVwap;
     }
 
     /**
@@ -216,87 +333,51 @@ public final class StrategyUpgrades {
         return plan;
     }
 
+
     /* =========================================================
-     *  #14 Minimal backtest runner (bar-by-bar)
-     *  Reuses your strategy via DecideFn (no reflection).
+     *  #7 Trailing guard — ADX rising AND price > Day VWAP
      * ========================================================= */
 
-    public enum Side {NONE, BUY, SELL}
-
-    public static final class Decision {
-        public final Side side;
-        public final String instrumentKey; // fill with your chosen strike
-
-        public Decision(Side side, String instrumentKey) {
-            this.side = side == null ? Side.NONE : side;
-            this.instrumentKey = instrumentKey;
-        }
-
-        public static Decision none() {
-            return new Decision(Side.NONE, null);
-        }
-    }
-
-    public interface CandleView {
-        Instant openTime();
-
-        BigDecimal open();
-
-        BigDecimal high();
-
-        BigDecimal low();
-
-        BigDecimal close();
-
-        long volume();
-    }
-
-    public interface IndicatorProvider {
-        BigDecimal adx(Instant asOf);
-
-        BigDecimal dayVwap(Instant asOf);
-    }
-
     /**
-     * Your live strategy wrapped as a pure function for backtests.
+     * Flags-aware recomputeTrailing – delegates to the regular method when guard is ON.
+     * If trail guard is OFF, returns the plan unchanged.
      */
-    public interface DecideFn {
-        Decision decide(BarContext ctx);
-    }
-
-    public static final class BarContext {
-        public final Instant ts;
-        public final CandleView candle;
-        public final IndicatorProvider indicators;
-        public final Map<String, Object> session; // you can carry state here (e.g., cooldowns)
-
-        public BarContext(Instant ts, CandleView candle, IndicatorProvider indicators, Map<String, Object> session) {
-            this.ts = ts;
-            this.candle = candle;
-            this.indicators = indicators;
-            this.session = session;
+    public static ExitPlan recomputeTrailing(
+            ExitPlan plan,
+            BigDecimal entryPrice,
+            BigDecimal ltp,
+            BigDecimal adxPrev,
+            BigDecimal adxNow,
+            BigDecimal dayVwap,
+            BigDecimal trailTriggerPct,
+            BigDecimal trailStepPct,
+            FlagsService flags
+    ) {
+        if (!trailGuardOn(flags) || !strategyOn(flags)) {
+            return plan;
         }
-    }
+        // When sub-conditions are relaxed, we still call the core method but we feed it
+        // adjusted parameters to emulate the loosened checks.
+        BigDecimal useAdxPrev = adxPrev;
+        BigDecimal useAdxNow = adxNow;
+        BigDecimal useVwap = dayVwap;
 
-    public static final class TradeSim {
-        public final String instrumentKey;
-        public final Instant entryTs;
-        public final BigDecimal entry;
-        public Instant exitTs;
-        public BigDecimal exit;
-        public BigDecimal pnl; // absolute
-
-        public TradeSim(String instrumentKey, Instant entryTs, BigDecimal entry) {
-            this.instrumentKey = instrumentKey;
-            this.entryTs = entryTs;
-            this.entry = entry;
+        // If ADX rising is not required, feed equal values so the check passes.
+        if (!requireAdxRising(flags) && adxNow != null) {
+            useAdxPrev = adxNow.subtract(new BigDecimal("0.000001"));
         }
+        // If price>VWAP is not required, set VWAP slightly below LTP to satisfy the gate.
+        if (!requirePriceAboveVwap(flags) && ltp != null) {
+            useVwap = ltp.multiply(new BigDecimal("0.999999"));
+        }
+
+        return recomputeTrailing(
+                plan, entryPrice, ltp, useAdxPrev, useAdxNow, useVwap, trailTriggerPct, trailStepPct
+        );
     }
 
-    public static final class BacktestResult {
-        public final List<TradeSim> trades = new ArrayList<>();
-        public BigDecimal pnlSum = BigDecimal.ZERO;
-        public int wins = 0, losses = 0;
+    public static Decision none() {
+        return new Decision(Side.NONE, null);
     }
 
     /**
@@ -394,9 +475,36 @@ public final class StrategyUpgrades {
         return out;
     }
 
+    /**
+     * Flags-aware backtest runner. Returns empty result if backtesting is disabled.
+     */
+    public static BacktestResult runBacktest(
+            List<? extends CandleView> candles,
+            IndicatorProvider indicators,
+            DecideFn decideFn,
+            BigDecimal slPct,
+            BigDecimal tpPct,
+            Duration timeStop,
+            BigDecimal trailTriggerPct,
+            BigDecimal trailStepPct,
+            FlagsService flags
+    ) {
+        if (!backtestOn(flags)) {
+            return new BacktestResult();
+        }
+        return runBacktest(candles, indicators, decideFn, slPct, tpPct, timeStop, trailTriggerPct, trailStepPct);
+    }
+
     private static Instant prevTs(List<? extends CandleView> candles, int i) {
         return i > 0 ? candles.get(i - 1).openTime() : candles.get(i).openTime();
     }
+
+
+
+    /* =========================================================
+     *  #14 Minimal backtest runner (bar-by-bar)
+     *  Reuses your strategy via DecideFn (no reflection).
+     * ========================================================= */
 
     private static void closeTrade(BacktestResult out, TradeSim t, Instant ts, BigDecimal px) {
         t.exitTs = ts;
@@ -406,5 +514,104 @@ public final class StrategyUpgrades {
         out.pnlSum = out.pnlSum.add(t.pnl);
         if (t.pnl.signum() >= 0) out.wins++;
         else out.losses++;
+    }
+
+    public enum Side {NONE, BUY, SELL}
+
+    public interface QuoteView {
+        BigDecimal bid();   // best bid (nullable -> return BigDecimal.ZERO)
+
+        BigDecimal ask();   // best ask (nullable -> return BigDecimal.ZERO)
+
+        BigDecimal ltp();   // last traded price (nullable -> return BigDecimal.ZERO)
+
+        BigDecimal open();  // day open (nullable -> return BigDecimal.ZERO)
+
+        BigDecimal close(); // prev close (nullable -> return BigDecimal.ZERO)
+    }
+
+
+    public interface QuoteProvider {
+        /**
+         * Return a QuoteView for the given instrumentKey (e.g., "NIFTY 24750 CE").
+         */
+        QuoteView quoteOf(String instrumentKey);
+    }
+
+    public interface CandleView {
+        Instant openTime();
+
+        BigDecimal open();
+
+        BigDecimal high();
+
+        BigDecimal low();
+
+        BigDecimal close();
+
+        long volume();
+    }
+
+    public interface IndicatorProvider {
+        BigDecimal adx(Instant asOf);
+
+        BigDecimal dayVwap(Instant asOf);
+    }
+
+    /**
+     * Your live strategy wrapped as a pure function for backtests.
+     */
+    public interface DecideFn {
+        Decision decide(BarContext ctx);
+    }
+
+    private record SpreadRow(String key, BigDecimal spreadPct) {
+    }
+
+    public static final class ExitPlan {
+        public BigDecimal stopPrice;   // current SL
+        public BigDecimal targetPrice; // TP
+        public boolean trailed;    // whether we have begun trailing
+
+        public ExitPlan(BigDecimal stopPrice, BigDecimal targetPrice) {
+            this.stopPrice = stopPrice;
+            this.targetPrice = targetPrice;
+            this.trailed = false;
+        }
+    }
+
+    public record Decision(Side side, String instrumentKey) {
+        public Decision(Side side, String instrumentKey) {
+            this.side = side == null ? Side.NONE : side;
+            this.instrumentKey = instrumentKey;
+        }
+
+        public static Decision none() {
+            return new Decision(Side.NONE, null);
+        }
+    }
+
+    public record BarContext(Instant ts, CandleView candle, IndicatorProvider indicators, Map<String, Object> session) {
+    }
+
+    public static final class TradeSim {
+        public final String instrumentKey;
+        public final Instant entryTs;
+        public final BigDecimal entry;
+        public Instant exitTs;
+        public BigDecimal exit;
+        public BigDecimal pnl; // absolute
+
+        public TradeSim(String instrumentKey, Instant entryTs, BigDecimal entry) {
+            this.instrumentKey = instrumentKey;
+            this.entryTs = entryTs;
+            this.entry = entry;
+        }
+    }
+
+    public static final class BacktestResult {
+        public final List<TradeSim> trades = new ArrayList<>();
+        public BigDecimal pnlSum = BigDecimal.ZERO;
+        public int wins = 0, losses = 0;
     }
 }

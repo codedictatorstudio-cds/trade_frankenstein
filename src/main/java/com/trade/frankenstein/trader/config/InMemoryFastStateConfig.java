@@ -9,6 +9,7 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 @ConditionalOnProperty(name = "trade.redis.enabled", havingValue = "false", matchIfMissing = false)
 public class InMemoryFastStateConfig {
+
     @Bean
     public FastStateStore fastStateStore() {
         return new InMemoryFastStateStore("tf:");

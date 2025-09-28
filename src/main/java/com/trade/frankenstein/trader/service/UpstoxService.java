@@ -2,12 +2,17 @@ package com.trade.frankenstein.trader.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.constants.UpstoxConstants;
+import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.upstox.AuthenticationResponse;
 import com.trade.frankenstein.trader.repo.upstox.AuthenticationResponseRepo;
 import com.upstox.api.*;
 import com.upstox.marketdatafeeder.rpc.proto.MarketDataFeed;
-import jakarta.annotation.PostConstruct;
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import io.github.resilience4j.retry.annotation.Retry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.*;
@@ -18,11 +23,7 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
-import io.github.resilience4j.retry.annotation.Retry;
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
-import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
-import io.github.resilience4j.bulkhead.annotation.Bulkhead;
-
+import javax.annotation.PostConstruct;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.time.Instant;
@@ -38,36 +39,46 @@ import java.util.function.Supplier;
 @Slf4j
 public class UpstoxService {
 
-    @Autowired
-    private RestTemplate template;
-
-    @Autowired
-    private UpstoxSessionToken upstoxSessionToken;
-
-    @Autowired
-    private UpstoxTradeMode tradeMode;
-
-    @Autowired
-    private ObjectMapper mapper;
-
-    @Autowired
-    private AuthenticationResponseRepo authenticationResponseRepo;
-
-    private AuthenticationResponse authenticationResponse;
-
     private static final Set<String> WORKING_STATUSES = new HashSet<>(
             Arrays.asList("open", "queued", "validation pending", "trigger pending", "enquiry", "partially filled"));
-
     private static final int MAX_RETRIES = 5;
     private static final long BASE_BACKOFF_MS = 250, MAX_BACKOFF_MS = 4000;
+    private static final long CACHE_TTL_MS = 30000;
     private final ConcurrentMap<String, GetOptionContractResponse> optionContractCache = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Long> optionContractCacheExpiry = new ConcurrentHashMap<>();
-    private static final long CACHE_TTL_MS = 30000;
+    @Autowired
+    private RestTemplate template;
+    @Autowired
+    private UpstoxSessionToken upstoxSessionToken;
+    @Autowired
+    private UpstoxTradeMode tradeMode;
+    @Autowired
+    private ObjectMapper mapper;
+    @Autowired
+    private FlagsService flags;
+    @Autowired
+    private AuthenticationResponseRepo authenticationResponseRepo;
+    private AuthenticationResponse authenticationResponse;
 
     @PostConstruct
     public void init() {
         this.authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(AuthenticationResponse.builder().build());
     }
+
+    /**
+     * Flag gates (Step-9/Toggles): blocks "new openings" when kill switch or paper-mode is ON.
+     */
+    private void ensureOrderOpenAllowed(String action) {
+        if (flags != null) {
+            if (flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT) || flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)) {
+                throw new IllegalStateException("Order blocked by risk/circuit flag for action: " + action);
+            }
+            if (flags.isOn(FlagName.PAPER_TRADING_MODE)) {
+                throw new IllegalStateException("Paper mode ON — broker order call skipped for action: " + action);
+            }
+        }
+    }
+
 
     private void sleepQuietly(long ms) {
         try {
@@ -102,10 +113,14 @@ public class UpstoxService {
             return call.get();
         } catch (HttpClientErrorException e) {
             if (e.getStatusCode() == HttpStatus.UNAUTHORIZED) {
-                log.info("401 from Upstox — refreshing token and retrying once...");
-                upstoxSessionToken.generateAccessToken();
-                authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(authenticationResponse);
-                return call.get();
+                if (flags != null && flags.isOn(FlagName.SESSION_AUTO_REFRESH)) {
+                    log.info("401 from Upstox — refreshing token and retrying once (SESSION_AUTO_REFRESH=ON)...");
+                    upstoxSessionToken.generateAccessToken();
+                    authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(authenticationResponse);
+                    return call.get();
+                } else {
+                    log.warn("401 from Upstox — SESSION_AUTO_REFRESH is OFF, not retrying");
+                }
             }
             throw e;
         }
@@ -120,6 +135,12 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public PlaceOrderResponse placeOrder(PlaceOrderRequest request) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return null;
+        }
+
+        ensureOrderOpenAllowed("PlaceOrderResponse placeOrder");
         log.info("Checking and refreshing token if needed : placeOrder");
         checkAndRefreshToken();
 
@@ -152,6 +173,12 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public ModifyOrderResponse modifyOrder(ModifyOrderRequest request) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return null;
+        }
+
+        ensureOrderOpenAllowed("ModifyOrderResponse modifyOrder");
         log.info("Checking and refreshing token if needed : modifyOrder");
         checkAndRefreshToken();
 
@@ -184,6 +211,11 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public CancelOrderResponse cancelOrder(String orderId) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return null;
+        }
+
         log.info("Checking and refreshing token if needed : cancelOrder");
         checkAndRefreshToken();
 
@@ -404,6 +436,7 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public ModifyOrderResponse amendOrderPrice(String orderId, Float newPrice) {
+        ensureOrderOpenAllowed("ModifyOrderResponse amendOrderPrice");
         log.info("Amending order price: orderId={}, newPrice={}", orderId, newPrice);
         checkAndRefreshToken();
 
@@ -438,6 +471,7 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public PlaceOrderResponse placeTargetOrder(String instrumentKey, int qty, Float targetPrice) {
+        ensureOrderOpenAllowed("PlaceOrderResponse placeTargetOrder");
         log.info("Placing target LIMIT order: {}, qty={}, price={}", instrumentKey, qty, targetPrice);
         checkAndRefreshToken();
 
@@ -463,6 +497,7 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public PlaceOrderResponse placeStopLossOrder(String instrumentKey, int qty, Float triggerPrice) {
+        ensureOrderOpenAllowed("PlaceOrderResponse placeStopLossOrder");
         log.info("Placing protective SL order: {}, qty={}, trigger={}", instrumentKey, qty, triggerPrice);
         checkAndRefreshToken();
 
@@ -1034,6 +1069,7 @@ public class UpstoxService {
                 .build().toUri();
 
         int attempt = 0;
+        boolean rateLimiterEnabled = (flags != null && flags.isOn(FlagName.UPSTOX_RATE_LIMITER_ENABLED));
         while (true) {
             try {
                 ResponseEntity<JsonNode> resp = callWith401Refresh(() ->
@@ -1046,6 +1082,7 @@ public class UpstoxService {
                 }
                 return body;
             } catch (HttpClientErrorException.TooManyRequests e) {
+                if (!rateLimiterEnabled) throw e;
                 attempt++;
                 if (attempt > MAX_RETRIES) throw e;
                 String ra = e.getResponseHeaders() != null ? e.getResponseHeaders().getFirst("Retry-After") : null;
@@ -1062,6 +1099,7 @@ public class UpstoxService {
                 }
                 sleepQuietly(waitMs);
             } catch (HttpServerErrorException | ResourceAccessException e) {
+                if (!rateLimiterEnabled) throw e;
                 attempt++;
                 if (attempt > MAX_RETRIES) throw e;
                 long backoff = Math.min(MAX_BACKOFF_MS, (long) (BASE_BACKOFF_MS * Math.pow(2, attempt - 1)));
@@ -1103,19 +1141,6 @@ public class UpstoxService {
         int year = now.getYear();
         int nextYear = year + 1;
         return String.valueOf(year).substring(2) + String.valueOf(nextYear).substring(2);
-    }
-
-    /**
-     * Best bid/ask snapshot for a single instrument.
-     */
-    public static class BestBidAsk {
-        public final double bid;
-        public final double ask;
-
-        public BestBidAsk(double bid, double ask) {
-            this.bid = bid;
-            this.ask = ask;
-        }
     }
 
     @Retry(name = "upstoxData")
@@ -1166,5 +1191,11 @@ public class UpstoxService {
     public Optional<BestBidAsk> getBestBidAskFallback(String instrumentKey, Throwable ex) {
         log.warn("getBestBidAsk fallback due to {}", ex.toString());
         return Optional.empty();
+    }
+
+    /**
+     * Best bid/ask snapshot for a single instrument.
+     */
+    public record BestBidAsk(double bid, double ask) {
     }
 }

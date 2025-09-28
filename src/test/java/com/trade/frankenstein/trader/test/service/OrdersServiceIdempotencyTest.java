@@ -1,7 +1,6 @@
 package com.trade.frankenstein.trader.test.service;
 
 import com.trade.frankenstein.trader.common.Result;
-import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.service.*;
 import com.upstox.api.PlaceOrderData;
 import com.upstox.api.PlaceOrderRequest;

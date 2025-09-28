@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.common.enums;
+package com.trade.frankenstein.trader.enums;
 
 public enum FlagName {
 
@@ -20,6 +20,8 @@ public enum FlagName {
     MEAN_REVERT_MODE_ENABLED,
     ATM_STRADDLE_QUIET,
     STRANGLE_PM_PLUS1,
+    STRAT_PICK_TIGHTEST_SPREAD,
+    STRAT_ENFORCE_SPREAD_CAP,
 
     // --- Signals & Filters ---
     TREND_FILTER_EMA_ADX,
@@ -54,5 +56,12 @@ public enum FlagName {
     // --- Data / Ops ---
     OPTION_CHAIN_CACHE_ENABLED,
     SESSION_AUTO_REFRESH,
-    SSE_MINIMIZED
+    SSE_MINIMIZED,
+
+    SSE_ENABLED,
+    SSE_TOPIC_DECISION,
+    SSE_TOPIC_RISK,
+    SSE_TOPIC_ADVICE,
+    SSE_TOPIC_TRADE,
+    SSE_TOPIC_MARKET
 }

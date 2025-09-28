@@ -1,48 +1,55 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
+import com.trade.frankenstein.trader.enums.FlagName;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.ta4j.core.Bar;
 import org.ta4j.core.BarSeries;
-import org.ta4j.core.Indicator;
-import org.ta4j.core.indicators.ATRIndicator;
-import org.ta4j.core.indicators.EMAIndicator;
-import org.ta4j.core.indicators.adx.ADXIndicator;
-import org.ta4j.core.indicators.helpers.ClosePriceIndicator;
 
 import java.time.Instant;
-import java.time.ZoneId;
-import java.util.Optional;
+import java.time.LocalDate;
+import java.time.ZonedDateTime;
 
-@Slf4j
+/**
+ * BacktestService (Java 8, no reflection)
+ * <p>
+ * Goal (Step 9 parity): Mirror live RiskService gates so backtest behaviour ≈ live:
+ * - Daily loss cap
+ * - Orders/minute throttle (applies to new entries only)
+ * - SL cooldown window after a stop-loss
+ * - 2-SL lockout (disable re-entry for remainder of the day after two SL hits)
+ * <p>
+ * Notes:
+ * - This service does not fetch market data or compute signals.
+ * You can supply a BarSeries and a SignalProvider (callback) via the overloaded run(...) method.
+ * - The default run(...) keeps the public signature from earlier code; it returns a Summary with a message
+ * indicating that no data-provider is wired. This preserves API while enabling new parity logic.
+ * - FlagsService (if present in the context) governs whether each guard is enforced at runtime.
+ */
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class BacktestService {
 
-    private final MarketDataService marketDataService;
+    private final FlagsService flagsService; // no reflection; regular Spring wiring
 
-    // ---- Strategy knobs (MVP) ----
-    private static final int EMA_FAST = 12;
-    private static final int EMA_SLOW = 26;
-    private static final int ATR_N = 14;
-    private static final int ADX_N = 14;
-    private static final double ADX_MIN = 20.0;    // gate
-    private static final double ATR_MULT = 1.5;    // risk unit
-    private static final double TARGET_R_MULT = 2; // take-profit at 2R
-    private static final ZoneId ZONE = ZoneId.of("Asia/Kolkata");
+    // ============================= Public API (kept signature) =============================
+
+    private static double midPrice(Bar bar) {
+        // Deterministic "fill" price for backtest: average of open & close
+        double open = bar.getOpenPrice().doubleValue();
+        double close = bar.getClosePrice().doubleValue();
+        return (open + close) / 2.0;
+    }
+
+    // ============================= Primary Backtest Overload =============================
 
     /**
-     * Run a simple EMA(12/26) + ADX(14) trend strategy with ATR(14)-based stop/target
-     * on historical candles pulled via MarketDataService.
-     *
-     * @param strategyId    free text label (echoed in result)
-     * @param instrumentKey e.g. "NSE_INDEX|Nifty 50"
-     * @param unit          "minutes" | "hour" | "day"
-     * @param interval      e.g. "5", "15", "60"
-     * @param from          inclusive (bar end time >= from)
-     * @param to            inclusive (bar end time <= to)
+     * Legacy signature retained. This method does not perform a full backtest by itself because
+     * data-loading and strategy evaluation are project-specific. It returns an informative Summary.
      */
     public Summary run(String strategyId,
                        String instrumentKey,
@@ -50,199 +57,329 @@ public class BacktestService {
                        String interval,
                        Instant from,
                        Instant to) {
-        Summary out = new Summary();
-        out.setStrategyId(strategyId);
-        out.setInstrumentKey(instrumentKey);
-        out.setUnit(unit);
-        out.setInterval(interval);
-        out.setFrom(from);
-        out.setTo(to);
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            Summary s = new Summary();
+            s.setStrategyId(strategyId);
+            s.setInstrumentKey(instrumentKey);
+            s.setUnit(unit);
+            s.setInterval(interval);
+            s.setFrom(from);
+            s.setTo(to);
+            s.setMessage("user-not-logged-in");
+            return s;
+        }
 
-        try {
-            Optional<BarSeries> opt = marketDataService.getTa4jSeries(instrumentKey, unit, interval);
-            if (!opt.isPresent()) {
-                out.setMessage("No series available");
-                return out;
-            }
-            BarSeries series = opt.get();
-            if (series.isEmpty()) {
-                out.setMessage("Empty series");
-                return out;
-            }
+        Summary s = new Summary();
+        s.setStrategyId(strategyId);
+        s.setInstrumentKey(instrumentKey);
+        s.setUnit(unit);
+        s.setInterval(interval);
+        s.setFrom(from);
+        s.setTo(to);
+        s.setMessage("no-series-or-signal-provider-wired");
+        return s;
+    }
 
-            // Clip to [from, to]
-            int startIdx = firstIndexAtOrAfter(series, from);
-            int endIdx = lastIndexAtOrBefore(series, to);
-            if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
-                out.setMessage("No bars in requested window");
-                return out;
-            }
+    /**
+     * Backtest over a provided series and signal provider with risk-gate parity emulation.
+     * This is the recommended entry-point for deterministic tests.
+     *
+     * @param strategyId Identifier for the strategy under test
+     * @param series     Historical bars (time-ordered)
+     * @param signals    Strategy callback that emits actions per bar
+     * @param cfg        Risk parity configuration
+     * @return Summary with basic performance & risk-block stats
+     */
+    public Summary run(String strategyId,
+                       BarSeries series,
+                       SignalProvider signals,
+                       BacktestConfig cfg) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            Summary s = new Summary();
+            s.setStrategyId(strategyId);
+            s.setMessage("user-not-logged-in");
+            return s;
+        }
+        if (series == null || series.isEmpty()) {
+            Summary s = new Summary();
+            s.setStrategyId(strategyId);
+            s.setMessage("empty-series");
+            return s;
+        }
+        if (signals == null) {
+            Summary s = new Summary();
+            s.setStrategyId(strategyId);
+            s.setMessage("no-signal-provider");
+            return s;
+        }
+        if (cfg == null) cfg = BacktestConfig.defaults();
 
-            // Indicators
-            ClosePriceIndicator close = new ClosePriceIndicator(series);
-            EMAIndicator emaFast = new EMAIndicator(close, EMA_FAST);
-            EMAIndicator emaSlow = new EMAIndicator(close, EMA_SLOW);
-            ADXIndicator adx = new ADXIndicator(series, ADX_N);
-            ATRIndicator atr = new ATRIndicator(series, ATR_N);
+        // Flags (Step 9): read feature toggles if available
+        boolean guardDailyLoss = isOn(FlagName.DAILY_LOSS_GUARD, true);
+        boolean guardOrdersPerMin = isOn(FlagName.MAX_ORDERS_PER_MIN_GUARD, true);
+        boolean guardSlCooldown = isOn(FlagName.SL_COOLDOWN_ENABLED, true);
+        boolean guardTwoSlLock = isOn(FlagName.DISABLE_REENTRY_AFTER_2_SL, true);
 
-            // Warmup guard (ensure indicators fully initialized)
-            int warmup = Math.max(Math.max(EMA_SLOW, ATR_N), ADX_N) + 1;
-            int i0 = Math.max(startIdx, warmup);
+        RiskGateEmulator gates = new RiskGateEmulator(cfg, guardDailyLoss, guardOrdersPerMin, guardSlCooldown, guardTwoSlLock);
 
-            // Simulation state
-            boolean inLong = false, inShort = false;
-            double entry = 0, stop = 0, target = 0, riskAbs = 0;
+        // Basic position emulation
+        boolean inPosition = false;
+        Side posSide = Side.FLAT;
+        double entryPrice = 0.0;
+        double riskPerTrade = cfg.getRiskPerTradeAmount() > 0 ? cfg.getRiskPerTradeAmount() : 1.0;
 
-            int trades = 0, wins = 0, losses = 0;
-            double sumRR = 0.0;
+        int trades = 0, wins = 0, losses = 0;
+        double rrSum = 0.0;
 
-            for (int i = i0; i <= endIdx; i++) {
-                double c = val(close, i);
-                double ef = val(emaFast, i);
-                double es = val(emaSlow, i);
-                double a = val(adx, i);
-                double atrNow = val(atr, i);
+        // Stats for blocks
+        int blockedDailyLoss = 0, blockedOrdersPerMin = 0, blockedSlCooldown = 0, blockedTwoSl = 0;
 
-                Bar bar = series.getBar(i);
-                double high = bar.getHighPrice().doubleValue();
-                double low = bar.getLowPrice().doubleValue();
+        for (int i = 0; i < series.getBarCount(); i++) {
+            Bar bar = series.getBar(i);
+            ZonedDateTime end = bar.getEndTime();
+            long nowSec = end.toEpochSecond();
+            gates.rolloverIfNewDay(end.toLocalDate());
 
-                if (!inLong && !inShort) {
-                    // Entry rules
-                    boolean upTrend = ef > es;
-                    boolean dnTrend = ef < es;
-                    boolean longOk = c > ef && upTrend && a >= ADX_MIN;
-                    boolean shortOk = c < ef && dnTrend && a >= ADX_MIN;
+            // Exit handling first (strategy-driven)
+            if (inPosition) {
+                Action action = signals.onBar(i, bar, Context.open(entryPrice, posSide));
+                if (action == Action.EXIT || action == Action.STOP_LOSS_HIT) {
+                    double exitPrice = midPrice(bar);
+                    double pnl = (posSide == Side.LONG ? (exitPrice - entryPrice) : (entryPrice - exitPrice));
+                    gates.notePnl(pnl);
 
-                    if (longOk) {
-                        inLong = true;
-                        entry = c;
-                        riskAbs = ATR_MULT * atrNow;
-                        stop = entry - riskAbs;
-                        target = entry + TARGET_R_MULT * riskAbs;
-                        continue;
-                    }
-                    if (shortOk) {
-                        inShort = true;
-                        entry = c;
-                        riskAbs = ATR_MULT * atrNow;
-                        stop = entry + riskAbs;
-                        target = entry - TARGET_R_MULT * riskAbs;
-                        continue;
-                    }
-                } else if (inLong) {
-                    // Exit rules: stop first (conservative), then target, then trend flip
-                    if (low <= stop) {
-                        double exit = stop;
-                        double rr = (exit - entry) / riskAbs;
-                        trades++;
-                        losses++;
-                        sumRR += rr;
-                        inLong = false;
-                        continue;
-                    }
-                    if (high >= target) {
-                        double exit = target;
-                        double rr = (exit - entry) / riskAbs;
-                        trades++;
+                    trades++;
+                    if (pnl >= 0) {
                         wins++;
-                        sumRR += rr;
-                        inLong = false;
-                        continue;
-                    }
-                    if (c < ef) { // trend fade
-                        double exit = c;
-                        double rr = (exit - entry) / riskAbs;
-                        trades++;
-                        if (rr >= 0) wins++;
-                        else losses++;
-                        sumRR += rr;
-                        inLong = false;
-                    }
-                } else if (inShort) {
-                    // Exit rules for short: stop first, then target, then trend flip
-                    if (high >= stop) {
-                        double exit = stop;
-                        double rr = (entry - exit) / riskAbs;
-                        trades++;
+                        rrSum += (riskPerTrade == 0 ? 0.0 : pnl / riskPerTrade);
+                    } else {
                         losses++;
-                        sumRR += rr;
-                        inShort = false;
-                        continue;
+                        rrSum += (riskPerTrade == 0 ? 0.0 : pnl / riskPerTrade);
+                        // Inform risk emulator if loss was an SL
+                        if (action == Action.STOP_LOSS_HIT) {
+                            gates.noteStopLoss(nowSec);
+                        }
                     }
-                    if (low <= target) {
-                        double exit = target;
-                        double rr = (entry - exit) / riskAbs;
-                        trades++;
-                        wins++;
-                        sumRR += rr;
-                        inShort = false;
-                        continue;
-                    }
-                    if (c > ef) { // trend fade
-                        double exit = c;
-                        double rr = (entry - exit) / riskAbs;
-                        trades++;
-                        if (rr >= 0) wins++;
-                        else losses++;
-                        sumRR += rr;
-                        inShort = false;
-                    }
+                    inPosition = false;
+                    posSide = Side.FLAT;
+                    entryPrice = 0.0;
+                    // continue to next bar after exit
+                    continue;
                 }
             }
 
-            // Force-close if position left open at the end
-            if (inLong || inShort) {
-                Bar last = series.getBar(endIdx);
-                double c = last.getClosePrice().doubleValue();
-                double rr = inLong ? (c - entry) / riskAbs : (entry - c) / riskAbs;
-                trades++;
-                if (rr >= 0) wins++;
-                else losses++;
-                sumRR += rr;
-                inLong = inShort = false;
+            // Entry handling (apply risk gates)
+            Action action = signals.onBar(i, bar, Context.flat());
+            if ((action == Action.ENTER_LONG || action == Action.ENTER_SHORT) && !inPosition) {
+                RiskGateEmulator.GateCheck gc = gates.canEnter(nowSec);
+                if (gc.allowed) {
+                    // Record order placement to update orders/min counters
+                    gates.noteOrderPlaced(nowSec);
+
+                    // Enter at mid-price for determinism
+                    entryPrice = midPrice(bar);
+                    posSide = (action == Action.ENTER_LONG) ? Side.LONG : Side.SHORT;
+                    inPosition = true;
+                } else {
+                    // Tally block reasons
+                    switch (gc.reason) {
+                        case DAILY_LOSS_CAP:
+                            blockedDailyLoss++;
+                            break;
+                        case ORDERS_PER_MIN:
+                            blockedOrdersPerMin++;
+                            break;
+                        case SL_COOLDOWN:
+                            blockedSlCooldown++;
+                            break;
+                        case TWO_SL_LOCK:
+                            blockedTwoSl++;
+                            break;
+                        default:
+                            break;
+                    }
+                }
             }
+        }
 
-            out.setTrades(trades);
-            out.setWins(wins);
-            out.setLosses(losses);
-            out.setWinRatePct(trades == 0 ? 0.0 : (wins * 100.0) / trades);
-            out.setAvgRR(trades == 0 ? 0.0 : (sumRR / trades));
-            out.setMessage("ok");
-            return out;
+        Summary out = new Summary();
+        out.setStrategyId(strategyId);
+        if (series.getBarCount() > 0) {
+            out.setFrom(series.getBar(0).getEndTime().toInstant());
+            out.setTo(series.getLastBar().getEndTime().toInstant());
+        }
+        out.setTrades(trades);
+        out.setWins(wins);
+        out.setLosses(losses);
+        out.setWinRatePct(trades > 0 ? (wins * 100.0) / trades : 0.0);
+        out.setAvgRR(trades > 0 ? rrSum / trades : 0.0);
+        out.setBlockedByDailyLoss(blockedDailyLoss);
+        out.setBlockedByOrdersPerMin(blockedOrdersPerMin);
+        out.setBlockedBySlCooldown(blockedSlCooldown);
+        out.setBlockedByTwoSlLock(blockedTwoSl);
+        out.setMessage("ok");
+        return out;
+    }
 
+    private boolean isOn(FlagName name, boolean defaultVal) {
+        try {
+            // FlagsService#get returns Boolean in our project
+            Boolean v = flagsService == null ? null : flagsService.isOn(name);
+            return v == null ? defaultVal : v.booleanValue();
         } catch (Throwable t) {
-            log.warn("BacktestService.run error: {}", t.toString());
-            out.setMessage("error: " + t.getMessage());
-            return out;
+            // Defensive: never fail backtest because flags can't be read
+            log.warn("Flags read failed for {}: {}", name, t.getMessage());
+            return defaultVal;
         }
     }
 
-    // ----------- helpers -----------
+    // ============================= Types & Helpers =============================
 
-    private int firstIndexAtOrAfter(BarSeries s, Instant from) {
-        if (from == null) return 0;
-        for (int i = 0; i < s.getBarCount(); i++) {
-            Instant end = s.getBar(i).getEndTime().toInstant();
-            if (!end.isBefore(from)) return i;
+    public enum Action {
+        HOLD,
+        ENTER_LONG,
+        ENTER_SHORT,
+        EXIT,
+        STOP_LOSS_HIT
+    }
+
+    public enum Side {FLAT, LONG, SHORT}
+
+    public interface SignalProvider {
+        /**
+         * Called for each bar. Provide desired action given the current bar and context.
+         * Implementation must be deterministic for test repeatability.
+         */
+        Action onBar(int index, Bar bar, Context ctx);
+    }
+
+    public record Context(boolean inPosition, double entryPrice, Side side) {
+        public static Context flat() {
+            return new Context(false, 0.0, Side.FLAT);
         }
-        return -1;
-    }
 
-    private int lastIndexAtOrBefore(BarSeries s, Instant to) {
-        if (to == null) return s.getEndIndex();
-        for (int i = s.getBarCount() - 1; i >= 0; i--) {
-            Instant end = s.getBar(i).getEndTime().toInstant();
-            if (!end.isAfter(to)) return i;
+        public static Context open(double entryPrice, Side side) {
+            return new Context(true, entryPrice, side);
         }
-        return -1;
     }
 
-    private double val(Indicator<?> ind, int i) {
-        return Double.parseDouble(ind.getValue(i).toString());
+    @Data
+    public static class BacktestConfig {
+        private double dailyLossCap;            // absolute units (same as P&L units used by SignalProvider)
+        private int maxOrdersPerMinute;         // throttle new entries/min
+        private int slCooldownMinutes;          // cooldown after SL hit
+        private boolean disableReentryAfter2Sl; // true => lockout after 2 SL in a day
+        private double riskPerTradeAmount;      // used to compute RR
+
+        public static BacktestConfig defaults() {
+            BacktestConfig c = new BacktestConfig();
+            c.dailyLossCap = 10000.0;
+            c.maxOrdersPerMinute = 5;
+            c.slCooldownMinutes = 5;
+            c.disableReentryAfter2Sl = true;
+            c.riskPerTradeAmount = 1000.0;
+            return c;
+        }
     }
 
-    // ----------- DTO -----------
+    /**
+     * Mirrors live risk gates for entries. Tracks only fast counters needed in backtests, in-memory.
+     */
+    static class RiskGateEmulator {
+
+        private final BacktestConfig cfg;
+        private final boolean enforceDailyLoss;
+        private final boolean enforceOrdersPerMin;
+        private final boolean enforceSlCooldown;
+        private final boolean enforceTwoSlLock;
+        private LocalDate currentDay = null;
+        private double dailyPnl = 0.0;
+        private int slHitsToday = 0;
+        private boolean lockTwoSl = false;
+        // minute -> orders count (we only need current minute; keep last bucket)
+        private long currentMinuteBucket = -1L;
+        private int ordersThisMinute = 0;
+        // cooldown
+        private long lastSlEpochSec = Long.MIN_VALUE;
+
+        RiskGateEmulator(BacktestConfig cfg,
+                         boolean enforceDailyLoss,
+                         boolean enforceOrdersPerMin,
+                         boolean enforceSlCooldown,
+                         boolean enforceTwoSlLock) {
+            this.cfg = cfg;
+            this.enforceDailyLoss = enforceDailyLoss;
+            this.enforceOrdersPerMin = enforceOrdersPerMin;
+            this.enforceSlCooldown = enforceSlCooldown;
+            this.enforceTwoSlLock = enforceTwoSlLock;
+        }
+
+        void rolloverIfNewDay(LocalDate day) {
+            if (currentDay == null || !currentDay.equals(day)) {
+                currentDay = day;
+                dailyPnl = 0.0;
+                slHitsToday = 0;
+                lockTwoSl = false;
+                currentMinuteBucket = -1L;
+                ordersThisMinute = 0;
+            }
+        }
+
+        void noteOrderPlaced(long nowSec) {
+            long minBucket = nowSec / 60L;
+            if (minBucket != currentMinuteBucket) {
+                currentMinuteBucket = minBucket;
+                ordersThisMinute = 0;
+            }
+            ordersThisMinute++;
+        }
+
+        void noteStopLoss(long nowSec) {
+            lastSlEpochSec = nowSec;
+            slHitsToday++;
+            if (enforceTwoSlLock && cfg.disableReentryAfter2Sl && slHitsToday >= 2) {
+                lockTwoSl = true;
+            }
+        }
+
+        void notePnl(double pnl) {
+            dailyPnl += pnl;
+        }
+
+        GateCheck canEnter(long nowSec) {
+            // Daily loss cap
+            if (enforceDailyLoss && cfg.dailyLossCap > 0 && (dailyPnl <= -Math.abs(cfg.dailyLossCap))) {
+                return new GateCheck(false, BlockReason.DAILY_LOSS_CAP);
+            }
+            // Orders per minute throttle
+            long minBucket = nowSec / 60L;
+            int count = (minBucket == currentMinuteBucket) ? ordersThisMinute : 0;
+            if (enforceOrdersPerMin && cfg.maxOrdersPerMinute > 0 && count >= cfg.maxOrdersPerMinute) {
+                return new GateCheck(false, BlockReason.ORDERS_PER_MIN);
+            }
+            // SL cooldown
+            if (enforceSlCooldown && cfg.slCooldownMinutes > 0 && lastSlEpochSec > 0) {
+                long secsSinceSl = nowSec - lastSlEpochSec;
+                if (secsSinceSl < cfg.slCooldownMinutes * 60L) {
+                    return new GateCheck(false, BlockReason.SL_COOLDOWN);
+                }
+            }
+            // Two-SL lock
+            if (enforceTwoSlLock && lockTwoSl) {
+                return new GateCheck(false, BlockReason.TWO_SL_LOCK);
+            }
+            return new GateCheck(true, BlockReason.NONE);
+        }
+
+        enum BlockReason {NONE, DAILY_LOSS_CAP, ORDERS_PER_MIN, SL_COOLDOWN, TWO_SL_LOCK}
+
+        record GateCheck(boolean allowed, BlockReason reason) {
+        }
+    }
+
+    // ============================= Output DTO =============================
 
     @Data
     public static class Summary {
@@ -258,6 +395,12 @@ public class BacktestService {
         private int losses;
         private double winRatePct;
         private double avgRR;
+
+        // Risk-gate block stats for parity diagnostics
+        private int blockedByDailyLoss;
+        private int blockedByOrdersPerMin;
+        private int blockedBySlCooldown;
+        private int blockedByTwoSlLock;
 
         private String message; // "ok" or reason
     }

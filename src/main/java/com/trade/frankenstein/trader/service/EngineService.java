@@ -1,11 +1,14 @@
 package com.trade.frankenstein.trader.service;
 
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventBusConfig;
+import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
-import com.trade.frankenstein.trader.common.enums.FlagName;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
+import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
@@ -19,11 +22,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.util.*;
+import java.time.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -35,6 +38,15 @@ import java.util.regex.Pattern;
 @Slf4j
 public class EngineService {
 
+    private static final Pattern EXIT_HINTS = Pattern.compile("EXIT:\\s*SL=([^,]+),\\s*TP=([^,]+),\\s*TTL=(\\d+)m", Pattern.CASE_INSENSITIVE);
+    // --- Re-strike knobs (safe defaults) ---
+    private static final int RESTRIKE_CHECK_MINUTES = 5;
+    private static final int RESTRIKE_TRIGGER_ATM_SHIFT = 1; // strike steps (50-pt)
+    private static final int RESTRIKE_MAX_PER_HOUR = 2;
+    private static final int DO_NOT_RESTRIKE_AFTER_HHMM = 1500; // 15:00 IST
+    private final Map<String, ExitPlan> exitPlans = new ConcurrentHashMap<>(); // key = instrument_key
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicLong ticks = new AtomicLong(0);
     @Autowired
     private StreamGateway stream;
     @Autowired
@@ -60,39 +72,26 @@ public class EngineService {
     @Autowired
     private OptionChainService optionChainService;
     @Autowired
+    private EventPublisher bus;
+    @Autowired
     private FlagsService flags;
-
-    private final Map<String, ExitPlan> exitPlans = new ConcurrentHashMap<>(); // key = instrument_key
-    private static final Pattern EXIT_HINTS = Pattern.compile("EXIT:\\s*SL=([^,]+),\\s*TP=([^,]+),\\s*TTL=(\\d+)m", Pattern.CASE_INSENSITIVE);
-
     private int maxExecPerTick = 3;
-
     private int scanLimit = 50;
-
     /**
      * Default underlying used by analysis services (keep in sync with others).
      */
     private String underlyingKey = Underlyings.NIFTY;
-
     /**
      * Analysis tick cadence (ms). Keep modest; services pull live data already.
      */
     private long analysisMs = 15000;
-
-    private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicLong ticks = new AtomicLong(0);
-
     private volatile Instant startedAt = null;
     private volatile Instant lastTickAt = null;
     private volatile long lastExecuted = 0;
     private volatile String lastError = null;
-
-    // --- Re-strike knobs (safe defaults) ---
-    private static final int RESTRIKE_CHECK_MINUTES = 5;
-    private static final int RESTRIKE_TRIGGER_ATM_SHIFT = 1; // strike steps (50-pt)
-    private static final int RESTRIKE_MAX_PER_HOUR = 2;
-    private static final int DO_NOT_RESTRIKE_AFTER_HHMM = 1500; // 15:00 IST
-
+    // audit state
+    private volatile boolean lastCircuitTripped = false;
+    private volatile Boolean lastEntriesBlocked = null;
     // Re-strike state
     private volatile Instant lastRestrikeCheckAt = Instant.EPOCH;
     private volatile int restrikeCountThisHour = 0;
@@ -100,10 +99,54 @@ public class EngineService {
 
     // Re-strike memory for change-detection
     private volatile Integer lastDirScoreForRestrike = null;
-
-    private enum AtrBand {QUIET, NORMAL, VOLATILE}
-
     private volatile AtrBand lastAtrBandForRestrike = null;
+
+    private static String safe(String s) {
+        if (s == null) return "—";
+        String t = s.trim();
+        return t.isEmpty() ? "—" : t;
+    }
+
+    private static int safeInt(String s, int dflt) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return dflt;
+        }
+    }
+
+    private static float round2(float v) {
+        return Math.round(v * 100f) / 100f;
+    }
+
+    private static int nzi(Integer v) {
+        return v == null ? 0 : v;
+    }
+
+    private static String nullSafe(String s) {
+        return (s == null || s.trim().isEmpty()) ? "—" : s.trim();
+    }
+
+    // ---------------- Helpers ----------------
+
+    private static void appendReason(StringBuilder sb, String part) {
+        if (sb.length() > 0) sb.append("; ");
+        sb.append(part);
+    }
+
+    private static int computeAtmStrikeInt(float spot, int step) {
+        if (step <= 0) step = 50;
+        int rounded = Math.round(spot);
+        int rem = rounded % step;
+        int down = rounded - rem;
+        int up = down + step;
+        // closest multiple; if tie, bias to down
+        return (rounded - down) <= (up - rounded) ? down : up;
+    }
+
+    private static Float toFloat(java.math.BigDecimal v) {
+        return v == null ? null : v.floatValue();
+    }
 
     // ---------------- Lifecycle ----------------
     public Result<String> startEngine() {
@@ -120,6 +163,7 @@ public class EngineService {
         log.info("Engine STARTED at {} (maxExecPerTick={}, scanLimit={})",
                 startedAt, maxExecPerTick, scanLimit);
         publishState();
+        auditLifecycleStarted();
         return Result.ok("engine:started");
     }
 
@@ -135,6 +179,7 @@ public class EngineService {
         running.set(false);
         log.info("Engine STOPPED");
         publishState();
+        auditLifecycleStopped();
         return Result.ok("engine:stopped");
     }
 
@@ -148,7 +193,6 @@ public class EngineService {
         );
         return Result.ok(state);
     }
-
 
     // ---------------- Tick Loop ----------------
     @Scheduled(fixedDelayString = "${trade.engine.tick-ms:2000}")
@@ -168,7 +212,7 @@ public class EngineService {
 
         // -------- Evaluate flags (auto policy) --------
         FlagsService.Inputs in = new FlagsService.Inputs();
-        in.now = java.time.LocalDateTime.now();
+        in.now = LocalDateTime.now(ZoneId.of("Asia/Kolkata"));
 
         RiskSnapshot rs = null;
         try {
@@ -179,10 +223,15 @@ public class EngineService {
 
         // Risk-derived inputs
         in.circuitTripped = isCircuitLikeTripped(rs);
-        in.dailyLossPct = (rs != null && rs.getDailyLossPct() <= 0) ? rs.getDailyLossPct() : 0.0;
-        if (rs != null && rs.getOrdersPerMinPct() <= 0) {
-            in.ordersPerMinLoad = Math.max(0.0, Math.min(1.0, rs.getOrdersPerMinPct() / 100.0));
+        in.dailyLossPct = (rs != null && rs.getDailyLossPct() != null) ? rs.getDailyLossPct() : 0.0;
+
+        if (rs != null && rs.getOrdersPerMinPct() != null) {
+            double load = rs.getOrdersPerMinPct() / 100.0;
+            if (load < 0.0) load = 0.0;
+            if (load > 1.0) load = 1.0;
+            in.ordersPerMinLoad = load;
         }
+
         // Headroom: budget left, lots cap, throttle, daily loss
         boolean headroom = true;
         if (rs != null) {
@@ -196,22 +245,82 @@ public class EngineService {
                     && in.dailyLossPct < BotConsts.Risk.MAX_DAILY_LOSS_PCT;
         }
         in.riskHeadroomOk = headroom;
+        try {
+            if (lastCircuitTripped != in.circuitTripped) {
+                auditCircuitChange(in.circuitTripped, rs);
+                lastCircuitTripped = in.circuitTripped;
+            }
+        } catch (Throwable ignore) {
+        }
+        // ---- Push EngineInputs to Strategy/Decision (SSE) ----
+        try {
+            EngineInputs engIn = new EngineInputs();
+            engIn.setRiskHeadroomOk(headroom);
+            engIn.setMinutesSinceLastSl(in.minutesSinceLastSl);
+            engIn.setRestrikesToday(in.restrikesToday);
+            Double opm = (rs != null && rs.getOrdersPerMinPct() != null) ? rs.getOrdersPerMinPct() : null;
+            engIn.setOrdersPerMinPct(opm);
+            try {
+                stream.publish("strategy.inputs", "strategy", engIn);
+            } catch (Exception ignore) {
+            }
+            try {
+                stream.publishDecision("decision.inputs", engIn);
+            } catch (Exception ignore) {
+            }
+        } catch (Exception ignore) {
+        }
+
 
         // Signals (safe fallbacks)
         in.trendOk = true;
         in.momentumConfirmed = true;
-        in.pcr = null; // can be wired from MarketDataService later
+
+        // PCR, ATR, VIX
+        in.pcr = null; // (optional) wire from OptionChainService if available
         in.atrPct = 0.0;
         Float atrPctNow = getCurrentAtrPctSafe();
         if (atrPctNow != null) in.atrPct = atrPctNow;
         in.vix = null; // optional
-        in.majorNewsSoon = false; // wire from NewsService if available
-        in.intradayRangePct = 0.0; // wire when available
-        in.atrJump5mPct = 0.0;     // wire when available
+
+        // News & regime
+        in.majorNewsSoon = false; // optional: NewsService.hasMarketMovingNewsSoon()
+        in.intradayRangePct = 0.0; // optional: compute from day's H/L
+        in.atrJump5mPct = 0.0;     // optional: short-term ATR jump
+        // Fill ATR jump and intraday range from MarketDataService (cheap, cached)
+        try {
+            java.util.Optional<Float> jumpOpt = marketDataService.getAtrJump5mPct(underlyingKey);
+            if (jumpOpt != null && jumpOpt.isPresent()) {
+                in.atrJump5mPct = jumpOpt.get().doubleValue();
+            }
+        } catch (Exception ignore) {
+        }
+        try {
+            java.util.Optional<Float> rangeOpt = marketDataService.getIntradayRangePct(underlyingKey, "minutes", "5");
+            if (rangeOpt != null && rangeOpt.isPresent()) {
+                in.intradayRangePct = rangeOpt.get().doubleValue();
+            }
+        } catch (Exception ignore) {
+        }
+
         in.regimeQuiet = (atrPctNow != null && atrPctNow <= BotConsts.Quiet.ATR_MAX_PCT);
-        in.minutesSinceLastSl = 999;  // can wire from TradesService later
-        in.restrikesToday = 0;        // can wire from TradesService later
-        in.paperTradingMode = false;  // wire from router if you have a paper mode
+
+        // SL/Restrikes
+        try {
+            int mins = riskService.getMinutesSinceLastSl(Underlyings.NIFTY);
+            in.minutesSinceLastSl = (mins >= 0 ? mins : 999);
+        } catch (Exception ignored) {
+            in.minutesSinceLastSl = 999;
+        }
+        try {
+            int rsToday = riskService.getRestrikesToday(Underlyings.NIFTY);
+            in.restrikesToday = Math.max(0, rsToday);
+        } catch (Exception ignored) {
+            in.restrikesToday = 0;
+        }
+
+        // Mode
+        in.paperTradingMode = flags.isOn(FlagName.PAPER_TRADING_MODE);
 
         try {
             flags.evaluateAutoFlags(in);
@@ -224,7 +333,19 @@ public class EngineService {
                         || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
                         || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
                         || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
-                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF);
+                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF)
+                        || !in.riskHeadroomOk;
+
+        try {
+            if (lastEntriesBlocked == null || lastEntriesBlocked.booleanValue() != blockNewEntries) {
+                JsonObject d = new JsonObject();
+                d.addProperty("blocked", blockNewEntries);
+                if (!headroom) d.addProperty("riskHeadroomOk", false);
+                audit(blockNewEntries ? "entries.blocked" : "entries.unblocked", d);
+                lastEntriesBlocked = Boolean.valueOf(blockNewEntries);
+            }
+        } catch (Throwable ignore) {
+        }
 
         // -------- Keep risk PnL in sync --------
         try {
@@ -234,7 +355,8 @@ public class EngineService {
         }
 
         // -------- Generate new advices (only if allowed) --------
-        if (!blockNewEntries) {
+        final boolean riskBlock = !headroom || in.circuitTripped;
+        if (!blockNewEntries && !riskBlock) {
             try {
                 int made = strategyService.generateAdvicesNow();
                 if (made > 0) log.info("tick(): strategy generated {} advice(s)", made);
@@ -336,8 +458,6 @@ public class EngineService {
         engineExitTick();
     }
 
-    // ---------------- Helpers ----------------
-
     private void publishState() {
         if (!AuthCodeHolder.getInstance().isLoggedIn()) {
             log.info(" User not logged in");
@@ -346,19 +466,14 @@ public class EngineService {
         try {
             EngineState state = getEngineState().get();
             log.info("engine.state -> running={}, ticks={}, lastExecuted={}, lastError={}",
-                    state.isRunning(), state.getTicks(), state.getLastExecuted(), safe(lastError));
-            stream.sendSticky("engine.state", state);
+                    state.running, state.ticks, state.lastExecuted, safe(lastError));
+            stream.publish("engine.state", "engine", state);
         } catch (Exception ex) {
             log.error("publishState(): failed to emit engine.state: {}", ex.getMessage(), ex);
         }
     }
 
-    private static String safe(String s) {
-        if (s == null) return "—";
-        String t = s.trim();
-        return t.isEmpty() ? "—" : t;
-    }
-
+    // Add these methods inside EngineService:
 
     private List<Advice> findPendingAdvices(int limit) {
         if (!AuthCodeHolder.getInstance().isLoggedIn()) {
@@ -411,15 +526,6 @@ public class EngineService {
         exitPlans.put(a.getInstrument_token(), new ExitPlan(a.getInstrument_token(), qty, sl, tp, ttl));
     }
 
-
-    private static int safeInt(String s, int dflt) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Exception e) {
-            return dflt;
-        }
-    }
-
     private void engineExitTick() {
         for (ExitPlan plan : exitPlans.values()) {
             try {
@@ -467,12 +573,6 @@ public class EngineService {
         }
     }
 
-    private static float round2(float v) {
-        return Math.round(v * 100f) / 100f;
-    }
-
-    // Add these methods inside EngineService:
-
     public void onAdviceCreated(Advice a) {
         if (!AuthCodeHolder.getInstance().isLoggedIn()) {
             log.info(" User not logged in");
@@ -508,64 +608,6 @@ public class EngineService {
             }
         } catch (Exception e) {
             log.error("onAdviceExecuted(): failed to place SL/TP: {}", e);
-        }
-    }
-
-    // ---------------- DTO ----------------
-    @Data
-    public static class EngineState {
-        private final boolean running;
-        private final Instant startedAt;
-        private final Instant lastTick;
-        private final long ticks;
-        private final long lastExecuted;
-        private final String lastError;
-        private final Instant asOf;
-    }
-
-    private static int nzi(Integer v) {
-        return v == null ? 0 : v;
-    }
-
-    private static String nullSafe(String s) {
-        return (s == null || s.trim().isEmpty()) ? "—" : s.trim();
-    }
-
-    // Lightweight POJO purely for SSE; not stored anywhere and not part of your API surface.
-    @Data
-    @AllArgsConstructor
-    public static class EngineHeartbeat {
-        public EngineHeartbeat() {
-        }
-
-        private Instant asOf;
-        private int sentimentScore;
-        private String sentimentLabel;
-        private int decisionScore;
-        private String trend;
-        private List<String> tags;
-        private List<String> reasons;
-    }
-
-    private static class ExitPlan {
-        final String instrumentKey;
-        final int qty;
-        final Float slInit;
-        final Float tpInit;
-        final Instant createdAt;
-        final Instant expiresAt;
-        Float slLive;
-        String slOrderId;
-        String tpOrderId;
-
-        ExitPlan(String instrumentKey, int qty, Float sl, Float tp, int ttlMin) {
-            this.instrumentKey = instrumentKey;
-            this.qty = qty;
-            this.slInit = sl;
-            this.tpInit = tp;
-            this.slLive = sl;
-            this.createdAt = Instant.now();
-            this.expiresAt = this.createdAt.plus(Duration.ofMinutes(Math.max(1, ttlMin)));
         }
     }
 
@@ -683,12 +725,18 @@ public class EngineService {
             }
 
             if (triggered > 0) {
-                try {
-                    int made = strategyService.generateAdvicesNow();
-                    log.info("restrike: exits={}, new-buys={}", triggered, made);
-                } catch (Exception ignored) {
-                    log.error(" restrikeManagerTick(): failed to generate new advices", ignored);
+                if (!blockNewEntries() && !riskBlock()) {
+
+                    try {
+                        int made = strategyService.generateAdvicesNow();
+                        log.info("restrike: exits={}, new-buys={}", triggered, made);
+                    } catch (Exception ignored) {
+                        log.error(" restrikeManagerTick(): failed to generate new advices", ignored);
+                    }
+                } else {
+                    log.info("restrike: skipped new-buys due to risk/flags");
                 }
+
             }
 
             lastDirScoreForRestrike = currDir;
@@ -698,6 +746,49 @@ public class EngineService {
             log.info("restrikeManagerTick(): {}", t);
         }
     }
+
+    /**
+     * Whether new entries should be blocked due to operational flags.
+     * Java 8 only, no reflection. Includes login guard.
+     */
+    public boolean blockNewEntries() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return true;
+        }
+        try {
+            return flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
+                    || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
+                    || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
+                    || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
+                    || flags.isOn(FlagName.LATE_ENTRY_CUTOFF);
+        } catch (Throwable t) {
+            log.warn("blockNewEntries(): failed to evaluate flags: {}", t.toString());
+            return true;
+        }
+    }
+
+    /**
+     * Whether risk headroom is exhausted and we must block new entries.
+     * Delegates to the same logic used inside the tick() loop.
+     * Java 8 only, no reflection. Includes login guard.
+     */
+    public boolean riskBlock() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return true;
+        }
+        try {
+            Result<RiskSnapshot> res = riskService.getSummary();
+            RiskSnapshot rs = (res != null && res.isOk()) ? res.get() : null;
+            return isCircuitLikeTripped(rs);
+        } catch (Throwable t) {
+            log.warn("riskBlock(): failed to read RiskSnapshot: {}", t.toString());
+            return true;
+        }
+    }
+
+    // ---------------- Public guards for other services/UI ----------------
 
     private Integer parseStrikeFromSymbol(String sym) {
         if (sym == null) return null;
@@ -780,23 +871,77 @@ public class EngineService {
         }
     }
 
-    private static void appendReason(StringBuilder sb, String part) {
-        if (sb.length() > 0) sb.append("; ");
-        sb.append(part);
+    // ---------------- Audit helpers (Step-10: emit to Kafka 'audit') ----------------
+    private void audit(String event, JsonObject data) {
+        try {
+            final JsonObject payload = new JsonObject();
+            payload.addProperty("ts", java.time.Instant.now().toEpochMilli());
+            payload.addProperty("source", "engine");
+            payload.addProperty("event", event);
+            if (data != null) payload.add("data", data);
+            if (bus != null) bus.publish(EventBusConfig.TOPIC_AUDIT, "engine", payload.toString());
+        } catch (Throwable ignored) { /* best-effort */ }
     }
 
-    private static int computeAtmStrikeInt(float spot, int step) {
-        if (step <= 0) step = 50;
-        int rounded = Math.round(spot);
-        int rem = rounded % step;
-        int down = rounded - rem;
-        int up = down + step;
-        // closest multiple; if tie, bias to down
-        return (rounded - down) <= (up - rounded) ? down : up;
+    private void auditLifecycleStarted() {
+        try {
+            final JsonObject d = new JsonObject();
+            if (startedAt != null) d.addProperty("startedAt", startedAt.toString());
+            d.addProperty("maxExecPerTick", maxExecPerTick);
+            d.addProperty("scanLimit", scanLimit);
+            if (underlyingKey != null) d.addProperty("underlying", underlyingKey);
+            audit("engine.started", d);
+        } catch (Throwable ignored) { /* no-op */ }
     }
 
-    private static Float toFloat(java.math.BigDecimal v) {
-        return v == null ? null : v.floatValue();
+    private void auditLifecycleStopped() {
+        try {
+            final JsonObject d = new JsonObject();
+            final java.time.Instant now = java.time.Instant.now();
+            d.addProperty("stoppedAt", now.toString());
+            if (startedAt != null) {
+                long up = java.time.Duration.between(startedAt, now).getSeconds();
+                if (up < 0) up = 0;
+                d.addProperty("uptimeSec", up);
+            }
+            d.addProperty("ticks", ticks.get());
+            d.addProperty("lastExecuted", lastExecuted);
+            audit("engine.stopped", d);
+        } catch (Throwable ignored) { /* no-op */ }
+    }
+
+    private void auditCircuitChange(boolean tripped, RiskSnapshot rs) {
+        try {
+            final JsonObject d = new JsonObject();
+            d.addProperty("circuit", tripped);
+            if (rs != null) {
+                if (rs.getRiskBudgetLeft() != null) d.addProperty("riskBudgetLeft", rs.getRiskBudgetLeft());
+                if (rs.getDailyLossPct() != null) d.addProperty("dailyLossPct", rs.getDailyLossPct());
+                if (rs.getOrdersPerMinPct() != null) d.addProperty("ordersPerMinPct", rs.getOrdersPerMinPct());
+                if (rs.getLotsUsed() != null) d.addProperty("lotsUsed", rs.getLotsUsed());
+                if (rs.getLotsCap() != null) d.addProperty("lotsCap", rs.getLotsCap());
+            }
+            // reason (best-effort)
+            String reason = null;
+            if (rs != null) {
+                if (rs.getRiskBudgetLeft() != null && rs.getRiskBudgetLeft() <= 0.0)
+                    reason = appendReason(reason, "budget_exhausted");
+                if (rs.getDailyLossPct() != null && rs.getDailyLossPct() >= 100.0)
+                    reason = appendReason(reason, "daily_loss_cap");
+                Integer used = rs.getLotsUsed(), cap = rs.getLotsCap();
+                if (used != null && cap != null && cap > 0 && used >= cap) reason = appendReason(reason, "lots_cap");
+                if (rs.getOrdersPerMinPct() != null && rs.getOrdersPerMinPct() >= 100.0)
+                    reason = appendReason(reason, "orders_per_min_cap");
+            }
+            if (reason != null) d.addProperty("reason", reason);
+            audit(tripped ? "circuit.open" : "circuit.closed", d);
+        } catch (Throwable ignored) { /* no-op */ }
+    }
+
+    private String appendReason(String base, String add) {
+        if (add == null || add.length() == 0) return base;
+        if (base == null || base.length() == 0) return add;
+        return base + "," + add;
     }
 
     private boolean isCircuitLikeTripped(RiskSnapshot rs) {
@@ -815,5 +960,73 @@ public class EngineService {
         if (rs.getOrdersPerMinPct() >= 100.0) return true;
 
         return false;
+    }
+
+    private enum AtrBand {QUIET, NORMAL, VOLATILE}
+
+    // DTO to surface engine→strategy/decision inputs each cycle
+    @Data
+    public static class EngineInputs {
+        private boolean riskHeadroomOk;
+        private int minutesSinceLastSl;
+        private int restrikesToday;
+        private Double ordersPerMinPct;
+    }
+
+    public static class EngineState {
+        private boolean running;
+        private Instant startedAt;
+        private Instant lastTick;
+        private long ticks;
+        private long lastExecuted;
+        private String lastError;
+        private Instant asOf;
+
+        public EngineState(boolean b, Instant startedAt, Instant lastTickAt, long l, long lastExecuted, String lastError, Instant now) {
+            this.running = b;
+            this.startedAt = startedAt;
+            this.lastTick = lastTickAt;
+            this.ticks = l;
+            this.lastExecuted = lastExecuted;
+            this.lastError = lastError;
+            this.asOf = now;
+        }
+    }
+
+    // Lightweight POJO purely for SSE; not stored anywhere and not part of your API surface.
+    @Data
+    @AllArgsConstructor
+    public static class EngineHeartbeat {
+        private Instant asOf;
+        private int sentimentScore;
+        private String sentimentLabel;
+        private int decisionScore;
+        private String trend;
+        private List<String> tags;
+        private List<String> reasons;
+        public EngineHeartbeat() {
+        }
+    }
+
+    private static class ExitPlan {
+        final String instrumentKey;
+        final int qty;
+        final Float slInit;
+        final Float tpInit;
+        final Instant createdAt;
+        final Instant expiresAt;
+        Float slLive;
+        String slOrderId;
+        String tpOrderId;
+
+        ExitPlan(String instrumentKey, int qty, Float sl, Float tp, int ttlMin) {
+            this.instrumentKey = instrumentKey;
+            this.qty = qty;
+            this.slInit = sl;
+            this.tpInit = tp;
+            this.slLive = sl;
+            this.createdAt = Instant.now();
+            this.expiresAt = this.createdAt.plus(Duration.ofMinutes(Math.max(1, ttlMin)));
+        }
     }
 }

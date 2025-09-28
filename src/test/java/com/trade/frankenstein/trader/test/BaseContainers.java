@@ -15,7 +15,7 @@ public abstract class BaseContainers {
 
     // MongoDB 6.x is stable and fine for Spring Data Mongo
     static final MongoDBContainer MONGO =
-            new MongoDBContainer(DockerImageName.parse("mongo:6.0"));
+            new MongoDBContainer(DockerImageName.parse("mongo:8.0"));
 
     // Redis 7-alpine is lightweight
     static final GenericContainer<?> REDIS =

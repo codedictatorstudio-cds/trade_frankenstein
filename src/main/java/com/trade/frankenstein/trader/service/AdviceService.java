@@ -1,8 +1,13 @@
 package com.trade.frankenstein.trader.service;
 
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventBusConfig;
+import com.trade.frankenstein.trader.bus.EventPublisher;
+import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
+import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
 import com.upstox.api.PlaceOrderRequest;
@@ -28,13 +33,27 @@ public class AdviceService {
     @Autowired
     private OrdersService ordersService;     // risk checks + Upstox call
     @Autowired
-    private StreamGateway stream;
-    @Autowired
     private FastStateStore fast;             // Step-3: fast guards/dedupe
+    @Autowired
+    private FlagsService flags;              // Step-9: entry gates
+    @Autowired
+    private EventPublisher eventPublisher; // Step-10: Kafka publish
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
+    }
 
     // ---------- READ ----------
     @Transactional(readOnly = true)
     public Result<List<Advice>> list() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info("User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             List<Advice> advs = adviceRepo
                     .findAll(PageRequest.of(0, 100, Sort.by("createdAt").descending()))
@@ -48,6 +67,10 @@ public class AdviceService {
 
     @Transactional(readOnly = true)
     public Result<Advice> get(String adviceId) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info("User not logged in :: get");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
             Optional<Advice> opt = adviceRepo.findById(adviceId);
@@ -58,13 +81,15 @@ public class AdviceService {
         }
     }
 
-    // ---------- WRITE ----------
-
     /**
      * Persist a new Advice and emit advice.new (Step-3 dedupe on (instrumentToken, side) for 60s).
      */
     @Transactional
     public Result<Advice> create(Advice draft) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in :: create");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             if (draft == null) return Result.fail("BAD_REQUEST", "Advice payload required");
 
@@ -87,8 +112,7 @@ public class AdviceService {
             draft.setUpdatedAt(Instant.now());
             Advice saved = adviceRepo.save(draft);
 
-            stream.send("advice.new", saved);
-
+            publishAdviceEvent("advice.new", saved);
             return Result.ok(saved);
         } catch (Exception t) {
             log.error("advice.create failed", t);
@@ -99,9 +123,16 @@ public class AdviceService {
     /**
      * Execute a PENDING advice: build typed PlaceOrderRequest, place it via OrdersService,
      * mark EXECUTED with broker orderId if available, emit advice.updated, and notify engine.
+     * <p>
+     * Step-9: For BUY (new entry), block when any entry gate is ON in FlagsService.
+     * SELL (exit) is allowed regardless so we can flatten positions.
      */
     @Transactional
     public Result<Advice> execute(String adviceId) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in :: execute");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
 
@@ -112,6 +143,18 @@ public class AdviceService {
                 return Result.ok(a);
             }
             assertReadyForCreationOrExecution(a);
+
+            // Hard entry gates only for BUY (allow SELL exits)
+            String side = String.valueOf(a.getTransaction_type());
+            if ("BUY".equalsIgnoreCase(side)) {
+                if (flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
+                        || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
+                        || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
+                        || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
+                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF)) {
+                    return Result.fail("ENTRY_BLOCKED", "Entry blocked by risk/time window flags");
+                }
+            }
 
             PlaceOrderRequest req = buildUpstoxRequest(a);
             Result<PlaceOrderResponse> r = ordersService.placeOrder(req);
@@ -127,7 +170,7 @@ public class AdviceService {
             a.setUpdatedAt(Instant.now());
 
             Advice saved = adviceRepo.save(a);
-            stream.send("advice.updated", saved);
+            publishAdviceEvent("advice.executed", saved); // Step-10
             log.info("advice.execute: placed order {} for {}", orderId, a.getSymbol());
             return Result.ok(saved);
         } catch (Exception t) {
@@ -141,6 +184,10 @@ public class AdviceService {
      */
     @Transactional
     public Result<Advice> dismiss(String adviceId) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.info(" User not logged in");
+            return Result.fail("user-not-logged-in");
+        }
         try {
             if (isBlank(adviceId)) return Result.fail("BAD_REQUEST", "adviceId is required");
             Advice a = adviceRepo.findById(adviceId).orElse(null);
@@ -151,7 +198,7 @@ public class AdviceService {
             a.setUpdatedAt(Instant.now());
             Advice saved = adviceRepo.save(a);
 
-            stream.send("advice.updated", saved);
+            publishAdviceEvent("advice.updated", saved); // Step-10
             return Result.ok(saved);
         } catch (Exception t) {
             log.error("advice.dismiss failed", t);
@@ -177,14 +224,6 @@ public class AdviceService {
         return req;
     }
 
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
-
-    private static String nullToEmpty(String s) {
-        return s == null ? "" : s;
-    }
-
     /**
      * Strict checks so OrdersService doesn’t receive half-filled payloads.
      */
@@ -200,5 +239,47 @@ public class AdviceService {
             throw new IllegalStateException("transactionType (BUY/SELL) is required on Advice");
         if (a.getQuantity() <= 0)
             throw new IllegalStateException("quantity must be > 0 on Advice");
+    }
+
+    // NEW: Step-10 helper placed near the bottom of the class
+// ------------------------------------------------------
+
+    /**
+     * Step-10: Publish to Kafka "advice" topic (only when AdviceService is the source).
+     * Emits compact JSON using JsonObject (no StringBuilder).
+     */
+    private void publishAdviceEvent(String event, Advice a) {
+        try {
+            if (a == null) return;
+
+            JsonObject o = new JsonObject();
+            o.addProperty("ts", java.time.Instant.now().toEpochMilli());
+            o.addProperty("event", event);
+            o.addProperty("source", "advice");
+
+            if (a.getId() != null) o.addProperty("id", a.getId());
+            if (a.getSymbol() != null) o.addProperty("symbol", a.getSymbol());
+            if (a.getInstrument_token() != null) o.addProperty("instrument_token", a.getInstrument_token());
+            if (a.getOrder_type() != null) o.addProperty("order_type", a.getOrder_type());
+            if (a.getTransaction_type() != null)
+                o.addProperty("transaction_type", a.getTransaction_type());
+            o.addProperty("quantity", a.getQuantity());
+            if (a.getProduct() != null) o.addProperty("product", a.getProduct());
+            if (a.getValidity() != null) o.addProperty("validity", a.getValidity());
+            if (a.getPrice() != null) o.addProperty("price", a.getPrice());
+            if (a.getTrigger_price() != null) o.addProperty("trigger_price", a.getTrigger_price());
+            if (a.getStatus() != null) o.addProperty("status", a.getStatus().name());
+
+            // Key preference: symbol -> instrument_token -> id
+            String key = a.getSymbol();
+            if (key == null || key.trim().isEmpty()) key = a.getInstrument_token();
+            if ((key == null || key.trim().isEmpty()) && a.getId() != null) key = a.getId();
+
+            if (eventPublisher != null) {
+                eventPublisher.publish(EventBusConfig.TOPIC_ADVICE, key, o.toString());
+            }
+        } catch (Throwable t) {
+            // best-effort, never break advice flow
+        }
     }
 }

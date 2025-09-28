@@ -32,7 +32,7 @@ public class Order {
     private String symbol;
     private String order_type;           // MARKET/LIMIT/SL
     private String transaction_type;     // BUY/SELL
-    private int quantity;
+    private Integer quantity;
     private String product;              // MIS/NRML/CNC
     private String validity;             // DAY/IOC
     private double price;

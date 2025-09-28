@@ -1,6 +1,5 @@
 package com.trade.frankenstein.trader.config;
 
-import com.trade.frankenstein.trader.common.enums.BotFeature;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;

@@ -22,19 +22,17 @@ import java.util.concurrent.atomic.AtomicLong;
 @Slf4j
 public class NewsIngestJob {
 
-    @Autowired
-    private NewsService newsService;
-    @Autowired
-    private SentimentService sentimentService;
-
     private final AtomicLong lastSuccessfulIngest = new AtomicLong(0);
     private final AtomicLong lastSuccessfulEmit = new AtomicLong(0);
     private final AtomicLong totalIngests = new AtomicLong(0);
     private final AtomicLong successfulIngests = new AtomicLong(0);
-
-    private boolean newsEnabled = TradeNewsConstants.NEWS_ENABLED;
-    private boolean marketHoursOnly = TradeNewsConstants.NEWS_MARKET_HOURS_ONLY;
-    private String marketTimezone = TradeNewsConstants.NEWS_MARKET_TIMEZONE;
+    private final boolean newsEnabled = TradeNewsConstants.NEWS_ENABLED;
+    private final boolean marketHoursOnly = TradeNewsConstants.NEWS_MARKET_HOURS_ONLY;
+    private final String marketTimezone = TradeNewsConstants.NEWS_MARKET_TIMEZONE;
+    @Autowired
+    private NewsService newsService;
+    @Autowired
+    private SentimentService sentimentService;
 
     /**
      * Main news ingest job (defaults every 30s).

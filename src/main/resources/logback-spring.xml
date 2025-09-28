@@ -1,17 +1,46 @@
 <configuration>
+    <!-- Console JSON appender (unchanged name & class) -->
     <appender name="jsonConsoleAppender" class="ch.qos.logback.core.ConsoleAppender">
+        <!-- Keep using LogstashEncoder to preserve existing JSON shape & decorators -->
         <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!--
+              Kept from your file:
+              - includeCallerData: preserves caller_* fields
+              - jsonGeneratorDecorator: still pretty prints and masks "password" with XXXX
+            -->
             <includeCallerData>true</includeCallerData>
+
+            <!-- New (non-breaking) includes: enrich logs for querying & correlation -->
+            <includeMdc>true</includeMdc>                       <!-- allow MDC keys like traceId, orderId -->
+            <includeContext>true</includeContext>               <!-- include LoggerContext properties if any -->
+            <includeMarkers>true</includeMarkers>               <!-- include SLF4J markers if you use them -->
+            <includeStructuredArguments>true</includeStructuredArguments> <!-- capture structured args -->
+            <includeArguments>true</includeArguments>           <!-- log parameterized args -->
+            <includeStackTrace>true</includeStackTrace>         <!-- include exception stack trace when present -->
+
+            <!-- Add stable fields for OpenObserve filtering; keeps everything else identical -->
+            <customFields>{"service":"${SERVICE_NAME:-unknown}","env":"${ENV:-dev}"}</customFields>
+
+            <!-- Keep your existing decorators exactly as-is -->
             <jsonGeneratorDecorator class="net.logstash.logback.decorate.CompositeJsonGeneratorDecorator">
                 <decorator class="net.logstash.logback.decorate.PrettyPrintingJsonGeneratorDecorator"/>
                 <decorator class="net.logstash.logback.mask.MaskingJsonGeneratorDecorator">
                     <defaultMask>XXXX</defaultMask>
                     <path>password</path>
+                    <!--
+                      If you want to extend masking later without changing behavior today,
+                      add more paths here, e.g.:
+                      <path>token</path>
+                      <path>secret</path>
+                      <path>authorization</path>
+                      (left commented to preserve current output)
+                    -->
                 </decorator>
             </jsonGeneratorDecorator>
         </encoder>
     </appender>
 
+    <!-- Root logger level unchanged -->
     <root level="INFO">
         <appender-ref ref="jsonConsoleAppender"/>
     </root>
