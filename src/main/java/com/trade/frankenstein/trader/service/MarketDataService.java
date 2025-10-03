@@ -12,11 +12,10 @@ import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.model.documents.Candle;
 import com.trade.frankenstein.trader.model.documents.Tick;
+import com.trade.frankenstein.trader.model.dto.MicrostructureSignals;
 import com.trade.frankenstein.trader.repo.documents.CandleRepo;
 import com.trade.frankenstein.trader.repo.documents.TickRepo;
-import com.upstox.api.GetIntraDayCandleResponse;
-import com.upstox.api.GetMarketQuoteOHLCResponseV3;
-import com.upstox.api.IntraDayCandleData;
+import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -892,6 +891,159 @@ public class MarketDataService {
             log.warn("isVolatilitySpikeNow({}) failed: {}", instrumentKey, t.toString());
             return false;
         }
+    }
+
+    /**
+     * Calculates the volume concentration ratio for an index based on 1-minute intraday candles.
+     * Ratio = (maximum single candle volume over last N candles) / (total volume over last N candles)
+     * Interpreted as: if ratio ≈ 1, highly concentrated; if low, volumes are more distributed.
+     */
+    public Optional<Double> getConcentrationRatio(String instrumentKey) {
+        if (!isLoggedIn()) return Optional.empty();
+        try {
+            // Get the last N=20 1-min candles for given instrument
+            int N = 20;
+            GetIntraDayCandleResponse resp = upstox.getIntradayCandleData(instrumentKey, "minutes", "1");
+            if (resp == null || resp.getData() == null) return Optional.empty();
+            List<List<Object>> rows = resp.getData().getCandles();
+            if (rows == null || rows.size() < N)
+                return Optional.empty();
+
+            // Get last N (or all, if fewer)
+            List<List<Object>> lastN = rows.subList(Math.max(0, rows.size() - N), rows.size());
+            double maxVolume = 0, totalVolume = 0;
+            for (List<Object> r : lastN) {
+                if (r.size() < 6) continue;
+                Object vObj = r.get(5);
+                double vol = 0;
+                if (vObj instanceof Number) vol = ((Number) vObj).doubleValue();
+                else try { vol = Double.parseDouble(String.valueOf(vObj)); } catch(Exception e){vol=0;}
+                if (vol > maxVolume) maxVolume = vol;
+                totalVolume += vol;
+            }
+            if (totalVolume <= 0) return Optional.empty();
+            return Optional.of(maxVolume / totalVolume);
+        } catch(Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<MicrostructureSignals> getMicrostructure(String instrumentKey) {
+        if (!isLoggedIn() || instrumentKey == null) return Optional.empty();
+        try {
+            GetMarketQuoteOHLCResponseV3 resp = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+            if (resp == null || resp.getData() == null || !resp.getData().containsKey(instrumentKey))
+                return Optional.empty();
+
+            MarketQuoteOHLCV3 data = resp.getData().get(instrumentKey);
+            OhlcV3 ohlc = data.getLiveOhlc(); // Use live_ohlc field
+            if (ohlc == null) return Optional.empty();
+
+            // Use provided fields
+            Double high = ohlc.getHigh();
+            Double low = ohlc.getLow();
+            Double open = ohlc.getOpen();
+            Double close = ohlc.getClose();
+            Long volume = ohlc.getVolume();
+            Long ts = ohlc.getTs();
+
+            Double lastPrice = data.getLastPrice();
+            String instrumentToken = data.getInstrumentToken();
+
+            // Calculate Bid-Ask Spread (use high-low over mid)
+            double vHigh = high != null ? high : 0.0;
+            double vLow = low != null ? low : 0.0;
+            double mid = (vHigh + vLow) / 2.0;
+            BigDecimal bidAskSpread = mid > 0 ? BigDecimal.valueOf((vHigh - vLow) / mid).abs() : BigDecimal.ZERO;
+
+            // Order book imbalance (not present in your fields, so omit or use other proxy)
+
+            BigDecimal imbalance = BigDecimal.ZERO; // placeholder (add logic if you have bid/ask)
+
+            // Trade size skew — if using volume
+            BigDecimal tradeSizeSkew = volume != null ? BigDecimal.valueOf(volume) : BigDecimal.ZERO;
+
+            double depthScore = 1.0; // placeholder
+            double priceImpact = 0.0; // placeholder
+
+            MicrostructureSignals signals = new MicrostructureSignals(
+                    bidAskSpread,
+                    imbalance,
+                    tradeSizeSkew,
+                    depthScore,
+                    priceImpact,
+                    ts != null ? Instant.ofEpochMilli(ts) : Instant.now()
+            );
+            return Optional.of(signals);
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<BigDecimal> getBidAskSpread(String instrumentKey) {
+        try {
+            GetMarketQuoteOHLCResponseV3 resp = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+            if (resp == null || resp.getData() == null || !resp.getData().containsKey(instrumentKey))
+                return Optional.empty();
+            OhlcV3 ohlc = resp.getData().get(instrumentKey).getLiveOhlc();
+            if (ohlc == null || ohlc.getHigh() == null || ohlc.getLow() == null) return Optional.empty();
+            double mid = (ohlc.getHigh() + ohlc.getLow()) / 2.0;
+            return mid != 0.0
+                    ? Optional.of(BigDecimal.valueOf(Math.abs((ohlc.getHigh() - ohlc.getLow()) / mid)))
+                    : Optional.empty();
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<BigDecimal> getOrderBookImbalance(String instrumentKey) {
+        try {
+            GetMarketQuoteOHLCResponseV3 resp = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+            if (resp == null || resp.getData() == null || !resp.getData().containsKey(instrumentKey))
+                return Optional.empty();
+            MarketQuoteOHLCV3 data = resp.getData().get(instrumentKey);
+            OhlcV3 prev = data.getPrevOhlc();
+            OhlcV3 live = data.getLiveOhlc();
+
+            if (prev == null || prev.getClose() == null || live == null || live.getClose() == null)
+                return Optional.empty();
+
+            // Use price change as a proxy for imbalance:
+            double prevClose = prev.getClose();
+            double liveClose = live.getClose();
+
+            if (prevClose == 0) return Optional.empty();
+            BigDecimal pseudoImbalance = BigDecimal.valueOf((liveClose - prevClose) / prevClose);
+
+            return Optional.of(pseudoImbalance);
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+
+    public Optional<BigDecimal> getTradeSizeSkew(String instrumentKey) {
+        try {
+            // If you have tick-level trade size, average and compare, else use volume field from 1-min candle
+            GetMarketQuoteOHLCResponseV3 resp = upstox.getMarketOHLCQuote(instrumentKey, "I1");
+            if (resp == null || resp.getData() == null || !resp.getData().containsKey(instrumentKey))
+                return Optional.empty();
+            OhlcV3 ohlc = resp.getData().get(instrumentKey).getLiveOhlc();
+            if (ohlc == null || ohlc.getVolume() == null) return Optional.empty();
+            return Optional.of(BigDecimal.valueOf(ohlc.getVolume()));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<Double> getDepthScore(String instrumentKey) {
+        // If you have more granular market depth info (e.g. multiple levels), use it. Placeholder = 1.0
+        return Optional.of(1.0);
+    }
+
+    public Optional<Double> getPriceImpact(String instrumentKey) {
+        // Needs tick data: For now, as placeholder, return 0.0.
+        return Optional.of(0.0);
     }
 
 }

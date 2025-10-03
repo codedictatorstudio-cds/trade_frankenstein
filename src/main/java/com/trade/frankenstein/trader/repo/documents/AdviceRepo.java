@@ -156,4 +156,7 @@ public interface AdviceRepo extends MongoRepository<Advice, String> {
 
         Double getSuccessRate();
     }
+
+    @Query("{ 'strategy': { $exists: true }, 'status': 'PENDING' }")
+    List<Advice> findAllPendingByStrategy();
 }

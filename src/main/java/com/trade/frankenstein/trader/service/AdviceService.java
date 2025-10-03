@@ -25,10 +25,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -1022,5 +1019,22 @@ public class AdviceService {
             if (s != null && !s.trim().isEmpty()) return s;
         }
         return null;
+    }
+
+    /**
+     * Returns a map of StrategyName → count of PENDING advices.
+     */
+    @Transactional(readOnly = true)
+    public Map<StrategyName, Integer> getPendingCountsByStrategy() {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            return Collections.emptyMap();
+        }
+        List<Advice> pending = adviceRepo.findAllPendingByStrategy();
+        return pending.stream()
+                .filter(a -> a.getStrategy() != null)
+                .collect(Collectors.groupingBy(
+                        Advice::getStrategy,
+                        Collectors.reducing(0, e -> 1, Integer::sum)
+                ));
     }
 }

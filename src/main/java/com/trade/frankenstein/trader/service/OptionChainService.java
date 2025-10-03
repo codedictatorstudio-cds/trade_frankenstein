@@ -9,6 +9,7 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.OptionType;
+import com.trade.frankenstein.trader.model.dto.OptionsFlowBias;
 import com.upstox.api.GetMarketQuoteOptionGreekResponseV3;
 import com.upstox.api.GetOptionContractResponse;
 import com.upstox.api.InstrumentData;
@@ -876,6 +877,49 @@ public class OptionChainService {
 
     private String nullSafe(String s) {
         return s == null ? "" : s;
+    }
+
+    /**
+     * Returns a snapshot of options flow (CE/PE volumes, OI change) for the instrument and expiry.
+     */
+    public Optional<OptionsFlowBias> analyzeOptionsFlow(String underlyingKey, LocalDate expiry) {
+        if (!isLoggedIn() || underlyingKey == null || expiry == null) return Optional.empty();
+        try {
+            // CE/PE volumes and OI from current expiry greeks data
+            List instruments = fetchInstruments(underlyingKey, expiry);
+            Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
+
+            double ceVolume = 0, peVolume = 0;
+            double ceOiChange = 0, peOiChange = 0;
+
+            for (Object oiObj : instruments) {
+                InstrumentData oi = (InstrumentData) oiObj;
+                MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
+                if (g == null) continue;
+                long vol = safeLong(g.getVolume());
+                long oiVal = safeLong(g.getOi());
+                long oiPrev = 0;
+                String side = oi.getUnderlyingType();
+                if ("CE".equalsIgnoreCase(side)) {
+                    ceVolume += vol;
+                    ceOiChange += oiVal - oiPrev;
+                } else if ("PE".equalsIgnoreCase(side)) {
+                    peVolume += vol;
+                    peOiChange += oiVal - oiPrev;
+                }
+            }
+
+            double totalVol = ceVolume + peVolume;
+            double callVolRatio = totalVol > 0 ? ceVolume / totalVol : 0.5;
+            double putVolRatio = totalVol > 0 ? peVolume / totalVol : 0.5;
+            double netOiChange = ceOiChange - peOiChange;
+
+            OptionsFlowBias flow = new OptionsFlowBias(callVolRatio, putVolRatio, netOiChange, Instant.now());
+            return Optional.of(flow);
+
+        } catch (Exception e) {
+            return Optional.empty();
+        }
     }
 
     public record OiSnapshot(BigDecimal totalCeOi, BigDecimal totalPeOi, Instant asOf) {

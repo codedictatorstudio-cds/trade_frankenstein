@@ -644,4 +644,40 @@ public class TradesService {
             }
         } catch (Throwable ignored) { /* best-effort */ }
     }
+
+    // Inside TradesService.java
+
+    /**
+     * Returns currently open trades (not closed/exited).
+     */
+    @Transactional(readOnly = true)
+    public List<Trade> getActiveTrades() {
+        if (!isLoggedIn()) {
+            return Collections.emptyList();
+        }
+        // Fetch most recent 500 trades and filter in-memory
+        Page<Trade> page = tradeRepo.findAll(
+                PageRequest.of(0, 500, Sort.by(
+                        Sort.Order.desc("exitTime"),
+                        Sort.Order.desc("entryTime"),
+                        Sort.Order.desc("updatedAt"),
+                        Sort.Order.desc("createdAt")))
+        );
+        List<Trade> active = new ArrayList<>();
+        for (Trade t : page.getContent()) {
+            if (t == null) continue;
+            // Consider open if exitTime==null and status not in closed states
+            TradeStatus st = t.getStatus();
+            boolean isClosed = st == TradeStatus.CLOSED
+                    || st == TradeStatus.EXITED
+                    || st == TradeStatus.CANCELLED
+                    || st == TradeStatus.REJECTED
+                    || st == TradeStatus.FAILED;
+            if (t.getExitTime() == null && !isClosed) {
+                active.add(t);
+            }
+        }
+        return active;
+    }
+
 }
