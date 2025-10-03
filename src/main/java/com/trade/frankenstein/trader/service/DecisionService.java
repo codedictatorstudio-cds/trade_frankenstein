@@ -121,7 +121,7 @@ public class DecisionService {
         });
 
         // 6) Risk gates & adjustments
-        boolean circuit = safe(() -> riskService.getCircuitState().get()).orElse(false);
+        boolean circuit = safe(() -> riskService.getCircuitState().get()).get();
         finalRaw.set(applyDynamicRiskAdjustments(finalRaw.get(), ctx, regime));
 
         // 7) Predictive adjustments
@@ -261,7 +261,7 @@ public class DecisionService {
         double cons = reg.getRegimeConsistency();
         if (cons > 0.8) s *= 1.15;
         else if (cons < 0.3) s *= 0.8;
-        double dailyLoss = safe(() -> riskService.getSummary().get().getDailyLossPct()).orElse(0.0);
+        double dailyLoss = safe(() -> riskService.getDailyLossPct()).orElse(0.0);
         if (dailyLoss > 50) s *= 0.6;
         else if (dailyLoss > 25) s *= 0.8;
         return s;
