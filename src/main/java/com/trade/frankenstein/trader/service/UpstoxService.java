@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.constants.UpstoxConstants;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.upstox.AuthenticationResponse;
 import com.trade.frankenstein.trader.repo.upstox.AuthenticationResponseRepo;
 import com.upstox.api.*;
@@ -33,7 +32,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.function.Supplier;
 
 @Service
 @Slf4j
@@ -51,34 +49,16 @@ public class UpstoxService {
     @Autowired
     private UpstoxSessionToken upstoxSessionToken;
     @Autowired
-    private UpstoxTradeMode tradeMode;
-    @Autowired
     private ObjectMapper mapper;
     @Autowired
-    private FlagsService flags;
-    @Autowired
     private AuthenticationResponseRepo authenticationResponseRepo;
+
     private AuthenticationResponse authenticationResponse;
 
     @PostConstruct
     public void init() {
         this.authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(AuthenticationResponse.builder().build());
     }
-
-    /**
-     * Flag gates (Step-9/Toggles): blocks "new openings" when kill switch or paper-mode is ON.
-     */
-    private void ensureOrderOpenAllowed(String action) {
-        if (flags != null) {
-            if (flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT) || flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)) {
-                throw new IllegalStateException("Order blocked by risk/circuit flag for action: " + action);
-            }
-            if (flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                throw new IllegalStateException("Paper mode ON — broker order call skipped for action: " + action);
-            }
-        }
-    }
-
 
     private void sleepQuietly(long ms) {
         try {
@@ -105,27 +85,6 @@ public class UpstoxService {
         return createdLocalDate.equals(today);
     }
 
-    /**
-     * Generic wrapper: if a call throws 401, refresh token once and retry immediately.
-     */
-    private <T> T callWith401Refresh(Supplier<T> call) {
-        try {
-            return call.get();
-        } catch (HttpClientErrorException e) {
-            if (e.getStatusCode() == HttpStatus.UNAUTHORIZED) {
-                if (flags != null && flags.isOn(FlagName.SESSION_AUTO_REFRESH)) {
-                    log.info("401 from Upstox — refreshing token and retrying once (SESSION_AUTO_REFRESH=ON)...");
-                    upstoxSessionToken.generateAccessToken();
-                    authenticationResponse = authenticationResponseRepo.findAll().stream().findFirst().orElse(authenticationResponse);
-                    return call.get();
-                } else {
-                    log.warn("401 from Upstox — SESSION_AUTO_REFRESH is OFF, not retrying");
-                }
-            }
-            throw e;
-        }
-    }
-
     // =====================================================================================
     // Orders path — upstoxOrders (retry + circuit + rate limiter + bulkhead)
     // =====================================================================================
@@ -140,13 +99,11 @@ public class UpstoxService {
             return null;
         }
 
-        ensureOrderOpenAllowed("PlaceOrderResponse placeOrder");
         log.info("Checking and refreshing token if needed : placeOrder");
         checkAndRefreshToken();
 
-        String baseUrl = tradeMode.getTradeMode().equalsIgnoreCase(UpstoxConstants.TRADE_MODE_LIVE)
-                ? UpstoxConstants.LIVE_URL
-                : UpstoxConstants.SANDBOX_URL;
+        String baseUrl = UpstoxConstants.LIVE_URL;
+
         String url = baseUrl + UpstoxConstants.PLACE_ORDER_URL;
 
         HttpHeaders headers = new HttpHeaders();
@@ -157,8 +114,8 @@ public class UpstoxService {
         HttpEntity<PlaceOrderRequest> entity = new HttpEntity<>(request, headers);
         log.info("Placing order with request: {}", request);
 
-        PlaceOrderResponse response = callWith401Refresh(() ->
-                template.postForObject(url, entity, PlaceOrderResponse.class));
+        PlaceOrderResponse response = template.postForObject(url, entity, PlaceOrderResponse.class);
+
         log.info("Order placed");
         return response;
     }
@@ -178,13 +135,10 @@ public class UpstoxService {
             return null;
         }
 
-        ensureOrderOpenAllowed("ModifyOrderResponse modifyOrder");
         log.info("Checking and refreshing token if needed : modifyOrder");
         checkAndRefreshToken();
 
-        String baseUrl = tradeMode.getTradeMode().equalsIgnoreCase(UpstoxConstants.TRADE_MODE_LIVE)
-                ? UpstoxConstants.LIVE_URL
-                : UpstoxConstants.SANDBOX_URL;
+        String baseUrl = UpstoxConstants.LIVE_URL;
         String url = baseUrl + UpstoxConstants.MODIFY_ORDER_URL;
 
         HttpHeaders headers = new HttpHeaders();
@@ -195,8 +149,7 @@ public class UpstoxService {
         HttpEntity<ModifyOrderRequest> entity = new HttpEntity<>(request, headers);
         log.info("Modifying order with request: {}", request);
 
-        ModifyOrderResponse response = callWith401Refresh(() ->
-                template.postForObject(url, entity, ModifyOrderResponse.class));
+        ModifyOrderResponse response = template.postForObject(url, entity, ModifyOrderResponse.class);
         log.info("Order modified");
         return response;
     }
@@ -219,9 +172,7 @@ public class UpstoxService {
         log.info("Checking and refreshing token if needed : cancelOrder");
         checkAndRefreshToken();
 
-        String baseUrl = tradeMode.getTradeMode().equalsIgnoreCase(UpstoxConstants.TRADE_MODE_LIVE)
-                ? UpstoxConstants.LIVE_URL
-                : UpstoxConstants.SANDBOX_URL;
+        String baseUrl = UpstoxConstants.LIVE_URL;
         String url = baseUrl + UpstoxConstants.CANCEL_ORDER_URL;
 
         URI uri = UriComponentsBuilder.fromUriString(url)
@@ -237,8 +188,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Cancelling order with request: {}", orderId);
 
-        ResponseEntity<CancelOrderResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.DELETE, entity, CancelOrderResponse.class));
+        ResponseEntity<CancelOrderResponse> response = template.exchange(uri, HttpMethod.DELETE, entity, CancelOrderResponse.class);
         log.info("Order cancelled");
         return response.getBody();
     }
@@ -271,8 +221,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting order with request: {}", orderId);
 
-        ResponseEntity<GetOrderDetailsResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetOrderDetailsResponse.class));
+        ResponseEntity<GetOrderDetailsResponse> response = template.exchange(uri, HttpMethod.GET, entity, GetOrderDetailsResponse.class);
         log.info("Order details fetched");
         return response.getBody();
     }
@@ -306,8 +255,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting order history");
 
-        ResponseEntity<GetOrderResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetOrderResponse.class));
+        ResponseEntity<GetOrderResponse> response = template.exchange(uri, HttpMethod.GET, entity, GetOrderResponse.class);
         log.info("Order history fetched");
         return response.getBody();
     }
@@ -332,8 +280,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting order book");
 
-        ResponseEntity<GetOrderBookResponse> response = callWith401Refresh(() ->
-                template.exchange(UpstoxConstants.GET_ALL_ORDERS_URL, HttpMethod.GET, entity, GetOrderBookResponse.class));
+        ResponseEntity<GetOrderBookResponse> response = template.exchange(UpstoxConstants.GET_ALL_ORDERS_URL, HttpMethod.GET, entity, GetOrderBookResponse.class);
         log.info("Order book fetched");
         return response.getBody();
     }
@@ -358,8 +305,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting trades for the day");
 
-        ResponseEntity<GetTradeResponse> response = callWith401Refresh(() ->
-                template.exchange(UpstoxConstants.GET_TRADES_PER_DAY_URL, HttpMethod.GET, entity, GetTradeResponse.class));
+        ResponseEntity<GetTradeResponse> response = template.exchange(UpstoxConstants.GET_TRADES_PER_DAY_URL, HttpMethod.GET, entity, GetTradeResponse.class);
         log.info("Trades for the day fetched");
         return response.getBody();
     }
@@ -384,8 +330,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting all order trades");
 
-        ResponseEntity<GetTradeResponse> response = callWith401Refresh(() ->
-                template.exchange(UpstoxConstants.GET_ORDER_TRADES_URL, HttpMethod.GET, entity, GetTradeResponse.class));
+        ResponseEntity<GetTradeResponse> response = template.exchange(UpstoxConstants.GET_ORDER_TRADES_URL, HttpMethod.GET, entity, GetTradeResponse.class);
         log.info("All order trades fetched");
         return response.getBody();
     }
@@ -419,8 +364,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Exiting all positions for segment: {}", segment);
 
-        ResponseEntity<CancelOrExitMultiOrderResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.POST, entity, CancelOrExitMultiOrderResponse.class));
+        ResponseEntity<CancelOrExitMultiOrderResponse> response = template.exchange(uri, HttpMethod.POST, entity, CancelOrExitMultiOrderResponse.class);
         log.info("Exit all positions response fetched");
         return response.getBody();
     }
@@ -436,7 +380,6 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public ModifyOrderResponse amendOrderPrice(String orderId, Float newPrice) {
-        ensureOrderOpenAllowed("ModifyOrderResponse amendOrderPrice");
         log.info("Amending order price: orderId={}, newPrice={}", orderId, newPrice);
         checkAndRefreshToken();
 
@@ -471,7 +414,6 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public PlaceOrderResponse placeTargetOrder(String instrumentKey, int qty, Float targetPrice) {
-        ensureOrderOpenAllowed("PlaceOrderResponse placeTargetOrder");
         log.info("Placing target LIMIT order: {}, qty={}, price={}", instrumentKey, qty, targetPrice);
         checkAndRefreshToken();
 
@@ -497,7 +439,6 @@ public class UpstoxService {
     @RateLimiter(name = "upstoxOrders")
     @Bulkhead(name = "upstoxOrders", type = Bulkhead.Type.SEMAPHORE)
     public PlaceOrderResponse placeStopLossOrder(String instrumentKey, int qty, Float triggerPrice) {
-        ensureOrderOpenAllowed("PlaceOrderResponse placeStopLossOrder");
         log.info("Placing protective SL order: {}, qty={}, trigger={}", instrumentKey, qty, triggerPrice);
         checkAndRefreshToken();
 
@@ -537,8 +478,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting portfolio");
 
-        ResponseEntity<GetPositionResponse> response = callWith401Refresh(() ->
-                template.exchange(UpstoxConstants.GET_SHORT_TERM_POSITIONS_URL, HttpMethod.GET, entity, GetPositionResponse.class));
+        ResponseEntity<GetPositionResponse> response = template.exchange(UpstoxConstants.GET_SHORT_TERM_POSITIONS_URL, HttpMethod.GET, entity, GetPositionResponse.class);
         log.info("Portfolio fetched");
         return response.getBody();
     }
@@ -563,8 +503,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting long term holdings");
 
-        ResponseEntity<GetHoldingsResponse> response = callWith401Refresh(() ->
-                template.exchange(UpstoxConstants.GET_LONG_TERM_HOLDINGS_URL, HttpMethod.GET, entity, GetHoldingsResponse.class));
+        ResponseEntity<GetHoldingsResponse> response = template.exchange(UpstoxConstants.GET_LONG_TERM_HOLDINGS_URL, HttpMethod.GET, entity, GetHoldingsResponse.class);
         log.info("Long term holdings fetched");
         return response.getBody();
     }
@@ -597,8 +536,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting LTP quote for instrument key: {}", instrument_key);
 
-        ResponseEntity<GetMarketQuoteLastTradedPriceResponseV3> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteLastTradedPriceResponseV3.class));
+        ResponseEntity<GetMarketQuoteLastTradedPriceResponseV3> response = template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteLastTradedPriceResponseV3.class);
         log.info("LTP quote fetched");
         return response.getBody();
     }
@@ -632,8 +570,7 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting OHLC quote for instrument key: {}", instrument_key);
 
-        ResponseEntity<GetMarketQuoteOHLCResponseV3> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteOHLCResponseV3.class));
+        ResponseEntity<GetMarketQuoteOHLCResponseV3> response = template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteOHLCResponseV3.class);
         log.info("OHLC quote fetched");
         return response.getBody();
     }
@@ -669,8 +606,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting intraday candle data for instrument key: {}", instrument_key);
 
-        ResponseEntity<GetIntraDayCandleResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetIntraDayCandleResponse.class));
+        ResponseEntity<GetIntraDayCandleResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetIntraDayCandleResponse.class);
         log.info("Intraday candle data fetched");
         return response.getBody();
     }
@@ -707,8 +644,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting historical candle data for instrument key: {}", instrument_key);
 
-        ResponseEntity<GetHistoricalCandleResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetHistoricalCandleResponse.class));
+        ResponseEntity<GetHistoricalCandleResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetHistoricalCandleResponse.class);
         log.info("Historical candle data fetched");
         return response.getBody();
     }
@@ -741,8 +678,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting funds and margin for segment: {}", segment);
 
-        ResponseEntity<GetUserFundMarginResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetUserFundMarginResponse.class));
+        ResponseEntity<GetUserFundMarginResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetUserFundMarginResponse.class);
         log.info("Funds and margin fetched");
         return response.getBody();
     }
@@ -775,8 +712,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting market holidays");
 
-        ResponseEntity<GetHolidayResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetHolidayResponse.class));
+        ResponseEntity<GetHolidayResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetHolidayResponse.class);
         log.info("Market holidays fetched");
         return response.getBody();
     }
@@ -803,8 +740,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting market data feed details");
 
-        ResponseEntity<MarketDataFeed> response = callWith401Refresh(() ->
-                template.exchange(feedUrl, HttpMethod.GET, entity, MarketDataFeed.class));
+        ResponseEntity<MarketDataFeed> response =
+                template.exchange(feedUrl, HttpMethod.GET, entity, MarketDataFeed.class);
         log.info("Market data feed details fetched");
         return response.getBody();
     }
@@ -830,8 +767,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
         log.info("Getting market data feed URL : {}", url);
-        ResponseEntity<JsonNode> response = callWith401Refresh(() ->
-                template.exchange(url, HttpMethod.GET, entity, JsonNode.class));
+        ResponseEntity<JsonNode> response =
+                template.exchange(url, HttpMethod.GET, entity, JsonNode.class);
 
         JsonNode node = response.getBody();
         log.info("Market data feed URL fetched", node);
@@ -860,8 +797,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
         log.info("Getting market data feed URL");
-        ResponseEntity<JsonNode> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, JsonNode.class));
+        ResponseEntity<JsonNode> response =
+                template.exchange(uri, HttpMethod.GET, entity, JsonNode.class);
 
         JsonNode node = response.getBody();
         log.info("Portfolio data feed URL fetched", node);
@@ -891,8 +828,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting option greeks for instrument key: {}", instrument_key);
 
-        ResponseEntity<GetMarketQuoteOptionGreekResponseV3> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteOptionGreekResponseV3.class));
+        ResponseEntity<GetMarketQuoteOptionGreekResponseV3> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetMarketQuoteOptionGreekResponseV3.class);
         log.info("Option greeks fetched");
         return response.getBody();
     }
@@ -927,8 +864,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting PnL Meta Data");
 
-        ResponseEntity<GetTradeWiseProfitAndLossMetaDataResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetTradeWiseProfitAndLossMetaDataResponse.class));
+        ResponseEntity<GetTradeWiseProfitAndLossMetaDataResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetTradeWiseProfitAndLossMetaDataResponse.class);
         log.info("PnL Meta Data fetched");
         return response.getBody();
     }
@@ -965,8 +902,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting PnL Reports");
 
-        ResponseEntity<GetTradeWiseProfitAndLossDataResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetTradeWiseProfitAndLossDataResponse.class));
+        ResponseEntity<GetTradeWiseProfitAndLossDataResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetTradeWiseProfitAndLossDataResponse.class);
         log.info("PnL Reports fetched");
         return response.getBody();
     }
@@ -1001,8 +938,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting Trade Charges");
 
-        ResponseEntity<GetProfitAndLossChargesResponse> response = callWith401Refresh(() ->
-                template.exchange(uri, HttpMethod.GET, entity, GetProfitAndLossChargesResponse.class));
+        ResponseEntity<GetProfitAndLossChargesResponse> response =
+                template.exchange(uri, HttpMethod.GET, entity, GetProfitAndLossChargesResponse.class);
         log.info("Trade Charges fetched");
         return response.getBody();
     }
@@ -1029,8 +966,8 @@ public class UpstoxService {
         HttpEntity<Void> entity = new HttpEntity<>(headers);
         log.info("Getting User Profile");
 
-        ResponseEntity<GetProfileResponse> response = callWith401Refresh(() ->
-                template.exchange(url, HttpMethod.GET, entity, GetProfileResponse.class));
+        ResponseEntity<GetProfileResponse> response =
+                template.exchange(url, HttpMethod.GET, entity, GetProfileResponse.class);
         log.info("User Profile fetched");
         return response.getBody();
     }
@@ -1069,11 +1006,9 @@ public class UpstoxService {
                 .build().toUri();
 
         int attempt = 0;
-        boolean rateLimiterEnabled = (flags != null && flags.isOn(FlagName.UPSTOX_RATE_LIMITER_ENABLED));
         while (true) {
             try {
-                ResponseEntity<JsonNode> resp = callWith401Refresh(() ->
-                        template.exchange(uri, HttpMethod.GET, entity, JsonNode.class));
+                ResponseEntity<JsonNode> resp = template.exchange(uri, HttpMethod.GET, entity, JsonNode.class);
 
                 GetOptionContractResponse body = mapper.convertValue(resp.getBody(), GetOptionContractResponse.class);
                 if (body != null) {
@@ -1082,7 +1017,6 @@ public class UpstoxService {
                 }
                 return body;
             } catch (HttpClientErrorException.TooManyRequests e) {
-                if (!rateLimiterEnabled) throw e;
                 attempt++;
                 if (attempt > MAX_RETRIES) throw e;
                 String ra = e.getResponseHeaders() != null ? e.getResponseHeaders().getFirst("Retry-After") : null;
@@ -1099,7 +1033,6 @@ public class UpstoxService {
                 }
                 sleepQuietly(waitMs);
             } catch (HttpServerErrorException | ResourceAccessException e) {
-                if (!rateLimiterEnabled) throw e;
                 attempt++;
                 if (attempt > MAX_RETRIES) throw e;
                 long backoff = Math.min(MAX_BACKOFF_MS, (long) (BASE_BACKOFF_MS * Math.pow(2, attempt - 1)));
@@ -1166,13 +1099,10 @@ public class UpstoxService {
             headers.setBearerAuth(authenticationResponse.getResponse().getAccess_token());
 
             HttpEntity<Void> entity = new HttpEntity<>(headers);
-            JsonNode root = callWith401Refresh(() -> {
-                ResponseEntity<JsonNode> resp = template.exchange(uri, HttpMethod.GET, entity, JsonNode.class);
-                return resp != null ? resp.getBody() : null;
-            });
-            if (root == null || root.get("data") == null) return Optional.empty();
+            ResponseEntity<JsonNode> resp = template.exchange(uri, HttpMethod.GET, entity, JsonNode.class);
+            if (resp == null || resp.getBody() == null) return Optional.empty();
 
-            JsonNode node = root.get("data").get(instrumentKey);
+            JsonNode node = resp.getBody().get("data").get(instrumentKey);
             if (node == null) return Optional.empty();
 
             JsonNode buy0 = node.path("depth").path("buy").isArray() && node.path("depth").path("buy").size() > 0 ? node.path("depth").path("buy").get(0) : null;

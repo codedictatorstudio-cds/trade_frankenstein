@@ -1,12 +1,13 @@
 package com.trade.frankenstein.trader.service;
 
-import com.trade.frankenstein.trader.enums.FlagName;
+import com.google.gson.JsonObject;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+
 
 /**
  * StrategyUpgrades — single-class helper (Java 8, no reflection).
@@ -37,115 +38,6 @@ public class StrategyUpgrades {
      * ========================================================= */
 
     private StrategyUpgrades() {
-    }
-
-    // Defaults: strategy is ON unless global kill switches are active.
-    private static boolean strategyOn(FlagsService flags) {
-        if (flags == null) return true;
-        if (is(flags, "CIRCUIT_BREAKER_LOCKOUT", false)) return false;
-        return !is(flags, "KILL_SWITCH_OPEN_NEW", false);
-    }
-
-    // Guard for tight-spread picker
-    private static boolean spreadRankOn(FlagsService flags) {
-        // Prefer explicit STRAT_PICK_TIGHTEST_SPREAD if present; else inherit strategyOn
-        return flags == null || is(flags, "STRAT_PICK_TIGHTEST_SPREAD", strategyOn(flags));
-    }
-
-    // Whether to enforce a hard cap on acceptable spread%
-    private static boolean spreadCapEnforced(FlagsService flags) {
-        return flags == null || is(flags, "STRAT_ENFORCE_SPREAD_CAP", true);
-    }
-
-    // Trailing logic gate
-    private static boolean trailGuardOn(FlagsService flags) {
-        return flags == null || is(flags, "STRAT_TRAIL_GUARD", strategyOn(flags));
-    }
-
-    // Sub-conditions for trail guard – can be loosened via flags if needed
-    private static boolean requireAdxRising(FlagsService flags) {
-        return flags == null || is(flags, "STRAT_REQUIRE_ADX_RISING", true);
-    }
-
-    private static boolean requirePriceAboveVwap(FlagsService flags) {
-        return flags == null || is(flags, "STRAT_REQUIRE_PRICE_ABOVE_VWAP", true);
-    }
-
-    // Backtest enable (so you can disable in prod builds)
-    private static boolean backtestOn(FlagsService flags) {
-        return flags == null || is(flags, "STRAT_BACKTEST_ENABLED", strategyOn(flags));
-    }
-
-
-
-    /* =========================================================
-     *  Public wrappers exposing key Step-9 toggles for StrategyService
-     *  (Java 8, no reflection). These simply delegate to FlagsService
-     *  using safe lookups with sensible defaults.
-     * ========================================================= */
-
-    // Safe FlagName lookup by string, with default fallback
-    private static boolean is(FlagsService flags, String name, boolean defVal) {
-        try {
-            FlagName f = FlagName.valueOf(name);
-            return flags.isOn(f);
-        } catch (Throwable t) {
-            return defVal;
-        }
-    }
-
-    public static boolean entriesHardBlocked(FlagsService flags) {
-        return is(flags, "KILL_SWITCH_OPEN_NEW", false) || is(flags, "CIRCUIT_BREAKER_LOCKOUT", false);
-    }
-
-    public static boolean opening5mBlackoutActive(FlagsService flags) {
-        return is(flags, "OPENING_5M_BLACKOUT", false);
-    }
-
-    public static boolean noonPauseActive(FlagsService flags) {
-        return is(flags, "NOON_PAUSE_WINDOW", false);
-    }
-
-    public static boolean lateEntryCutoffActive(FlagsService flags) {
-        return is(flags, "LATE_ENTRY_CUTOFF", false);
-    }
-
-    public static boolean momentumConfirmationEnabled(FlagsService flags) {
-        return is(flags, "MOMENTUM_CONFIRMATION", false);
-    }
-
-    public static boolean pcrTiltEnabled(FlagsService flags) {
-        return is(flags, "PCR_TILT", false);
-    }
-
-    public static boolean stranglePmPlus1Enabled(FlagsService flags) {
-        return is(flags, "STRANGLE_PM_PLUS1", false);
-    }
-
-    public static boolean atmStraddleQuietEnabled(FlagsService flags) {
-        return is(flags, "ATM_STRADDLE_QUIET", false);
-    }
-
-    public static boolean restrikeEnabled(FlagsService flags) {
-        return is(flags, "RESTRIKE_ENABLED", false);
-    }
-
-    // Existing internal toggles surfaced for callers
-    public static boolean spreadRankingEnabled(FlagsService flags) {
-        return spreadRankOn(flags);
-    }
-
-    public static boolean spreadCapRequired(FlagsService flags) {
-        return spreadCapEnforced(flags);
-    }
-
-
-    /* =========================================================
-     *  #9 Tightest-spread strike selection
-     * ========================================================= */
-
-    public static boolean trailGuardEnabled(FlagsService flags) {
-        return trailGuardOn(flags);
     }
 
     /**
@@ -223,27 +115,6 @@ public class StrategyUpgrades {
         return rows.isEmpty() ? null : rows.get(0).key;
     }
 
-    /**
-     * Flags-aware variant of pickTightestSpreadStrike.
-     * - Returns first candidate if spread ranking is OFF.
-     * - Returns null when strategy is OFF (e.g., kill switches).
-     * - If spread cap is disabled, ignores maxSpreadPctCap argument.
-     */
-    public static String pickTightestSpreadStrike(
-            List<String> candidateInstrumentKeys,
-            QuoteProvider quoteProvider,
-            BigDecimal maxSpreadPctCap,
-            FlagsService flags
-    ) {
-        if (!strategyOn(flags)) return null;
-        if (!spreadRankOn(flags)) {
-            // simple fallback: first viable candidate
-            return (candidateInstrumentKeys == null || candidateInstrumentKeys.isEmpty()) ? null : candidateInstrumentKeys.get(0);
-        }
-        BigDecimal cap = (spreadCapEnforced(flags) ? maxSpreadPctCap : null);
-        return pickTightestSpreadStrike(candidateInstrumentKeys, quoteProvider, cap);
-    }
-
     private static BigDecimal nz(BigDecimal v) {
         return v == null ? BigDecimal.ZERO : v;
     }
@@ -263,32 +134,6 @@ public class StrategyUpgrades {
         boolean adxRising = adxNow.compareTo(adxPrev) > 0;
         boolean priceAboveVwap = ltp.compareTo(dayVwap) > 0;
         return adxRising && priceAboveVwap;
-    }
-
-    /**
-     * Flags-aware trailing gate:
-     * - If trail guard is OFF, always returns false (no trailing).
-     * - You can weaken conditions via STRAT_REQUIRE_ADX_RISING / STRAT_REQUIRE_PRICE_ABOVE_VWAP flags.
-     */
-    public static boolean shouldActivateTrailing(
-            BigDecimal adxPrev, BigDecimal adxNow,
-            BigDecimal ltp, BigDecimal dayVwap,
-            FlagsService flags
-    ) {
-        if (!trailGuardOn(flags) || !strategyOn(flags)) return false;
-
-        boolean okAdx = true;
-        boolean okVwap = true;
-
-        if (requireAdxRising(flags)) {
-            okAdx = (adxPrev != null && adxNow != null && adxNow.compareTo(adxPrev) > 0);
-        }
-        if (requirePriceAboveVwap(flags)) {
-            okVwap = (ltp != null && dayVwap != null && ltp.compareTo(dayVwap) > 0);
-        }
-        if (adxPrev == null || adxNow == null || ltp == null || dayVwap == null) return false;
-
-        return okAdx && okVwap;
     }
 
     /**
@@ -333,48 +178,6 @@ public class StrategyUpgrades {
         return plan;
     }
 
-
-    /* =========================================================
-     *  #7 Trailing guard — ADX rising AND price > Day VWAP
-     * ========================================================= */
-
-    /**
-     * Flags-aware recomputeTrailing – delegates to the regular method when guard is ON.
-     * If trail guard is OFF, returns the plan unchanged.
-     */
-    public static ExitPlan recomputeTrailing(
-            ExitPlan plan,
-            BigDecimal entryPrice,
-            BigDecimal ltp,
-            BigDecimal adxPrev,
-            BigDecimal adxNow,
-            BigDecimal dayVwap,
-            BigDecimal trailTriggerPct,
-            BigDecimal trailStepPct,
-            FlagsService flags
-    ) {
-        if (!trailGuardOn(flags) || !strategyOn(flags)) {
-            return plan;
-        }
-        // When sub-conditions are relaxed, we still call the core method but we feed it
-        // adjusted parameters to emulate the loosened checks.
-        BigDecimal useAdxPrev = adxPrev;
-        BigDecimal useAdxNow = adxNow;
-        BigDecimal useVwap = dayVwap;
-
-        // If ADX rising is not required, feed equal values so the check passes.
-        if (!requireAdxRising(flags) && adxNow != null) {
-            useAdxPrev = adxNow.subtract(new BigDecimal("0.000001"));
-        }
-        // If price>VWAP is not required, set VWAP slightly below LTP to satisfy the gate.
-        if (!requirePriceAboveVwap(flags) && ltp != null) {
-            useVwap = ltp.multiply(new BigDecimal("0.999999"));
-        }
-
-        return recomputeTrailing(
-                plan, entryPrice, ltp, useAdxPrev, useAdxNow, useVwap, trailTriggerPct, trailStepPct
-        );
-    }
 
     public static Decision none() {
         return new Decision(Side.NONE, null);
@@ -473,26 +276,6 @@ public class StrategyUpgrades {
             closeTrade(out, open, last.openTime(), last.close());
         }
         return out;
-    }
-
-    /**
-     * Flags-aware backtest runner. Returns empty result if backtesting is disabled.
-     */
-    public static BacktestResult runBacktest(
-            List<? extends CandleView> candles,
-            IndicatorProvider indicators,
-            DecideFn decideFn,
-            BigDecimal slPct,
-            BigDecimal tpPct,
-            Duration timeStop,
-            BigDecimal trailTriggerPct,
-            BigDecimal trailStepPct,
-            FlagsService flags
-    ) {
-        if (!backtestOn(flags)) {
-            return new BacktestResult();
-        }
-        return runBacktest(candles, indicators, decideFn, slPct, tpPct, timeStop, trailTriggerPct, trailStepPct);
     }
 
     private static Instant prevTs(List<? extends CandleView> candles, int i) {
@@ -614,4 +397,65 @@ public class StrategyUpgrades {
         public BigDecimal pnlSum = BigDecimal.ZERO;
         public int wins = 0, losses = 0;
     }
+
+    // =========================================================
+    // Kafkaesque-friendly helpers (no direct Kafka coupling)
+    // =========================================================
+
+    /**
+     * Build a uniform kafkaesque envelope for Strategy events.
+     * - Adds ts (epoch), ts_iso (ISO-8601), event, source, and optional data.
+     * - Java 8 only, no reflection.
+     */
+    public static JsonObject buildKafkaesqueEvent(String event, String source, JsonObject data) {
+        java.time.Instant now = java.time.Instant.now();
+        JsonObject o = new JsonObject();
+        o.addProperty("ts", now.toEpochMilli());
+        o.addProperty("ts_iso", now.toString());
+        o.addProperty("event", event == null ? "strategy.unknown" : event);
+        o.addProperty("source", source == null || source.trim().isEmpty() ? "strategy" : source);
+        if (data != null) o.add("data", data);
+        return o;
+    }
+
+    /**
+     * Shortcut with source defaulted to "strategy".
+     */
+    public static JsonObject buildStrategyEvent(String event, JsonObject data) {
+        return buildKafkaesqueEvent(event, "strategy", data);
+    }
+
+    /**
+     * String variants (useful for bus.publish(topic, key, json)).
+     */
+    public static String buildKafkaesqueEventString(String event, String source, JsonObject data) {
+        return buildKafkaesqueEvent(event, source, data).toString();
+    }
+
+    public static String buildStrategyEventString(String event, JsonObject data) {
+        return buildKafkaesqueEvent(event, "strategy", data).toString();
+    }
+
+    /**
+     * Convenience data builders for common upgrade actions (optional).
+     */
+    public static JsonObject dataPickSpread(String symbol, String expiry, double bestStrike, double spreadPct, int candidates) {
+        JsonObject d = new JsonObject();
+        if (symbol != null) d.addProperty("symbol", symbol);
+        if (expiry != null) d.addProperty("expiry", expiry);
+        d.addProperty("bestStrike", bestStrike);
+        d.addProperty("spreadPct", spreadPct);
+        d.addProperty("candidates", candidates);
+        return d;
+    }
+
+    public static JsonObject dataTrailingDecision(boolean activate, BigDecimal adxPrev, BigDecimal adxNow, boolean aboveVwap) {
+        JsonObject d = new JsonObject();
+        d.addProperty("activate", activate);
+        if (adxPrev != null) d.addProperty("adxPrev", adxPrev);
+        if (adxNow != null) d.addProperty("adxNow", adxNow);
+        d.addProperty("aboveVwap", aboveVwap);
+        return d;
+    }
+
 }

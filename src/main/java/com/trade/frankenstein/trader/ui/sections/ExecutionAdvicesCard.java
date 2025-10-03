@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.ui.sections;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.ui.bridge.ApiClient;
@@ -32,7 +34,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 
 import static com.trade.frankenstein.trader.ui.bridge.ApiClient.post;
 
@@ -349,6 +354,9 @@ public class ExecutionAdvicesCard extends CardSection {
         })).setHeader(createStyledHeader("Actions")).setAutoWidth(true);
 
         grid.sort(Collections.singletonList(new GridSortOrder<>(timeCol, SortDirection.DESCENDING)));
+        grid.addColumn(a -> safePercent(a, "conf")).setHeader("Conf %").setAutoWidth(true);
+        grid.addColumn(a -> safePercent(a, "tech")).setHeader("Tech %").setAutoWidth(true);
+        grid.addColumn(a -> safePercent(a, "news")).setHeader("News %").setAutoWidth(true);
 
         VerticalLayout mainContent = new VerticalLayout(header, filters, grid);
         mainContent.setPadding(false);
@@ -531,10 +539,28 @@ public class ExecutionAdvicesCard extends CardSection {
         genChip.getElement().getThemeList().add(active ? "success" : "error");
     }
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private void safeRefreshList() {
         try {
-            Advice[] arr = ApiClient.get("/api/advice", Advice[].class);
-            if (arr != null) setData(Arrays.asList(arr));
+            JsonNode root = ApiClient.get("/api/advice/list", JsonNode.class); // or "/api/advices"
+            if (root != null) {
+                JsonNode arr = root.isArray()
+                        ? root
+                        : (root.has("data") && root.get("data").isArray() ? root.get("data") : null);
+
+                if (arr != null) {
+                    // Convert the JSON array into List<Advice>
+                    java.util.List<Advice> list = MAPPER.convertValue(
+                            arr, new TypeReference<List<Advice>>() {
+                            }
+                    );
+                    setData(list != null ? list : java.util.Collections.emptyList());
+                    return;
+                }
+            }
+            // If we reached here, the payload wasn’t the expected array
+            showLoadingError();
         } catch (Throwable ignored) {
             showLoadingError();
         }
@@ -597,5 +623,23 @@ public class ExecutionAdvicesCard extends CardSection {
 
     private static boolean notBlank(String s) {
         return s != null && !s.trim().isEmpty();
+    }
+
+    // Safely render optional UI-only percentage fields that may not exist on Advice
+    private String safePercent(Object bean, String field) {
+        try {
+            JsonNode n = M.valueToTree(bean);
+            JsonNode v = n.path(field);
+            if (v.isMissingNode() || v.isNull()) return "–";
+            if (v.isNumber()) {
+                double d = v.asDouble();
+                double pct = (d <= 1.0) ? d * 100.0 : d; // 0.73 -> 73, 73 -> 73
+                return String.format(java.util.Locale.ENGLISH, "%.0f%%", pct);
+            }
+            String s = v.asText();
+            return s.endsWith("%") ? s : s + "%";
+        } catch (Throwable ignore) {
+            return "–";
+        }
     }
 }

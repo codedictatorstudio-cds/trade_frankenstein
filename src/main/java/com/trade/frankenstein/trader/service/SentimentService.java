@@ -1,5 +1,8 @@
 package com.trade.frankenstein.trader.service;
 
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventBusConfig;
+import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
@@ -43,6 +46,9 @@ public class SentimentService {
     private NewsService newsService;
     @Autowired
     private MarketSentimentSnapshotRepo sentimentRepo;
+    @Autowired(required = false)
+    private EventPublisher bus;
+
     @Autowired
     private StreamGateway stream;
 
@@ -194,6 +200,13 @@ public class SentimentService {
 
             try {
                 stream.send("sentiment.update", snap);
+                try {
+                    com.google.gson.JsonObject d = new com.google.gson.JsonObject();
+                    if (snap.getAsOf() != null) d.addProperty("asOf", snap.getAsOf().toString());
+                    d.addProperty("score", snap.getScore());
+                    audit("sentiment.update", d);
+                } catch (Throwable ignore) {
+                }
             } catch (Exception ignore) {
                 log.error("refresh(): stream send failed (non-fatal): {}", ignore);
             }
@@ -252,4 +265,20 @@ public class SentimentService {
 
     private record SentSample(Instant ts, BigDecimal score) {
     }
+
+    // Kafkaesque audit helper (optional). Emits to TOPIC_AUDIT.
+    private void audit(String event, JsonObject data) {
+        try {
+            if (bus == null) return;
+            java.time.Instant now = java.time.Instant.now();
+            JsonObject o = new JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", event);
+            o.addProperty("source", "sentiment");
+            if (data != null) o.add("data", data);
+            bus.publish(EventBusConfig.TOPIC_AUDIT, "sentiment", o.toString());
+        } catch (Throwable ignore) { /* best-effort */ }
+    }
+
 }

@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.JsonObject;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
@@ -8,7 +10,6 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
 import com.trade.frankenstein.trader.core.FastStateStore;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.upstox.api.GetMarketQuoteOHLCResponseV3;
 import com.upstox.api.MarketQuoteOHLCV3;
@@ -54,9 +55,9 @@ public class RiskService {
     @Autowired
     private FastStateStore fast;
     @Autowired
-    private FlagsService flags;
-    @Autowired
     private EventPublisher bus;
+    @Autowired
+    private ObjectMapper mapper;
 
     // =====================================================================
     // HELPERS (no reflection)
@@ -94,18 +95,6 @@ public class RiskService {
         }
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
 
-        // -1) Global kill switch — block new orders if circuit/kill is active
-        if (flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW) || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)) {
-            return Result.fail("CIRCUIT_TRIPPED", "Daily risk circuit is active");
-        }
-
-
-        // 0) Daily circuit — apply only if daily loss guard is enabled
-        if (flags.isOn(FlagName.DAILY_LOSS_GUARD) && isDailyCircuitTripped().orElse(false)) {
-            return Result.fail("CIRCUIT_TRIPPED", "Daily risk circuit is active");
-        }
-
-
         // 1) Basic symbol blacklist — match by instrument token
         String instrumentKey = req.getInstrumentToken();
         if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains)) {
@@ -113,27 +102,21 @@ public class RiskService {
         }
 
         // 2) Throttle: orders/minute — apply only if flag enabled
-        if (flags.isOn(FlagName.MAX_ORDERS_PER_MIN_GUARD)) {
-            double ordPct = getOrdersPerMinutePct(); // 0..100
-            if (ordPct >= 100.0) {
-                return Result.fail("THROTTLED", "Orders per minute throttle reached");
-            }
+        double ordPct = getOrdersPerMinutePct(); // 0..100
+        if (ordPct >= 100.0) {
+            return Result.fail("THROTTLED", "Orders per minute throttle reached");
         }
 
         // 3) SL cool-down — apply only if flag enabled
-        if (flags.isOn(FlagName.SL_COOLDOWN_ENABLED) && instrumentKey != null) {
-            int mins = getMinutesSinceLastSl(instrumentKey);
-            if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES) {
-                return Result.fail("SL_COOLDOWN", "Wait " + (BotConsts.Risk.SL_COOLDOWN_MINUTES - mins) + "m after last SL");
-            }
+        int mins = getMinutesSinceLastSl(instrumentKey);
+        if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES) {
+            return Result.fail("SL_COOLDOWN", "Wait " + (BotConsts.Risk.SL_COOLDOWN_MINUTES - mins) + "m after last SL");
         }
 
         // 4) Disable re-entry after 2 SL — apply only if flag enabled
-        if (flags.isOn(FlagName.DISABLE_REENTRY_AFTER_2_SL) && instrumentKey != null) {
-            int rsToday = getRestrikesToday(instrumentKey);
-            if (rsToday >= 2) {
-                return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
-            }
+        int rsToday = getRestrikesToday(instrumentKey);
+        if (rsToday >= 2) {
+            return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
         }
 
         // 5) Market hygiene: live 1m bar roughness as slippage proxy
@@ -153,16 +136,14 @@ public class RiskService {
         }
 
         // 6) Daily loss guard — apply only if flag enabled
-        if (flags.isOn(FlagName.DAILY_LOSS_GUARD)) {
-            try {
-                double lossNow = currentLossRupees(); // positive if losing
-                double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
-                if (cap > 0.0 && lossNow >= cap - 1e-6) {
-                    return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
-                }
-            } catch (Exception t) {
-                log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
+        try {
+            double lossNow = currentLossRupees(); // positive if losing
+            double cap = RiskConstants.DAILY_LOSS_CAP.doubleValue();
+            if (cap > 0.0 && lossNow >= cap - 1e-6) {
+                return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
             }
+        } catch (Exception t) {
+            log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
         }
 
         return Result.ok(null);
@@ -185,7 +166,8 @@ public class RiskService {
             evictOlderThan(now.minusSeconds(60));
         }
         try {
-            stream.publishRisk("summary", buildSnapshot());
+            JsonNode n = mapper.valueToTree(buildSnapshot());
+            stream.publishRisk("summary", n.toPrettyString());
         } catch (Exception ignored) {
         }
         try {
@@ -210,7 +192,8 @@ public class RiskService {
         try {
             RiskSnapshot snap = buildSnapshot();
             try {
-                stream.publishRisk("summary", snap);
+                JsonNode n = mapper.valueToTree(snap);
+                stream.publishRisk("summary", n.toPrettyString());
             } catch (Exception ignored) {
                 log.error("stream.send failed", ignored);
             }
@@ -243,7 +226,7 @@ public class RiskService {
             // Auto-trip circuit if needed (drives KILL_SWITCH_OPEN_NEW)
             if (isDailyCircuitTripped().orElse(false)) {
                 try {
-                    stream.publishRisk("circuit", true);
+                    stream.publishRisk("circuit", Boolean.TRUE.toString());
                 } catch (Exception ignored) {
                 }
                 publishCircuitState(true, "pnl-refresh");
@@ -260,7 +243,7 @@ public class RiskService {
         }
         boolean tripped = isDailyCircuitTripped().orElse(false);
         try {
-            stream.publishRisk("circuit", tripped);
+            stream.publishRisk("circuit", Boolean.valueOf(tripped).toString());
         } catch (Exception ignored) {
         }
         return Result.ok(tripped);
@@ -454,7 +437,7 @@ public class RiskService {
             double budgetPctLeft = (cap > 0.0) ? (budgetLeft * 100.0 / cap) : 100.0;
 
             double ordPct = getOrdersPerMinutePct(); // 0..100
-            boolean throttleOk = !flags.isOn(FlagName.MAX_ORDERS_PER_MIN_GUARD) || ordPct < 100.0;
+            boolean throttleOk = ordPct < 100.0;
 
             return budgetPctLeft >= Math.max(0.0, minBudgetPct) && throttleOk && !isDailyCircuitTripped().orElse(false);
         } catch (Exception e) {
@@ -491,13 +474,20 @@ public class RiskService {
         try {
             // SSE (UI)
             try {
-                stream.publishRisk(subTopic, snap);
-            } catch (Throwable ignored) { /* best-effort SSE */ }
+                JsonNode n = mapper.valueToTree(snap);
+                stream.publishRisk(subTopic, n.toPrettyString());
+            } catch (Throwable ignored) { /* -effort SSE */ }
 
             // Kafka (internal bus)
             try {
                 final JsonObject o = new JsonObject();
                 o.addProperty("ts", java.time.Instant.now().toEpochMilli());
+                o.addProperty("ts_iso", java.time.Instant.now().toString());
+                o.addProperty("event", "risk.circuit");
+                o.addProperty("source", "risk");
+                o.addProperty("ts_iso", java.time.Instant.now().toString());
+                o.addProperty("event", "risk.summary");
+                o.addProperty("source", "risk");
                 if (reason != null && reason.length() > 0) o.addProperty("reason", reason);
                 o.addProperty("subTopic", subTopic == null ? "summary" : subTopic);
                 if (snap != null) {
@@ -517,7 +507,7 @@ public class RiskService {
         try {
             // SSE (UI)
             try {
-                stream.publishRisk("circuit", tripped);
+                stream.publishRisk("circuit", Boolean.valueOf(tripped).toString());
             } catch (Throwable ignored) { /* best-effort SSE */ }
 
             // Kafka (internal bus)

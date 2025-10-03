@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
@@ -56,6 +58,9 @@ public class MarketDataService {
     private CandleRepo candleRepo;
     @Autowired
     private EventPublisher bus;
+    @Autowired
+    private ObjectMapper mapper;
+
     private volatile Instant lastRegimeFlip = Instant.EPOCH; // hourly flip tracker
 
     // ================= LTP with 2s cache + local tick persistence =================
@@ -351,7 +356,8 @@ public class MarketDataService {
             if (z15.isPresent()) payload.put("z15", z15.get());
             if (z60.isPresent()) payload.put("z60", z60.get());
 
-            stream.publish("signals.regime", "signals", payload);
+            JsonNode node = mapper.valueToTree(payload);
+            stream.publishTicks("signals.regime", node.toPrettyString());
         } catch (Exception t) {
             log.error("broadcastSignalsTick failed: {}", t.toString());
         }
@@ -415,13 +421,20 @@ public class MarketDataService {
         tickRepo.save(t);
 // Step-10: publish lightweight tick to Kafka (non-blocking; ignore errors)
         try {
+            java.time.Instant now = java.time.Instant.now();
             String key = symbol;
-            String json = "{\"symbol\":\"" + symbol + "\",\"ts\":" + ts.toEpochMilli() + ",\"ltp\":" + ltp + ",\"qty\":" + (qty == null ? 0 : qty) + "}";
-            bus.publish(EventBusConfig.TOPIC_TICKS, key, json);
+            com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", "tick.ltp");
+            o.addProperty("source", "marketdata");
+            if (symbol != null) o.addProperty("symbol", symbol);
+            o.addProperty("ltp", ltp);
+            o.addProperty("qty", qty == null ? 0 : qty);
+            bus.publish(EventBusConfig.TOPIC_TICKS, key, o.toString());
         } catch (Throwable e) {
             log.debug("tick publish skipped: {}", e.toString());
         }
-
     }
 
     /**

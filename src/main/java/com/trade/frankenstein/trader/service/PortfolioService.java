@@ -1,16 +1,16 @@
 package com.trade.frankenstein.trader.service;
 
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.core.FastStateStore;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.upstox.api.GetHoldingsResponse;
 import com.upstox.api.GetPositionResponse;
 import com.upstox.api.MarketQuoteOptionGreekV3;
 import com.upstox.api.PositionData;
 import lombok.AllArgsConstructor;
 import lombok.Data;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -29,16 +29,16 @@ import java.util.Optional;
  * - All methods require user login (AuthCodeHolder guard)
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class PortfolioService {
 
-
-    private final FlagsService flags;
-    private final OptionChainService optionChain;
-    private final UpstoxService upstox;
-
-    @Autowired(required = false)
+    @Autowired
+    private EventPublisher bus;
+    @Autowired
+    private OptionChainService optionChain;
+    @Autowired
+    private UpstoxService upstox;
+    @Autowired
     private FastStateStore fast; // Optional: present in most deployments
 
     // ---------------------------------------------------------------------
@@ -115,6 +115,12 @@ public class PortfolioService {
             }
             if (h == null || h.getData() == null) {
                 return Result.fail("NOT_FOUND", "No live holdings data");
+            }
+            try {
+                com.google.gson.JsonObject d = new com.google.gson.JsonObject();
+                d.addProperty("count", (h) == null || (h).getData() == null ? 0 : (h).getData().size());
+                audit("portfolio.holdings", d);
+            } catch (Throwable ignore) {
             }
             return Result.ok(h);
         } catch (Exception t) {
@@ -211,6 +217,18 @@ public class PortfolioService {
             );
 
             writeSummaryCache(summary);
+            try {
+                JsonObject d = new JsonObject();
+                d.addProperty("invested", summary.getTotalInvested().doubleValue());
+                d.addProperty("current", summary.getCurrentValue().doubleValue());
+                d.addProperty("totalPnlAbs", summary.getTotalPnlPct().doubleValue());
+                d.addProperty("totalPnlPct", summary.getTotalPnlPct().doubleValue());
+                d.addProperty("dayPnlAbs", summary.getDayPnl().doubleValue());
+                d.addProperty("dayPnlPct", summary.getDayPnlPct().doubleValue());
+                d.addProperty("lines", summary.getPositionsCount());
+                audit("portfolio.summary", d);
+            } catch (Throwable ignore) {
+            }
             return Result.ok(summary);
         } catch (Exception t) {
             log.error("getPortfolioSummary failed", t);
@@ -358,9 +376,6 @@ public class PortfolioService {
     public Result<BigDecimal> getDeltaGapForUnderlying(String underlyingKey) {
         if (!isLoggedIn()) return Result.fail("user-not-logged-in");
         try {
-            if (flags == null || !flags.isOn(FlagName.DELTA_TARGET_HEDGE)) {
-                return Result.fail("DISABLED", "Delta-target hedge flag is OFF");
-            }
             Result<BigDecimal> nd = getNetDeltaForUnderlying(underlyingKey);
             if (nd == null || !nd.isOk()) return nd;
             // Target is 0 (delta-neutral). Gap == net delta.
@@ -568,5 +583,20 @@ public class PortfolioService {
         private BigDecimal netGamma;
         private BigDecimal netTheta;
         private BigDecimal netVega;
+    }
+
+    // Kafkaesque audit helper (optional)
+    private void audit(String event, com.google.gson.JsonObject data) {
+        try {
+            if (bus == null) return;
+            java.time.Instant now = java.time.Instant.now();
+            com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", event);
+            o.addProperty("source", "portfolio");
+            if (data != null) o.add("data", data);
+            bus.publish(com.trade.frankenstein.trader.bus.EventBusConfig.TOPIC_AUDIT, "portfolio", o.toString());
+        } catch (Throwable ignore) { /* best-effort */ }
     }
 }

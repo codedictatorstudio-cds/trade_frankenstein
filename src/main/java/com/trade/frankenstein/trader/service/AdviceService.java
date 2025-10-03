@@ -7,7 +7,6 @@ import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
 import com.upstox.api.PlaceOrderRequest;
@@ -34,8 +33,6 @@ public class AdviceService {
     private OrdersService ordersService;     // risk checks + Upstox call
     @Autowired
     private FastStateStore fast;             // Step-3: fast guards/dedupe
-    @Autowired
-    private FlagsService flags;              // Step-9: entry gates
     @Autowired
     private EventPublisher eventPublisher; // Step-10: Kafka publish
 
@@ -146,15 +143,6 @@ public class AdviceService {
 
             // Hard entry gates only for BUY (allow SELL exits)
             String side = String.valueOf(a.getTransaction_type());
-            if ("BUY".equalsIgnoreCase(side)) {
-                if (flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
-                        || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
-                        || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
-                        || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
-                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF)) {
-                    return Result.fail("ENTRY_BLOCKED", "Entry blocked by risk/time window flags");
-                }
-            }
 
             PlaceOrderRequest req = buildUpstoxRequest(a);
             Result<PlaceOrderResponse> r = ordersService.placeOrder(req);
@@ -241,9 +229,6 @@ public class AdviceService {
             throw new IllegalStateException("quantity must be > 0 on Advice");
     }
 
-    // NEW: Step-10 helper placed near the bottom of the class
-// ------------------------------------------------------
-
     /**
      * Step-10: Publish to Kafka "advice" topic (only when AdviceService is the source).
      * Emits compact JSON using JsonObject (no StringBuilder).
@@ -252,8 +237,11 @@ public class AdviceService {
         try {
             if (a == null) return;
 
+            java.time.Instant now = java.time.Instant.now();
+
             JsonObject o = new JsonObject();
-            o.addProperty("ts", java.time.Instant.now().toEpochMilli());
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString()); // <— add ISO for consistency
             o.addProperty("event", event);
             o.addProperty("source", "advice");
 
@@ -261,8 +249,7 @@ public class AdviceService {
             if (a.getSymbol() != null) o.addProperty("symbol", a.getSymbol());
             if (a.getInstrument_token() != null) o.addProperty("instrument_token", a.getInstrument_token());
             if (a.getOrder_type() != null) o.addProperty("order_type", a.getOrder_type());
-            if (a.getTransaction_type() != null)
-                o.addProperty("transaction_type", a.getTransaction_type());
+            if (a.getTransaction_type() != null) o.addProperty("transaction_type", a.getTransaction_type());
             o.addProperty("quantity", a.getQuantity());
             if (a.getProduct() != null) o.addProperty("product", a.getProduct());
             if (a.getValidity() != null) o.addProperty("validity", a.getValidity());
@@ -270,16 +257,22 @@ public class AdviceService {
             if (a.getTrigger_price() != null) o.addProperty("trigger_price", a.getTrigger_price());
             if (a.getStatus() != null) o.addProperty("status", a.getStatus().name());
 
-            // Key preference: symbol -> instrument_token -> id
-            String key = a.getSymbol();
-            if (key == null || key.trim().isEmpty()) key = a.getInstrument_token();
-            if ((key == null || key.trim().isEmpty()) && a.getId() != null) key = a.getId();
-
+            // Key preference: symbol -> instrument_token -> id; fall back to null (Kafka will accept)
+            String key = firstNonBlank(a.getSymbol(),
+                    a.getInstrument_token(),
+                    a.getId());
             if (eventPublisher != null) {
-                eventPublisher.publish(EventBusConfig.TOPIC_ADVICE, key, o.toString());
+                eventPublisher.publish(EventBusConfig.TOPIC_ADVICE,
+                        isBlank(key) ? null : key, o.toString());
             }
-        } catch (Throwable t) {
-            // best-effort, never break advice flow
+        } catch (Throwable ignore) { /* best-effort */ }
+    }
+
+    private static String firstNonBlank(String... v) {
+        if (v == null) return null;
+        for (String s : v) {
+            if (s != null && !s.trim().isEmpty()) return s;
         }
+        return null;
     }
 }

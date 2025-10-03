@@ -1,0 +1,176 @@
+/* ==========================================================================
+   TradeFrankenstein — Premium AppHeader Theme
+   Scope: global (imported via @CssImport)
+   ========================================================================== */
+
+/* ---------- Simplified color tokens ---------- */
+:root {
+  /* Premium header colors */
+  --tf-premium-bg: var(--tf-brand);
+  --tf-premium-surface: rgba(255, 255, 255, 0.1);
+  --tf-premium-text: #ffffff;
+  --tf-premium-text-muted: rgba(255, 255, 255, 0.7);
+
+  /* Status colors */
+  --tf-premium-ok: #22c55e;
+  --tf-premium-warn: #f59e0b;
+  --tf-premium-bad: #ef4444;
+
+  /* Simple shadows */
+  --tf-premium-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+
+/* Light scheme overrides */
+:root[theme~="light"] {
+  --tf-premium-bg: var(--tf-brand);
+  --tf-premium-surface: rgba(255, 255, 255, 0.2);
+  --tf-premium-text: #ffffff;
+  --tf-premium-text-muted: rgba(255, 255, 255, 0.8);
+}
+
+/* ---------- Premium header container ---------- */
+.tf-premium-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  height: 60px;
+  width: 100%;
+  background: var(--tf-premium-bg);
+  color: var(--tf-premium-text);
+  box-shadow: var(--tf-premium-shadow);
+  box-sizing: border-box;
+  z-index: 100;
+}
+
+/* Left (brand) + right (chips) zones */
+.tf-premium-header__left,
+.tf-premium-header__right {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.tf-premium-header__left {
+  gap: 16px;
+}
+
+.tf-premium-header__right {
+  gap: 12px;
+  margin-left: auto;
+}
+
+/* Brand elements */
+.tf-premium-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 18px;
+}
+
+.tf-premium-brand__logo {
+  height: 28px;
+  width: auto;
+}
+
+/* Status chips */
+.tf-premium-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--tf-premium-surface);
+  color: var(--tf-premium-text);
+  white-space: nowrap;
+}
+
+/* Status variants */
+.tf-premium-chip.ok {
+  background: var(--tf-premium-ok);
+  color: white;
+}
+
+.tf-premium-chip.warn {
+  background: var(--tf-premium-warn);
+  color: white;
+}
+
+.tf-premium-chip.bad {
+  background: var(--tf-premium-bad);
+  color: white;
+}
+
+.tf-premium-chip.muted {
+  background: var(--tf-premium-surface);
+  color: var(--tf-premium-text-muted);
+}
+
+/* Header buttons */
+.tf-premium-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  padding: 0 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  background: var(--tf-premium-surface);
+  color: var(--tf-premium-text);
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.tf-premium-button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Dropdown menu in header */
+.tf-premium-dropdown {
+  position: relative;
+}
+
+.tf-premium-dropdown-content {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 180px;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  z-index: 1000;
+  overflow: hidden;
+}
+
+.tf-premium-dropdown-item {
+  display: block;
+  padding: 10px 16px;
+  color: var(--tf-text);
+  text-decoration: none;
+}
+
+.tf-premium-dropdown-item:hover {
+  background: var(--tf-bg);
+}
+
+/* Simple mobile adjustments */
+@media (max-width: 768px) {
+  .tf-premium-header {
+    padding: 0 12px;
+  }
+
+  .tf-premium-chip {
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .tf-premium-header__right {
+    gap: 8px;
+  }
+}

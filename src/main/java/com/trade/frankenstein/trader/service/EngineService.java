@@ -1,14 +1,14 @@
 package com.trade.frankenstein.trader.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.JsonObject;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
-import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
@@ -22,7 +22,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.time.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +50,7 @@ public class EngineService {
     private final Map<String, ExitPlan> exitPlans = new ConcurrentHashMap<>(); // key = instrument_key
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong ticks = new AtomicLong(0);
+
     @Autowired
     private StreamGateway stream;
     @Autowired
@@ -74,7 +78,8 @@ public class EngineService {
     @Autowired
     private EventPublisher bus;
     @Autowired
-    private FlagsService flags;
+    private ObjectMapper mapper;
+
     private int maxExecPerTick = 3;
     private int scanLimit = 50;
     /**
@@ -101,34 +106,6 @@ public class EngineService {
     private volatile Integer lastDirScoreForRestrike = null;
     private volatile AtrBand lastAtrBandForRestrike = null;
 
-    private static String safe(String s) {
-        if (s == null) return "—";
-        String t = s.trim();
-        return t.isEmpty() ? "—" : t;
-    }
-
-    private static int safeInt(String s, int dflt) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Exception e) {
-            return dflt;
-        }
-    }
-
-    private static float round2(float v) {
-        return Math.round(v * 100f) / 100f;
-    }
-
-    private static int nzi(Integer v) {
-        return v == null ? 0 : v;
-    }
-
-    private static String nullSafe(String s) {
-        return (s == null || s.trim().isEmpty()) ? "—" : s.trim();
-    }
-
-    // ---------------- Helpers ----------------
-
     private static void appendReason(StringBuilder sb, String part) {
         if (sb.length() > 0) sb.append("; ");
         sb.append(part);
@@ -142,10 +119,6 @@ public class EngineService {
         int up = down + step;
         // closest multiple; if tie, bias to down
         return (rounded - down) <= (up - rounded) ? down : up;
-    }
-
-    private static Float toFloat(java.math.BigDecimal v) {
-        return v == null ? null : v.floatValue();
     }
 
     // ---------------- Lifecycle ----------------
@@ -211,9 +184,6 @@ public class EngineService {
         lastError = null;
 
         // -------- Evaluate flags (auto policy) --------
-        FlagsService.Inputs in = new FlagsService.Inputs();
-        in.now = LocalDateTime.now(ZoneId.of("Asia/Kolkata"));
-
         RiskSnapshot rs = null;
         try {
             Result<RiskSnapshot> res = riskService.getSummary();
@@ -221,15 +191,11 @@ public class EngineService {
         } catch (Exception ignore) {
         }
 
-        // Risk-derived inputs
-        in.circuitTripped = isCircuitLikeTripped(rs);
-        in.dailyLossPct = (rs != null && rs.getDailyLossPct() != null) ? rs.getDailyLossPct() : 0.0;
 
         if (rs != null && rs.getOrdersPerMinPct() != null) {
             double load = rs.getOrdersPerMinPct() / 100.0;
             if (load < 0.0) load = 0.0;
             if (load > 1.0) load = 1.0;
-            in.ordersPerMinLoad = load;
         }
 
         // Headroom: budget left, lots cap, throttle, daily loss
@@ -241,14 +207,12 @@ public class EngineService {
             Double ordPct = rs.getOrdersPerMinPct();
             headroom = (budgetLeft == null || budgetLeft > 0.0)
                     && (cap == null || used == null || used < cap)
-                    && (ordPct == null || ordPct < 100.0)
-                    && in.dailyLossPct < BotConsts.Risk.MAX_DAILY_LOSS_PCT;
+                    && (ordPct == null || ordPct < 100.0);
         }
-        in.riskHeadroomOk = headroom;
         try {
-            if (lastCircuitTripped != in.circuitTripped) {
-                auditCircuitChange(in.circuitTripped, rs);
-                lastCircuitTripped = in.circuitTripped;
+            if (lastCircuitTripped != isCircuitLikeTripped(rs)) {
+                auditCircuitChange(isCircuitLikeTripped(rs), rs);
+                lastCircuitTripped = isCircuitLikeTripped(rs);
             }
         } catch (Throwable ignore) {
         }
@@ -256,8 +220,8 @@ public class EngineService {
         try {
             EngineInputs engIn = new EngineInputs();
             engIn.setRiskHeadroomOk(headroom);
-            engIn.setMinutesSinceLastSl(in.minutesSinceLastSl);
-            engIn.setRestrikesToday(in.restrikesToday);
+            engIn.setMinutesSinceLastSl(rs.getMinutesSinceLastSl());
+            engIn.setRestrikesToday(rs.getRestrikesToday());
             Double opm = (rs != null && rs.getOrdersPerMinPct() != null) ? rs.getOrdersPerMinPct() : null;
             engIn.setOrdersPerMinPct(opm);
             try {
@@ -265,7 +229,8 @@ public class EngineService {
             } catch (Exception ignore) {
             }
             try {
-                stream.publishDecision("decision.inputs", engIn);
+                JsonNode node = mapper.valueToTree(engIn);
+                stream.publishDecision("decision.inputs", node.toPrettyString());
             } catch (Exception ignore) {
             }
         } catch (Exception ignore) {
@@ -273,78 +238,15 @@ public class EngineService {
 
 
         // Signals (safe fallbacks)
-        in.trendOk = true;
-        in.momentumConfirmed = true;
-
-        // PCR, ATR, VIX
-        in.pcr = null; // (optional) wire from OptionChainService if available
-        in.atrPct = 0.0;
         Float atrPctNow = getCurrentAtrPctSafe();
-        if (atrPctNow != null) in.atrPct = atrPctNow;
-        in.vix = null; // optional
-
-        // News & regime
-        in.majorNewsSoon = false; // optional: NewsService.hasMarketMovingNewsSoon()
-        in.intradayRangePct = 0.0; // optional: compute from day's H/L
-        in.atrJump5mPct = 0.0;     // optional: short-term ATR jump
-        // Fill ATR jump and intraday range from MarketDataService (cheap, cached)
-        try {
-            java.util.Optional<Float> jumpOpt = marketDataService.getAtrJump5mPct(underlyingKey);
-            if (jumpOpt != null && jumpOpt.isPresent()) {
-                in.atrJump5mPct = jumpOpt.get().doubleValue();
-            }
-        } catch (Exception ignore) {
-        }
-        try {
-            java.util.Optional<Float> rangeOpt = marketDataService.getIntradayRangePct(underlyingKey, "minutes", "5");
-            if (rangeOpt != null && rangeOpt.isPresent()) {
-                in.intradayRangePct = rangeOpt.get().doubleValue();
-            }
-        } catch (Exception ignore) {
-        }
-
-        in.regimeQuiet = (atrPctNow != null && atrPctNow <= BotConsts.Quiet.ATR_MAX_PCT);
+        Optional<Float> jumpOpt = marketDataService.getAtrJump5mPct(underlyingKey);
+        Optional<Float> rangeOpt = marketDataService.getIntradayRangePct(underlyingKey, "minutes", "5");
 
         // SL/Restrikes
         try {
             int mins = riskService.getMinutesSinceLastSl(Underlyings.NIFTY);
-            in.minutesSinceLastSl = (mins >= 0 ? mins : 999);
-        } catch (Exception ignored) {
-            in.minutesSinceLastSl = 999;
-        }
-        try {
             int rsToday = riskService.getRestrikesToday(Underlyings.NIFTY);
-            in.restrikesToday = Math.max(0, rsToday);
         } catch (Exception ignored) {
-            in.restrikesToday = 0;
-        }
-
-        // Mode
-        in.paperTradingMode = flags.isOn(FlagName.PAPER_TRADING_MODE);
-
-        try {
-            flags.evaluateAutoFlags(in);
-        } catch (Exception e) {
-            log.warn("tick(): evaluateAutoFlags failed: {}", e.getMessage());
-        }
-
-        final boolean blockNewEntries =
-                flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
-                        || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
-                        || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
-                        || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
-                        || flags.isOn(FlagName.LATE_ENTRY_CUTOFF)
-                        || !in.riskHeadroomOk;
-
-        try {
-            if (lastEntriesBlocked == null || lastEntriesBlocked.booleanValue() != blockNewEntries) {
-                JsonObject d = new JsonObject();
-                d.addProperty("blocked", blockNewEntries);
-                if (!headroom) d.addProperty("riskHeadroomOk", false);
-                audit(blockNewEntries ? "entries.blocked" : "entries.unblocked", d);
-                lastEntriesBlocked = Boolean.valueOf(blockNewEntries);
-            }
-        } catch (Throwable ignore) {
         }
 
         // -------- Keep risk PnL in sync --------
@@ -355,8 +257,8 @@ public class EngineService {
         }
 
         // -------- Generate new advices (only if allowed) --------
-        final boolean riskBlock = !headroom || in.circuitTripped;
-        if (!blockNewEntries && !riskBlock) {
+        final boolean riskBlock = !headroom || isCircuitLikeTripped(rs);
+        if (riskBlock) {
             try {
                 int made = strategyService.generateAdvicesNow();
                 if (made > 0) log.info("tick(): strategy generated {} advice(s)", made);
@@ -404,17 +306,9 @@ public class EngineService {
             List<Advice> pending = findPendingAdvices(scanLimit);
             log.debug("tick(): pending advices fetched={}", pending.size());
 
-            final boolean newEntriesBlockedNow = blockNewEntries;
-
             for (int i = 0; i < pending.size() && executed < maxExecPerTick; i++) {
                 Advice a = pending.get(i);
                 if (a == null) continue;
-
-                // If blocked, still allow SELL exits; skip BUY entries
-                if (newEntriesBlockedNow && "BUY".equalsIgnoreCase(a.getTransaction_type())) {
-                    log.debug("tick(): skipping BUY advice id={} due to entry block", a.getId());
-                    continue;
-                }
 
                 String id = a.getId();
                 if (id == null) continue;
@@ -725,7 +619,7 @@ public class EngineService {
             }
 
             if (triggered > 0) {
-                if (!blockNewEntries() && !riskBlock()) {
+                if (riskBlock()) {
 
                     try {
                         int made = strategyService.generateAdvicesNow();
@@ -747,26 +641,6 @@ public class EngineService {
         }
     }
 
-    /**
-     * Whether new entries should be blocked due to operational flags.
-     * Java 8 only, no reflection. Includes login guard.
-     */
-    public boolean blockNewEntries() {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info(" User not logged in");
-            return true;
-        }
-        try {
-            return flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
-                    || flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)
-                    || flags.isOn(FlagName.OPENING_5M_BLACKOUT)
-                    || flags.isOn(FlagName.NOON_PAUSE_WINDOW)
-                    || flags.isOn(FlagName.LATE_ENTRY_CUTOFF);
-        } catch (Throwable t) {
-            log.warn("blockNewEntries(): failed to evaluate flags: {}", t.toString());
-            return true;
-        }
-    }
 
     /**
      * Whether risk headroom is exhausted and we must block new entries.
@@ -876,6 +750,7 @@ public class EngineService {
         try {
             final JsonObject payload = new JsonObject();
             payload.addProperty("ts", java.time.Instant.now().toEpochMilli());
+            payload.addProperty("ts_iso", java.time.Instant.now().toString());
             payload.addProperty("source", "engine");
             payload.addProperty("event", event);
             if (data != null) payload.add("data", data);
@@ -934,7 +809,7 @@ public class EngineService {
                     reason = appendReason(reason, "orders_per_min_cap");
             }
             if (reason != null) d.addProperty("reason", reason);
-            audit(tripped ? "circuit.open" : "circuit.closed", d);
+            audit(tripped ? "engine.circuit.open" : "engine.circuit.closed", d);
         } catch (Throwable ignored) { /* no-op */ }
     }
 
@@ -973,6 +848,7 @@ public class EngineService {
         private Double ordersPerMinPct;
     }
 
+    @Data
     public static class EngineState {
         private boolean running;
         private Instant startedAt;
@@ -1004,6 +880,7 @@ public class EngineService {
         private String trend;
         private List<String> tags;
         private List<String> reasons;
+
         public EngineHeartbeat() {
         }
     }
@@ -1028,5 +905,23 @@ public class EngineService {
             this.createdAt = Instant.now();
             this.expiresAt = this.createdAt.plus(Duration.ofMinutes(Math.max(1, ttlMin)));
         }
+    }
+
+    private static String safe(String s) {
+        if (s == null) return "—";
+        String t = s.trim();
+        return t.isEmpty() ? "—" : t;
+    }
+
+    private static int safeInt(String s, int dflt) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return dflt;
+        }
+    }
+
+    private static Float toFloat(java.math.BigDecimal v) {
+        return v == null ? null : v.floatValue();
     }
 }

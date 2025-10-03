@@ -206,6 +206,12 @@
             <artifactId>kafka-clients</artifactId>
             <version>3.9.0</version> <!-- Replace with the desired version -->
         </dependency>
+
+        <!-- (Optional) Micrometer for Step 11 metrics like news.deduped -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

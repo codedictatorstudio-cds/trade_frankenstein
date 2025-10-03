@@ -10,6 +10,7 @@ public final class KafkaProducerFactory {
     private static volatile Producer<String, String> INSTANCE;
 
     public static Producer<String, String> get(Properties baseProps) {
+        baseProps = KafkaPropertiesHelper.loadProducerProps();
         if (INSTANCE == null) {
             synchronized (KafkaProducerFactory.class) {
                 if (INSTANCE == null) INSTANCE = new KafkaProducer<String, String>(baseProps);

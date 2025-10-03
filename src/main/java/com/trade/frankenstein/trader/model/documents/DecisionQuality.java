@@ -32,6 +32,7 @@ public class DecisionQuality {
     private String rr;              // e.g. "RR:1.8"
     private String slippage;        // e.g. "Low"
     private String throttle;        // e.g. "60%"
+    private String accuracy;
 
     @CreatedDate
     private Instant createdAt;
@@ -45,6 +46,7 @@ public class DecisionQuality {
         this.rr = tags.get("RR");
         this.slippage = tags.get("Slippage");
         this.throttle = tags.get("Throttle");
+        this.accuracy = tags.get("Accuracy");
         this.asOf = now;
         this.createdAt = now;
         this.updatedAt = now;

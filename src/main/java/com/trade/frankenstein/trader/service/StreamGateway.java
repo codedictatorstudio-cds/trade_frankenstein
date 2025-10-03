@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
+import com.trade.frankenstein.trader.bus.KafkaPropertiesHelper;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
-import com.trade.frankenstein.trader.enums.FlagName;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -16,6 +16,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -146,7 +147,7 @@ public class StreamGateway {
      * Example topic: "advice.new" → eventName "advice".
      */
     public void send(String topic, Object payload) {
-        if (!org.springframework.util.StringUtils.hasText(topic)) return;
+        if (!StringUtils.hasText(topic)) return;
         final String eventName;
         final int dot = topic.indexOf('.');
         if (dot > 0) {
@@ -160,7 +161,7 @@ public class StreamGateway {
     // ------------------------ PUBLISH ------------------------
 
     private String normalizeTopic(String base, String subTopic) {
-        if (!org.springframework.util.StringUtils.hasText(subTopic)) return base;
+        if (!StringUtils.hasText(subTopic)) return base;
         final String t = subTopic.trim();
         if (t.startsWith(base + ".")) return t;
         return base + "." + t;
@@ -187,13 +188,24 @@ public class StreamGateway {
     }
 
 
+    public void publishAudit(String subTopic, Object payload) {
+        final String topic = normalizeTopic("audit", subTopic);
+        publish(topic, "audit", payload);
+    }
+
+    public void publishTicks(String subTopic, Object payload) {
+        final String topic = normalizeTopic("ticks", subTopic);
+        publish(topic, "ticks", payload);
+    }
+
+    public void publishOptionChain(String subTopic, Object payload) {
+        final String topic = normalizeTopic("option_chain", subTopic);
+        publish(topic, "option_chain", payload);
+    }
+
     public void publishTrade(String subTopic, Object payload) {
         final String topic = normalizeTopic("trade", subTopic);
         publish(topic, "trade", payload);
-    }
-
-    public void publishFlagsSnapshot(Map<FlagName, Boolean> flags) {
-        publish("flags", "flags.updated", flags);
     }
 
     public void publish(String topic, String eventName, Object payload) {
@@ -248,10 +260,10 @@ public class StreamGateway {
     }
 
     private void runKafkaLoop() {
-        java.util.Properties p = new java.util.Properties();
+        Properties p = KafkaPropertiesHelper.loadConsumerProps();
         try {
             // Load defaults from classpath (same file as EventPublisher)
-            java.io.InputStream in = StreamGateway.class.getResourceAsStream("/event-bus.properties");
+            InputStream in = StreamGateway.class.getResourceAsStream("/event-bus.properties");
             if (in != null) {
                 try {
                     p.load(in);
@@ -290,6 +302,10 @@ public class StreamGateway {
                 topics.add("trade");
                 topics.add("risk");
                 topics.add("decision");
+                topics.add("audit");
+                topics.add("ticks");
+                topics.add("option_chain");
+                topics.add("order");
                 consumer.subscribe(topics);
             }
 

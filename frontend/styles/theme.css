@@ -1,0 +1,248 @@
+/* ==========================================================================
+   TradeFrankenstein — Global Theme (Vaadin 24 core)
+   File: src/main/frontend/styles/theme.css
+   ========================================================================== */
+
+/* ---- Design Tokens ------------------------------------------------------ */
+:root {
+  /* Simplified Brand Colors */
+  --tf-brand:           #1a2c54;
+  --tf-accent:          #3b82f6;
+
+  /* Surface / Backgrounds */
+  --tf-bg:              #f8fafc;
+  --tf-card:            #ffffff;
+
+  /* Text */
+  --tf-text:            #1e293b;
+  --tf-text-muted:      #64748b;
+  --tf-text-inverse:    #ffffff;
+
+  /* Borders & Shadows */
+  --tf-border:          #e2e8f0;
+  --tf-shadow:          0 4px 12px rgba(15, 23, 42, 0.06);
+
+  /* Simpler Header background */
+  --tf-header-bg:       var(--tf-brand);
+
+  /* Radii & Spacing */
+  --tf-radius-md:       8px;
+  --tf-gap-sm:          8px;
+  --tf-gap-md:          16px;
+  --tf-gap-lg:          24px;
+
+  /* Typography scale */
+  --tf-font:            system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  --tf-h1:              24px;
+  --tf-h2:              18px;
+  --tf-body:            14px;
+  --tf-small:           12px;
+}
+
+/* ---- Base reset / layout ----------------------------------------------- */
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--tf-bg);
+  color: var(--tf-text);
+  font-family: var(--tf-font);
+  font-size: var(--tf-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+a { color: var(--tf-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Vaadin content root should stretch */
+:host, .v-vertical, .v-horizontal, .v-scroller {
+  width: 100%;
+}
+
+/* Simplified Card */
+.tf-card {
+  background: var(--tf-card);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  box-shadow: var(--tf-shadow);
+  padding: var(--tf-gap-md);
+}
+
+/* Utility gaps */
+.gap-sm { gap: var(--tf-gap-sm); }
+.gap-md { gap: var(--tf-gap-md); }
+.gap-lg { gap: var(--tf-gap-lg); }
+
+/* ==========================================================================
+   Premium Header (AppHeader)
+   These classes are used by AppHeader.java
+   ========================================================================== */
+
+.tf-premium-header {
+  width: 100%;
+  height: 60px;
+  background: var(--tf-header-bg);
+  position: sticky;    /* stays visible when scrolling */
+  top: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--tf-gap-md);
+}
+
+/* Ensure header content is readable on dark bg */
+.tf-premium-header,
+.tf-premium-header span,
+.tf-premium-header .tf-premium-chip {
+  color: var(--tf-text-inverse) !important;
+}
+
+/* Left side (brand) */
+.tf-premium-header__left {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+/* Right side (status rail) — consumes remaining space */
+.tf-premium-header__right {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden; /* prevents jitter on narrow viewports */
+}
+
+/* Brand */
+.tf-premium-brand {
+  font-size: var(--tf-h2);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  line-height: 1;
+  color: var(--tf-text-inverse);
+}
+.tf-premium-brand__accent {
+  font-size: var(--tf-h2);
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  line-height: 1;
+  background: linear-gradient(90deg, #71b7ff 0%, #42a5f5 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Chips */
+.tf-premium-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: var(--tf-chip);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: var(--tf-text-inverse);
+  backdrop-filter: saturate(120%) blur(6px);
+}
+
+/* Chip variants */
+.tf-premium-chip.ok    { background: rgba(34,197,94,0.18);  border-color: rgba(34,197,94,0.35); }
+.tf-premium-chip.warn  { background: rgba(250,204,21,0.20); border-color: rgba(250,204,21,0.38); }
+.tf-premium-chip.bad   { background: rgba(239,68,68,0.20);  border-color: rgba(239,68,68,0.38); }
+.tf-premium-chip.muted { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.14); }
+.tf-premium-chip.outlined {
+  background: transparent;
+  border: 1px dashed rgba(255,255,255,0.45);
+}
+
+/* Clock inside header */
+.tf-premium-clock {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.95;
+}
+
+/* Optional subtle change animation on status */
+.status-change {
+  box-shadow: 0 0 0 3px rgba(255,255,255,0.18);
+  transition: box-shadow 150ms ease;
+}
+
+/* ==========================================================================
+   Layout helpers for views so content uses full space under the header
+   ========================================================================== */
+
+.tf-page {
+  width: 100%;
+  min-height: calc(100vh - 64px); /* header height */
+  padding: 16px;
+}
+
+.tf-section {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 1200px) {
+  .tf-section.two-col {
+    grid-template-columns: 1.2fr 1fr;
+  }
+}
+
+/* ==========================================================================
+   Table & form polish (light)
+   ========================================================================== */
+
+.tf-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tf-field label {
+  color: var(--tf-text-muted);
+  font-weight: 600;
+}
+
+/* Buttons compatible with Vaadin core (if you map classes) */
+.tf-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-weight: 700;
+  border: 1px solid var(--tf-border);
+  background: #ffffff;
+  color: var(--tf-text);
+  cursor: pointer;
+  transition: transform 80ms ease, box-shadow 120ms ease;
+  box-shadow: var(--tf-shadow);
+}
+.tf-btn:active { transform: translateY(1px); }
+.tf-btn.primary {
+  background: var(--tf-accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+/* ==========================================================================
+   Misc utilities
+   ========================================================================== */
+.text-muted { color: var(--tf-text-muted) !important; }
+.text-inverse { color: var(--tf-text-inverse) !important; }
+.w-full { width: 100% !important; }
+.h-full { height: 100% !important; }
+.hidden { display: none !important; }

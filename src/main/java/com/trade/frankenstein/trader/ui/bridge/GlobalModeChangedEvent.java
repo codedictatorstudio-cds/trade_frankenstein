@@ -3,16 +3,15 @@ package com.trade.frankenstein.trader.ui.bridge;
 import com.vaadin.flow.component.ComponentEvent;
 import com.vaadin.flow.component.UI;
 
-public class GlobalModeChangedEvent extends ComponentEvent<UI> {
+public final class GlobalModeChangedEvent extends ComponentEvent<UI> {
+    private final String mode; // "sandbox" or "live"
 
-    private final boolean sandbox;
-
-    public GlobalModeChangedEvent(UI source, boolean sandbox) {
-        super(source, false);
-        this.sandbox = sandbox;
+    public GlobalModeChangedEvent(UI source, boolean fromClient, String mode) {
+        super(source, fromClient);
+        this.mode = mode == null ? "sandbox" : mode.toLowerCase();
     }
 
-    public boolean isSandbox() {
-        return sandbox;
+    public String getMode() {
+        return mode;
     }
 }

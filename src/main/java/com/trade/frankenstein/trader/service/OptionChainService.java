@@ -34,24 +34,17 @@ public class OptionChainService {
 
     private final Map<String, Map<Integer, Long>> lastCeOiByStrike = new ConcurrentHashMap<>();
     private final Map<String, Map<Integer, Long>> lastPeOiByStrike = new ConcurrentHashMap<>();
+
     @Autowired
     private UpstoxService upstox;
-    @Autowired
-    private FlagsService flags;
     @Autowired
     private FastStateStore fast;
     @Autowired
     private EventPublisher eventPublisher;
 
-    // Safe FlagName lookup by string, with default fallback
-    private static boolean is(FlagsService flags, String name, boolean defVal) {
-        try {
-            com.trade.frankenstein.trader.enums.FlagName f = com.trade.frankenstein.trader.enums.FlagName.valueOf(name);
-            return flags != null && flags.isOn(f);
-        } catch (Throwable t) {
-            return defVal;
-        }
-    }
+    // Track last delta-pick per symbol+expiry for audit diffs
+    private final ConcurrentHashMap<String, DeltaPick> lastPickByKey = new ConcurrentHashMap<>();
+
 
     private static String joinCsv(List<String> keys, int from, int to) {
         StringBuilder sb = new StringBuilder();
@@ -644,11 +637,6 @@ public class OptionChainService {
             return Result.fail("BAD_REQUEST", "params required");
         }
 
-        // Feature flag gate – if absent, defaults to ON
-        if (!is(flags, "HEDGE_DELTA_PICKER", true)) {
-            return Result.fail("DISABLED", "Delta-hedge picker disabled by flag");
-        }
-
         List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
         if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
 
@@ -658,7 +646,7 @@ public class OptionChainService {
 
         String side = optTypeCode(type); // "CE" / "PE"
         double tgt = targetAbsDelta == null ? 0.20 : Math.max(0.0, Math.min(1.0, targetAbsDelta.doubleValue()));
-        final List<Score> scored = new ArrayList<Score>();
+        final List<Score> scored = new ArrayList<>();
 
         for (InstrumentData oi : instruments) {
             if (!sideEquals(oi, side)) continue;
@@ -794,10 +782,43 @@ public class OptionChainService {
                                  DeltaPick pick,
                                  String rationale) {
         try {
+            final String lpKey = key(symbol, expiry);
+            final DeltaPick prev = lastPickByKey.get(lpKey);
+            final DeltaPick cur = pick;
+            boolean changed = false;
+            if (prev == null && cur != null) changed = true;
+            else if (prev != null && cur != null) {
+                // significant change if strike changed OR |delta diff| > 0.05 on either leg
+                boolean strikeChanged = (Double.doubleToLongBits(prev.ceStrike()) != Double.doubleToLongBits(cur.ceStrike()))
+                        || (Double.doubleToLongBits(prev.peStrike()) != Double.doubleToLongBits(cur.peStrike()));
+                double dCe = Math.abs((Double.isNaN(prev.ceDelta()) ? 0 : prev.ceDelta()) - (Double.isNaN(cur.ceDelta()) ? 0 : cur.ceDelta()));
+                double dPe = Math.abs((Double.isNaN(prev.peDelta()) ? 0 : prev.peDelta()) - (Double.isNaN(cur.peDelta()) ? 0 : cur.peDelta()));
+                boolean deltaMoved = (dCe > 0.05d) || (dPe > 0.05d);
+                changed = strikeChanged || deltaMoved;
+            }
+
             if (this.eventPublisher == null) return;
             final String key = key(symbol, expiry);
             final String json = buildDeltaPickJsonString(symbol, expiry, targetAbsDelta, pick, rationale);
-            this.eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, key, json);
+            lastPickByKey.put(lpKey, cur);
+            if (changed) {
+                com.google.gson.JsonObject d = new com.google.gson.JsonObject();
+                d.addProperty("symbol", symbol);
+                d.addProperty("expiry", expiry);
+                d.addProperty("targetAbsDelta", targetAbsDelta);
+                if (cur != null) {
+                    com.google.gson.JsonObject ce = new com.google.gson.JsonObject();
+                    ce.addProperty("strike", cur.ceStrike());
+                    ce.addProperty("delta", cur.ceDelta());
+                    com.google.gson.JsonObject pe = new com.google.gson.JsonObject();
+                    pe.addProperty("strike", cur.peStrike());
+                    pe.addProperty("delta", cur.peDelta());
+                    d.add("ce", ce);
+                    d.add("pe", pe);
+                }
+                if (rationale != null) d.addProperty("rationale", rationale);
+                audit("option_chain.pick_changed", d);
+            }
         } catch (Throwable t) {
             // non-fatal to keep existing behavior
         }
@@ -963,6 +984,55 @@ public class OptionChainService {
         public String toString() {
             return "DeltaPick{ceStrike=" + ceStrike + ", peStrike=" + peStrike +
                     ", ceDelta=" + ceDelta + ", peDelta=" + peDelta + "}";
+        }
+    }
+
+
+    // ===== Kafkaesque audit helper (optional; uses same EventPublisher) =====
+    private void audit(String event, com.google.gson.JsonObject data) {
+        try {
+            if (this.eventPublisher == null) return;
+            java.time.Instant now = java.time.Instant.now();
+            com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", event);
+            o.addProperty("source", "option_chain");
+            if (data != null) o.add("data", data);
+            this.eventPublisher.publish(EventBusConfig.TOPIC_AUDIT, "option_chain", o.toString());
+        } catch (Throwable ignore) { /* best-effort */ }
+    }
+
+
+    /**
+     * Publish a compact greeks snapshot for the current chain.
+     * Emits to TOPIC_OPTION_CHAIN with event="option_chain.greeks_snapshot".
+     * Backward compatible: does not alter existing publishers.
+     */
+    public void publishGreeksSnapshot(String symbol, String expiry, java.util.Collection<BasicOptionRow> rows) {
+        try {
+            if (this.eventPublisher == null) return;
+            final String k = key(symbol, expiry);
+            java.time.Instant now = java.time.Instant.now();
+            com.google.gson.JsonObject payload = new com.google.gson.JsonObject();
+            payload.addProperty("type", "greeks_snapshot");
+            payload.addProperty("event", "option_chain.greeks_snapshot");
+            payload.addProperty("source", "option_chain");
+            payload.addProperty("symbol", nullSafe(symbol));
+            payload.addProperty("expiry", nullSafe(expiry));
+            payload.addProperty("ts", now.toEpochMilli());
+            payload.addProperty("ts_iso", now.toString());
+            com.google.gson.JsonArray arr = new com.google.gson.JsonArray();
+            if (rows != null) {
+                for (BasicOptionRow r : rows) {
+                    if (r == null) continue;
+                    arr.add(toJson(r));
+                }
+            }
+            payload.add("rows", arr);
+            this.eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, k, payload.toString());
+        } catch (Throwable t) {
+            // non-fatal
         }
     }
 

@@ -28,17 +28,13 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
 
         // Base layout
         setSizeFull();
-        setPadding(false);
-        setSpacing(false);
+        setPadding(true);
+        setSpacing(true);
         setMargin(false);
         addClassName("view-dashboard");
 
         // ===== 1/21: App Header (sticky via CSS) =====
         AppHeader header = new AppHeader(new EngineApiClient());
-        header.setWidthFull();
-        header.setSizeFull();
-        header.setHeightFull();
-        header.addClassName("tf-header");
         add(header);
 
         // ===== 2/21: Controls bar row (full-bleed) =====
@@ -126,11 +122,18 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
         // Single SSE bridge for the whole UI
         if (sse == null) {
             sse = new SseBridge().topics(
+                    "engine.state",
+                    "engine.heartbeat",
                     "decision.quality",
-                    "risk.summary", "risk.circuit",
-                    "advice.new", "advice.updated",
-                    "trade.created", "trade.updated",
-                    "sentiment.update"
+                    "risk.summary",
+                    "risk.circuit",
+                    "order.*",
+                    "trade.*",
+                    "sentiment.update",
+                    "advice.new",
+                    "advice.updated",
+                    "trade.created",
+                    "trade.updates"
             );
             add(sse); // invisible; lives in the UI
         }
@@ -159,7 +162,7 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
         // Capture specific parameters (existing functionality)
         String code = queryParameters.getParameters().getOrDefault("code", Collections.singletonList("")).get(0);
         if (code != null && !code.isEmpty() && !code.isBlank()) {
-            System.out.println( "OAuth code received: " + code);
+            System.out.println("OAuth code received: " + code);
             AuthCodeHolder holder = AuthCodeHolder.getInstance();
             holder.set(code);
         }

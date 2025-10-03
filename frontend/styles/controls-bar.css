@@ -1,0 +1,392 @@
+:root {
+  /* Premium Brand Palette */
+  --tf-brand:            var(--lumo-primary-color, #2563EB);
+  --tf-brand-strong:     #1E40AF;
+  --tf-brand-gradient:   linear-gradient(135deg, #2563EB 0%, #1E40AF 100%);
+  --tf-success:          #10B981;
+  --tf-success-gradient: linear-gradient(135deg, #10B981 0%, #059669 100%);
+  --tf-danger:           #EF4444;
+  --tf-danger-gradient:  linear-gradient(135deg, #EF4444 0%, #DC2626 100%);
+  --tf-warning:          #F59E0B;
+  --tf-neutral:          #6B7280;
+
+  /* Premium Surfaces */
+  --tf-surface:          var(--lumo-base-color, #FFFFFF);
+  --tf-surface-elevated: rgba(255, 255, 255, 0.8);
+  --tf-surface-tint:     rgba(0,0,0,0.02);
+  --tf-border:           var(--lumo-contrast-10pct, #E5E7EB);
+  --tf-border-subtle:    var(--lumo-contrast-5pct, #F3F4F6);
+  --tf-radius-sm:        8px;
+  --tf-radius:           var(--lumo-border-radius-l, 12px);
+  --tf-radius-lg:        16px;
+  --tf-radius-xl:        20px;
+
+  /* Premium Shadows */
+  --tf-shadow-sm:        0 2px 4px rgba(0,0,0,0.06);
+  --tf-shadow:           0 4px 12px rgba(0,0,0,0.08);
+  --tf-shadow-lg:        0 8px 32px rgba(0,0,0,0.12);
+  --tf-shadow-premium:   0 20px 60px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.1);
+
+  /* Premium Transitions */
+  --tf-transition:       0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --tf-transition-slow:  0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Premium Container Styling - Optimized Horizontal Layout */
+.tf-controls-bar {
+  background: linear-gradient(135deg, var(--tf-surface) 0%, var(--tf-surface-tint) 100%);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  padding: 1.25rem 2rem;
+  gap: 2rem;
+  box-shadow: var(--tf-shadow-premium);
+  backdrop-filter: blur(10px);
+  position: relative;
+  overflow: hidden;
+  transition: var(--tf-transition);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 80px;
+}
+
+.tf-controls-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--tf-brand-gradient);
+  border-radius: var(--tf-radius-lg) var(--tf-radius-lg) 0 0;
+}
+
+.tf-controls-bar:hover {
+  box-shadow: 0 12px 48px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.1);
+  transform: translateY(-2px);
+}
+
+/* Mode-specific styling */
+.tf-controls-bar.mode-live::before {
+  background: var(--tf-danger-gradient);
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+}
+
+.tf-controls-bar.mode-sandbox::before {
+  background: var(--tf-success-gradient);
+  box-shadow: 0 0 20px rgba(16, 185, 129, 0.3);
+}
+
+/* Section Layouts */
+.mode-section {
+  flex-shrink: 0;
+  min-width: 180px;
+}
+
+.engine-controls-section {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.confidence-section {
+  flex-shrink: 0;
+  min-width: 300px;
+}
+
+/* Premium Button Group - Horizontal */
+.premium-button-group {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: nowrap;
+}
+
+.premium-button {
+  border-radius: var(--tf-radius) !important;
+  font-weight: 600 !important;
+  padding: 0.75rem 1.25rem !important;
+  transition: all var(--tf-transition) !important;
+  box-shadow: var(--tf-shadow) !important;
+  position: relative !important;
+  overflow: hidden !important;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  font-size: 0.875rem;
+  min-width: 120px;
+  white-space: nowrap;
+}
+
+.premium-button:hover {
+  transform: translateY(-2px) !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.15) !important;
+}
+
+.premium-button:active {
+  transform: translateY(0) !important;
+}
+
+.premium-button[theme~="primary success"] {
+  background: var(--tf-success-gradient) !important;
+  border: none !important;
+}
+
+.premium-button[theme~="primary error"] {
+  background: var(--tf-danger-gradient) !important;
+  border: none !important;
+}
+
+/* Premium Confidence Section Layout - Updated for Circular Meter */
+.confidence-layout {
+  display: flex !important;
+  align-items: center !important;
+  gap: 1.5rem !important;
+  background: linear-gradient(135deg, var(--lumo-contrast-5pct) 0%, rgba(255,255,255,0.1) 100%) !important;
+  padding: 1rem 1.5rem !important;
+  border-radius: 16px !important;
+  border: 1px solid var(--lumo-contrast-15pct) !important;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.1) !important;
+  backdrop-filter: blur(10px);
+  transition: all var(--tf-transition-slow);
+  position: relative;
+}
+
+.confidence-layout:hover {
+  background: linear-gradient(135deg, var(--lumo-contrast-10pct) 0%, rgba(255,255,255,0.15) 100%) !important;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.15), 0 0 20px var(--glow-color, rgba(37, 99, 235, 0.2)) !important;
+  transform: translateY(-1px);
+}
+
+/* Premium Confidence Field - Redesigned for Circular Meter */
+.premium-confidence-field {
+  --vaadin-input-field-border-radius: 8px !important;
+  --vaadin-input-field-background: transparent !important;
+  --vaadin-input-field-border-color: transparent !important;
+  --vaadin-input-field-border-width: 0px !important;
+  font-weight: 700 !important;
+  font-size: 1.25rem !important;
+  position: relative !important;
+  text-align: center !important;
+}
+
+.premium-confidence-field vaadin-integer-field::part(input-field) {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 8px;
+  transition: var(--tf-transition);
+  position: relative;
+  overflow: visible;
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.premium-confidence-field vaadin-integer-field::part(input-field) input {
+  position: absolute !important;
+  top: 50% !important;
+  left: 50% !important;
+  transform: translate(-50%, -50%) !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  text-align: center !important;
+  font-size: 1rem !important;
+  font-weight: 700 !important;
+  color: var(--lumo-contrast-90pct) !important;
+  width: 40px !important;
+  z-index: 1 !important;
+  pointer-events: none !important;
+}
+
+/* Circular Progress Ring Styling */
+.confidence-circle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 80px;
+  height: 80px;
+  z-index: 0;
+}
+
+.progress-ring {
+  transform: rotate(-90deg);
+}
+
+.progress-ring__background {
+  stroke: var(--lumo-contrast-10pct);
+  stroke-width: 3;
+  opacity: 0.3;
+}
+
+.progress-ring__progress {
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1),
+              filter 0.3s ease;
+  filter: drop-shadow(0 0 4px rgba(0,0,0,0.2));
+}
+
+.confidence-percentage {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--lumo-contrast-60pct);
+  pointer-events: none;
+  transition: color 0.3s ease;
+}
+
+/* Remove old confidence progress bar styling */
+.confidence-progress {
+  display: none !important;
+}
+
+/* Enhanced Section Layouts for Better Balance */
+.confidence-section {
+  flex-shrink: 0;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+/* Trend Container - Enhanced to work with circular meter */
+.trend-container {
+  display: flex !important;
+  align-items: center !important;
+  padding: 0.75rem 1rem !important;
+  background: linear-gradient(135deg, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0.08) 100%) !important;
+  border-radius: 14px !important;
+  border: 1px solid var(--lumo-contrast-20pct) !important;
+  backdrop-filter: blur(8px) !important;
+  transition: all var(--tf-transition-slow) !important;
+  min-width: 150px !important;
+  justify-content: center !important;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.trend-container:hover {
+  background: linear-gradient(135deg, rgba(255,255,255,0.2) 0%, rgba(255,255,255,0.12) 100%) !important;
+  border-color: var(--lumo-contrast-30pct) !important;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+  transform: translateY(-1px);
+}
+
+/* Enhanced responsive design for circular meter */
+@media (max-width: 1200px) {
+  .confidence-layout {
+    gap: 1rem !important;
+    padding: 0.75rem 1.25rem !important;
+  }
+
+  .confidence-section {
+    min-width: 280px;
+  }
+
+  .confidence-circle {
+    width: 70px;
+    height: 70px;
+  }
+
+  .progress-ring {
+    width: 70px;
+    height: 70px;
+  }
+
+  .progress-ring__background,
+  .progress-ring__progress {
+    r: 30;
+    cx: 35;
+    cy: 35;
+  }
+
+  .premium-confidence-field vaadin-integer-field::part(input-field) {
+    min-height: 70px;
+  }
+}
+
+@media (max-width: 768px) {
+  .confidence-layout {
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    text-align: center;
+  }
+
+  .trend-container {
+    min-width: 120px;
+  }
+
+  .confidence-circle {
+    width: 60px;
+    height: 60px;
+  }
+
+  .progress-ring {
+    width: 60px;
+    height: 60px;
+  }
+
+  .progress-ring__background,
+  .progress-ring__progress {
+    r: 25;
+    cx: 30;
+    cy: 30;
+    stroke-width: 2.5;
+  }
+
+  .premium-confidence-field vaadin-integer-field::part(input-field) {
+    min-height: 60px;
+  }
+
+  .confidence-percentage {
+    font-size: 0.7rem;
+  }
+}
+
+/* Enhanced animations for circular meter */
+@keyframes confidenceGlow {
+  0%, 100% {
+    filter: drop-shadow(0 0 4px rgba(0,0,0,0.2));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px currentColor);
+  }
+}
+
+.progress-ring__progress.high-confidence {
+  animation: confidenceGlow 3s ease-in-out infinite;
+}
+
+/* Focus states for circular meter */
+.premium-confidence-field:focus-within .progress-ring__progress {
+  stroke-width: 4;
+}
+
+.premium-confidence-field:focus-within .confidence-percentage {
+  color: var(--lumo-contrast-90pct);
+  font-weight: 700;
+}
+
+/* Dark mode enhancements for circular meter */
+@media (prefers-color-scheme: dark) {
+  .confidence-layout {
+    background: linear-gradient(135deg, rgba(55, 65, 81, 0.4) 0%, rgba(75, 85, 99, 0.2) 100%) !important;
+    border-color: rgba(156, 163, 175, 0.2);
+  }
+
+  .progress-ring__background {
+    stroke: rgba(156, 163, 175, 0.3);
+  }
+
+  .trend-container {
+    background: linear-gradient(135deg, rgba(75, 85, 99, 0.3) 0%, rgba(55, 65, 81, 0.2) 100%) !important;
+    border-color: rgba(156, 163, 175, 0.2);
+  }
+}

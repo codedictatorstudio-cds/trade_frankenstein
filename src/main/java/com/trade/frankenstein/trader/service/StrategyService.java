@@ -1,9 +1,12 @@
 package com.trade.frankenstein.trader.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.enums.OptionType;
 import com.trade.frankenstein.trader.model.documents.Advice;
@@ -117,8 +120,10 @@ public class StrategyService {
     private SentimentService sentimentService;
     @Autowired
     private StreamGateway stream;
+    @Autowired(required = false)
+    private EventPublisher bus;
     @Autowired
-    private FlagsService flags;
+    private ObjectMapper mapper;
 
     private static List<String> safeList(List<String> a) {
         return a == null ? Collections.emptyList() : a;
@@ -174,32 +179,20 @@ public class StrategyService {
 
     // -------------------- Public entrypoint --------------------
     public int generateAdvicesNow() {
-        // Step-9: hard gate new entries via flags
-        if (StrategyUpgrades.entriesHardBlocked(flags)
-                || StrategyUpgrades.opening5mBlackoutActive(flags)
-                || StrategyUpgrades.noonPauseActive(flags)
-                || StrategyUpgrades.lateEntryCutoffActive(flags)) {
-            Map<String, Object> dbg = new LinkedHashMap<String, Object>();
-            dbg.put("gate.flags", true);
-            return skipTick(dbg, "flags.block");
-        }
-
-
-        // Step-9: risk headroom gate — block when daily budget exhausted / throttle tripped
         try {
             if (!riskService.hasHeadroom(1.0)) { // require at least 1% budget left (and not circuit-tripped)
-                Map<String, Object> guard = new LinkedHashMap<String, Object>();
+                Map<String, Object> guard = new LinkedHashMap<>();
                 guard.put("gate.risk", true);
                 return skipTick(guard, "risk.block");
             }
         } catch (Exception e) {
-            Map<String, Object> guard = new LinkedHashMap<String, Object>();
+            Map<String, Object> guard = new LinkedHashMap<>();
             guard.put("gate.risk.error", String.valueOf(e));
             return skipTick(guard, "risk.block.error");
         }
         int created = 0;
         final long t0 = System.currentTimeMillis();
-        Map<String, Object> dbg = new LinkedHashMap<String, Object>();
+        Map<String, Object> dbg = new LinkedHashMap<>();
         log.info("Strategy execution started");
         try {
             // 1) Decision trend + reasons
@@ -226,6 +219,7 @@ public class StrategyService {
 
             // 3) Intraday candles (5m) with staleness check
             IntraDayCandleData c5 = candles(NIFTY, "minutes", "5");
+            logCandleOrder("strategy.m5", c5);
             if (isStale(c5, 6)) {
                 log.info("Strategy execution skipped - stale candle data");
                 return skipTick(dbg, "stale-candles");
@@ -235,27 +229,24 @@ public class StrategyService {
             Ind ind5 = indicators(c5, spot);
 
             // Step-9: trend/momentum filters if enabled
-            if (flags.isOn(FlagName.TREND_FILTER_EMA_ADX)) {
-                boolean adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
-                if (adxWeak) {
-                    log.info("Strategy execution stopped - ADX trend filter");
-                    return skipTick(dbg, "gate.trend.adx");
-                }
+            boolean adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
+            if (adxWeak) {
+                log.info("Strategy execution stopped - ADX trend filter");
+                return skipTick(dbg, "gate.trend.adx");
             }
-            if (StrategyUpgrades.momentumConfirmationEnabled(flags)) {
-                String eBias = emaBias(ind5);
-                if ("FLAT".equals(eBias) || "NA".equals(eBias)) {
-                    log.info("Strategy execution stopped - momentum confirmation (EMA flat)");
-                    return skipTick(dbg, "gate.momentum.emaFlat");
-                }
+            String eBias = emaBias(ind5);
+            if ("FLAT".equals(eBias) || "NA".equals(eBias)) {
+                log.info("Strategy execution stopped - momentum confirmation (EMA flat)");
+                return skipTick(dbg, "gate.momentum.emaFlat");
             }
 
             // 5) Multi-timeframe alignment
             IntraDayCandleData c15 = candles(NIFTY, "minutes", "15");
+            logCandleOrder("strategy.m15", c15);
             Ind ind15 = indicators(c15, spot);
             MarketRegime hrReg = marketDataService.getRegimeOn("minutes", "60").orElse(MarketRegime.NEUTRAL);
 
-            boolean adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
+            adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
             String effectiveTrend = adxWeak ? "NEUTRAL" : trend;
 
             boolean mtfAgree = emaBias(ind5).equals(emaBias(ind15)) && hrReg == mapToRegime(effectiveTrend);
@@ -299,10 +290,8 @@ public class StrategyService {
             Bias merged = mergeBias(mapTrendBias(effectiveTrend), emaRsiBias, pcrBias);
 
             // Step-9: if PCR_TILT flag is on and PCR is decisive, prefer it
-            if (StrategyUpgrades.pcrTiltEnabled(flags) && pcrBias != Bias.BOTH) {
-                merged = pcrBias;
-                log.info("PCR_TILT active → using PCR side: {}", merged);
-            }
+            merged = pcrBias;
+            log.info("PCR_TILT active → using PCR side: {}", merged);
 
             // Supply-pressure enforcement
             if (supplyPressureCE) {
@@ -366,17 +355,11 @@ public class StrategyService {
 
             // Respect Step-9 toggles first for BOTH bias
             if (merged == Bias.BOTH) {
-                if (StrategyUpgrades.atmStraddleQuietEnabled(flags)) {
-                    legs.clear();
-                    legs.add(new LegSpec(expiry, atm, OptionType.CALL));
-                    legs.add(new LegSpec(expiry, atm, OptionType.PUT));
-                } else if (StrategyUpgrades.stranglePmPlus1Enabled(flags)) {
-                    legs.clear();
-                    BigDecimal ce = atm.add(bd(STRIKE_STEP));
-                    BigDecimal pe = atm.subtract(bd(STRIKE_STEP));
-                    legs.add(new LegSpec(expiry, ce, OptionType.CALL));
-                    legs.add(new LegSpec(expiry, pe, OptionType.PUT));
-                }
+                legs.clear();
+                BigDecimal ce = atm.add(bd(STRIKE_STEP));
+                BigDecimal pe = atm.subtract(bd(STRIKE_STEP));
+                legs.add(new LegSpec(expiry, ce, OptionType.CALL));
+                legs.add(new LegSpec(expiry, pe, OptionType.PUT));
             }
 
             // per-side OI-Δ leaders
@@ -742,6 +725,7 @@ public class StrategyService {
             BigDecimal peDelta = curr.totalPeOi().subtract(prev.totalPeOi());
 
             IntraDayCandleData c5 = candles(NIFTY, "minutes", "5");
+            logCandleOrder("strategy.m5", c5);
             if (c5 == null || c5.getCandles().size() < 2) return null;
             double c1 = ((Number) c5.getCandles().get(c5.getCandles().size() - 2).get(4)).doubleValue();
             double c2 = ((Number) c5.getCandles().get(c5.getCandles().size() - 1).get(4)).doubleValue();
@@ -822,8 +806,9 @@ public class StrategyService {
 
             Duration timeframe = inferTimeframe(cs);
             BarSeries series = toBarSeries(cs, timeframe);
-            if (series == null || series.getBarCount() == 0
-                    || series.getBarCount() < Math.max(EMA_SLOW, Math.max(RSI_N, Math.max(ATR_N, ADX_N)))) {
+            int minBars = Math.max(EMA_SLOW, Math.max(RSI_N, Math.max(ATR_N, ADX_N)));
+            if (series == null || series.getBarCount() < minBars) {
+                out.ema20 = out.ema50 = out.rsi = out.adx = out.atr = out.atrPct = null;
                 return out;
             }
 
@@ -869,6 +854,15 @@ public class StrategyService {
             BarSeries series = new BaseBarSeriesBuilder().withName("NIFTY-" + timeframe).build();
             ZoneId zone = ZoneId.of("Asia/Kolkata");
             List<List<Object>> rows = cs.getCandles();
+            if (rows == null || rows.isEmpty()) return series;
+
+            // ---- enforce chronological order (oldest -> newest)
+            rows.sort((a, b) -> {
+                long ta = toEpochMillis(a.get(0));
+                long tb = toEpochMillis(b.get(0));
+                return Long.compare(ta, tb);
+            });
+
             for (List<Object> row : rows) {
                 if (row == null || row.size() < 6) continue;
                 long epochMs = toEpochMillis(row.get(0));
@@ -890,6 +884,32 @@ public class StrategyService {
         }
     }
 
+    // StrategyService.java
+// ...
+    private void logCandleOrder(String label, IntraDayCandleData cs) {
+        try {
+            if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 2) return;
+            long t0 = toEpochMillis(cs.getCandles().get(0).get(0));
+            long t1 = toEpochMillis(cs.getCandles().get(1).get(0));
+            if (t0 > t1) {
+                log.warn("{} candles appear NEWEST-first. Sorting to chronological.", label);
+            }
+        } catch (Throwable ignore) { /* best-effort */ }
+    }
+
+    // If you don't already have this helper here:
+    private long toEpochMillis(Object ts) {
+        if (ts instanceof Number) {
+            long v = ((Number) ts).longValue();
+            return (v > 3_000_000_000L) ? v : v * 1000L; // seconds→ms if needed
+        }
+        if (ts instanceof String s) {
+            long v = Long.parseLong(s.trim());
+            return (v > 3_000_000_000L) ? v : v * 1000L;
+        }
+        return -1L;
+    }
+
     private Duration inferTimeframe(IntraDayCandleData cs) {
         try {
             List<List<Object>> rows = cs.getCandles();
@@ -907,23 +927,6 @@ public class StrategyService {
         return Duration.ofMinutes(5);
     }
 
-    private long toEpochMillis(Object ts) {
-        try {
-            if (ts instanceof Number) {
-                long v = ((Number) ts).longValue();
-                if (v < 1_000_000_000_000L) return v * 1000L;
-                return v;
-            } else if (ts instanceof String s) {
-                if (s.length() == 0) return -1L;
-                long v = Long.parseLong(s.trim());
-                if (v < 1_000_000_000_000L) return v * 1000L;
-                return v;
-            }
-        } catch (Throwable ignore) {
-        }
-        return -1L;
-    }
-
     private IntraDayCandleData candles(String key, String unit, String interval) {
         try {
             GetIntraDayCandleResponse ic = upstoxService.getIntradayCandleData(key, unit, interval);
@@ -933,11 +936,29 @@ public class StrategyService {
         }
     }
 
+    // replace your current isStale(..)
     private boolean isStale(IntraDayCandleData cs, int maxLagMin) {
         try {
-            if (cs == null) return true;
-            long lastEpochSec = ((Number) cs.getCandles().get(cs.getCandles().size() - 1).get(0)).longValue();
-            Instant last = Instant.ofEpochSecond(lastEpochSec);
+            if (cs == null || cs.getCandles() == null || cs.getCandles().isEmpty()) return true;
+
+            long maxEpochSec = Long.MIN_VALUE;
+            for (List<Object> row : cs.getCandles()) {
+                if (row == null || row.isEmpty()) continue;
+                Object t = row.get(0);
+                long v;
+                if (t instanceof Number) {
+                    v = ((Number) t).longValue();
+                } else if (t instanceof String s) {
+                    v = Long.parseLong(s.trim());
+                } else {
+                    continue;
+                }
+                // Upstox sometimes sends seconds; sometimes millis in other contexts. Normalize to seconds.
+                if (v > 3_000_000_000L) v = v / 1000L;
+                if (v > maxEpochSec) maxEpochSec = v;
+            }
+            if (maxEpochSec <= 0L) return true;
+            Instant last = Instant.ofEpochSecond(maxEpochSec);
             return Duration.between(last, Instant.now()).toMinutes() > maxLagMin;
         } catch (Exception t) {
             return false;
@@ -1059,7 +1080,8 @@ public class StrategyService {
         p.put("msg", msg);
         p.put("ts", Instant.now());
         try {
-            stream.publishDecision("decision.debug", p);
+            JsonNode node = mapper.valueToTree(p);
+            stream.publishDecision("decision.debug", node.toPrettyString());
         } catch (Exception ignored) {
         }
     }
@@ -1186,6 +1208,15 @@ public class StrategyService {
             m.put("endOfTick", endOfTick);
             m.put("ts", Instant.now());
             stream.publish("metrics.strategy", "strategy", m);
+            try {
+                JsonObject d = new JsonObject();
+                d.addProperty("advicesCreated", advicesCreated.get());
+                d.addProperty("advicesSkipped", advicesSkipped.get());
+                d.addProperty("advicesExecuted", advicesExecuted.get());
+                d.addProperty("endOfTick", endOfTick);
+                audit("strategy.metrics", d);
+            } catch (Throwable ignore) {
+            }
         } catch (Exception ignored) {
         }
     }
@@ -1289,6 +1320,22 @@ public class StrategyService {
         String toReason() {
             return "OIΔ[CE=" + ceDelta + ", PE=" + peDelta + ", price " + (priceRising ? "↑" : priceFalling ? "↓" : "—") + "]";
         }
+    }
+
+
+    // Kafkaesque audit helper (optional). Emits to TOPIC_AUDIT.
+    private void audit(String event, com.google.gson.JsonObject data) {
+        try {
+            if (bus == null) return;
+            java.time.Instant now = java.time.Instant.now();
+            com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", event);
+            o.addProperty("source", "strategy");
+            if (data != null) o.add("data", data);
+            bus.publish(com.trade.frankenstein.trader.bus.EventBusConfig.TOPIC_AUDIT, "strategy", o.toString());
+        } catch (Throwable ignore) { /* best-effort */ }
     }
 
 }

@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
@@ -10,14 +12,20 @@ import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
 import com.trade.frankenstein.trader.core.FastStateStore;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.trade.frankenstein.trader.enums.MarketRegime;
+import com.trade.frankenstein.trader.enums.OrderSide;
+import com.trade.frankenstein.trader.enums.TradeStatus;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
+import com.trade.frankenstein.trader.model.documents.Trade;
+import com.trade.frankenstein.trader.repo.documents.TradeRepo;
 import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -32,6 +40,9 @@ import java.util.Map;
 @Slf4j
 @Service
 public class DecisionService {
+
+    private final PercentileWindow inferWindow = new PercentileWindow(256);
+
 
     // freshness windows
     private static final long FRESH_SENTIMENT_SEC = 120;
@@ -61,20 +72,15 @@ public class DecisionService {
     @Autowired
     private UpstoxService upstoxService;
     @Autowired
-    private FlagsService flagsService;
-    @Autowired
     private FastStateStore fast;
-
+    @Autowired
+    private ObjectMapper mapper;
+    @Autowired
+    private TradeRepo tradeRepo;
 
     private volatile Integer lastEmittedScore = null;
     private volatile String lastEmittedTrend = null;
     private volatile String lastConfidenceBucket = null;
-
-    private static int clamp0to100(int v) {
-        return Math.max(0, Math.min(100, v));
-    }
-
-    // -------- helpers --------
 
     // Java 8-friendly switch
     private static int normalizeRegimeScore(MarketRegime r) {
@@ -161,6 +167,8 @@ public class DecisionService {
     }
 
     public Result<DecisionQuality> getQuality() {
+        final long __t0 = System.nanoTime();
+
         // ----- Risk gates (Step-9) -----
         boolean headroomOk = false;
         boolean slCooldownActive = false;
@@ -171,40 +179,24 @@ public class DecisionService {
         } catch (Exception ignored) {
         }
         try {
-            if (flagsService.isOn(FlagName.SL_COOLDOWN_ENABLED)) {
-                int mins = riskService.getMinutesSinceLastSl(niftyUnderlyingKey);
-                slCooldownActive = (mins >= 0) && (mins < BotConsts.Risk.SL_COOLDOWN_MINUTES);
-            }
+            int mins = riskService.getMinutesSinceLastSl(niftyUnderlyingKey);
+            slCooldownActive = (mins >= 0) && (mins < BotConsts.Risk.SL_COOLDOWN_MINUTES);
         } catch (Exception ignored) {
         }
         try {
-            if (flagsService.isOn(FlagName.DISABLE_REENTRY_AFTER_2_SL)) {
-                int rs2 = riskService.getRestrikesToday(niftyUnderlyingKey);
-                twoSlLockActive = rs2 >= 2;
-            }
+            int rs2 = riskService.getRestrikesToday(niftyUnderlyingKey);
+            twoSlLockActive = rs2 >= 2;
         } catch (Exception ignored) {
         }
         try {
-            if (flagsService.isOn(FlagName.DAILY_LOSS_GUARD)) {
-                Result<Boolean> c = riskService.getCircuitState();
-                dailyLossLock = (c != null && c.isOk() && Boolean.TRUE.equals(c.get()));
-            }
+            Result<Boolean> c = riskService.getCircuitState();
+            dailyLossLock = (c != null && c.isOk() && Boolean.TRUE.equals(c.get()));
         } catch (Exception ignored) {
         }
 
         if (!isLoggedIn()) return Result.fail("user-not-logged-in");
         try {
             final Instant now = Instant.now();
-
-            // hard entry-block flags influence the score/trend we publish
-            boolean hardBlock =
-                    flagsService.isOn(FlagName.KILL_SWITCH_OPEN_NEW)
-                            || flagsService.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT);
-
-            boolean timeBlock =
-                    flagsService.isOn(FlagName.OPENING_5M_BLACKOUT)
-                            || flagsService.isOn(FlagName.NOON_PAUSE_WINDOW)
-                            || flagsService.isOn(FlagName.LATE_ENTRY_CUTOFF);
 
             // ----- Sentiment -----
             int sScore = 50;
@@ -302,10 +294,10 @@ public class DecisionService {
 
             // Risk/flags cap
             int score = clamp0to100((int) Math.round(raw));
-            if (circuitTripped || hardBlock) {
+            if (circuitTripped) {
                 trend = "NEUTRAL";
                 score = Math.min(score, 40); // don’t claim high quality under a hard stop
-            } else if (timeBlock) {
+            } else {
                 score = Math.min(score, 55); // softer cap for time windows
             }
 
@@ -317,11 +309,9 @@ public class DecisionService {
             List<String> reasons = new ArrayList<String>();
             reasons.add("Sentiment " + sScore);
             reasons.add("Regime " + trend);
-            reasons.add("Momentum z≈" + momZ);
+            reasons.add("Momentum z≈" + momScore);
             reasons.add("ADX " + String.format("%.1f", adx14));
             if (circuitTripped) reasons.add("Circuit TRIPPED");
-            if (hardBlock) reasons.add("KillSwitch ON");
-            if (timeBlock) reasons.add("TimeWindow");
 
             Map<String, String> tags = computeTags(niftyUnderlyingKey, regimeNow, sScore, momZ);
             // Risk tags
@@ -331,24 +321,31 @@ public class DecisionService {
             if (dailyLossLock || circuitTripped) tags.put("DailyLoss", "LOCKED");
 
             tags.put("Confidence", String.valueOf(confidence));
-            if (hardBlock || !headroomOk || slCooldownActive || twoSlLockActive || dailyLossLock || circuitTripped)
+            if (!headroomOk || slCooldownActive || twoSlLockActive || dailyLossLock || circuitTripped)
                 tags.put("Entry", "BLOCKED");
-            else if (timeBlock) tags.put("Entry", "WINDOW");
-
+            else tags.put("Entry", "WINDOW");
+            Integer accuracy = computeAccuracyFromClosedTrades(20); // make 20 a flag if you want
+            if (accuracy != null) {
+                // Or, if you prefer not to touch DTO schema, surface via tags:
+                tags.put("Accuracy", String.valueOf(accuracy));
+            }
             DecisionQuality dto = new DecisionQuality(smoothScore, trend, reasons, tags, now);
 
             // emit with throttle + change filter
             boolean okToEmit = fast.setIfAbsent("decision:emit", "1", EMIT_MIN_GAP);
             if (okToEmit && shouldEmit(smoothScore, trend, confBucket)) {
-                streamGateway.publishDecision("quality", dto);
+                JsonNode node = mapper.valueToTree(dto);
+                streamGateway.publishDecision("quality", node.toPrettyString());
                 publishDecisionEvent("decision.quality", dto); // Step-10
                 lastEmittedScore = smoothScore;
                 lastEmittedTrend = trend;
                 lastConfidenceBucket = confBucket;
-                log.info("decision.quality -> score={}, trend={}, conf={}, hardBlock={}, timeBlock={}",
-                        smoothScore, trend, confBucket, hardBlock, timeBlock);
+                log.info("decision.quality -> score={}, trend={}, conf={}",
+                        smoothScore, trend, confBucket);
             }
 
+            long __ms = (System.nanoTime() - __t0) / 1_000_000L;
+            inferWindow.record(__ms);
             return Result.ok(dto);
         } catch (Exception t) {
             log.error("getQuality() failed", t);
@@ -486,24 +483,37 @@ public class DecisionService {
      */
     private double computeAdx14(GetIntraDayCandleResponse ic) {
         IntraDayCandleData cs = candles(ic);
+        logCandleOrder("decision.adx.m5", cs);
         if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 16) return 0.0;
-        List<Object> prev = cs.getCandles().get(0);
 
+        List<List<Object>> rows = new ArrayList<>(cs.getCandles());
+        // ---- enforce chronological order
+        rows.sort((a, b) -> {
+            long ta = toLong(a.get(0));
+            long tb = toLong(b.get(0));
+            // normalize to seconds
+            if (ta > 3_000_000_000L) ta /= 1000L;
+            if (tb > 3_000_000_000L) tb /= 1000L;
+            return Long.compare(ta, tb);
+        });
+
+        List<Object> prev = rows.get(0);
         double prevClose = toNumber(prev.get(4));
         double prevHigh = toNumber(prev.get(2));
         double prevLow = toNumber(prev.get(3));
 
         double tr14 = 0.0, plusDM14 = 0.0, minusDM14 = 0.0;
 
-        for (int i = 1; i < cs.getCandles().size(); i++) {
-            List<Object> row = cs.getCandles().get(i);
+        for (int i = 1; i < rows.size(); i++) {
+            List<Object> row = rows.get(i);
             double high = toNumber(row.get(2));
             double low = toNumber(row.get(3));
 
             double upMove = Math.max(0.0, high - prevHigh);
             double downMove = Math.max(0.0, prevLow - low);
 
-            double tr = Math.max(high - low, Math.max(Math.abs(high - prevClose), Math.abs(low - prevClose)));
+            double tr = Math.max(high - low,
+                    Math.max(Math.abs(high - prevClose), Math.abs(low - prevClose)));
             double plusDM = (upMove > downMove && upMove > 0) ? upMove : 0.0;
             double minusDM = (downMove > upMove && downMove > 0) ? downMove : 0.0;
 
@@ -527,7 +537,13 @@ public class DecisionService {
         double minusDI = (minusDM14 / tr14) * 100.0;
         double denom = (plusDI + minusDI);
         double dx = denom <= 1e-8 ? 0.0 : (Math.abs(plusDI - minusDI) / denom) * 100.0;
-        return dx; // good enough; full Wilder ADX smoothing beyond 14 is optional
+        return dx; // final DX after 14; acceptable as ADX proxy
+    }
+
+    private static long toLong(Object t) {
+        if (t instanceof Number) return ((Number) t).longValue();
+        if (t instanceof String s) return Long.parseLong(s.trim());
+        return -1L;
     }
 
     private boolean isLoggedIn() {
@@ -613,5 +629,116 @@ public class DecisionService {
     }
 
     private record Weights(double ws, double wr, double wm) {
+    }
+
+    public long getInferenceP95Millis() {
+        return inferWindow.percentile(95);
+    }
+
+    private static int clamp0to100(int v) {
+        return Math.max(0, Math.min(100, v));
+    }
+
+    // DecisionService.java
+    private void logCandleOrder(String label, IntraDayCandleData cs) {
+        try {
+            if (cs == null || cs.getCandles() == null || cs.getCandles().size() < 2) return;
+            long t0 = toEpochMillis(cs.getCandles().get(0).get(0));
+            long t1 = toEpochMillis(cs.getCandles().get(1).get(0));
+            if (t0 > t1) {
+                log.warn("{} candles appear NEWEST-first. Sorting to chronological.", label);
+            }
+        } catch (Throwable ignore) {
+        }
+    }
+
+    private long toEpochMillis(Object ts) {
+        if (ts instanceof Number) {
+            long v = ((Number) ts).longValue();
+            return (v > 3_000_000_000L) ? v : v * 1000L;
+        }
+        if (ts instanceof String s) {
+            long v = Long.parseLong(s.trim());
+            return (v > 3_000_000_000L) ? v : v * 1000L;
+        }
+        return -1L;
+    }
+
+    private Double realizedPnl(Trade t) {
+        if (t == null) return null;
+
+        // 1) Prefer stored pnl if present (backend computed/settled)
+        try {
+            Double stored = t.getPnl();
+            if (stored != null && !stored.isNaN() && !stored.isInfinite()) {
+                return stored;
+            }
+        } catch (Throwable ignored) { /* best-effort */ }
+
+        // 2) Compute from prices if possible
+        try {
+            Double entry = t.getEntryPrice();
+            // Prefer exit if trade is CLOSED; otherwise fall back to current
+            Double price = null;
+            if (t.getStatus() == TradeStatus.CLOSED) {
+                // Some models don’t store exitPrice; if you have it, prefer it;
+                // else use currentPrice as a fallback (usually it equals exit at close persist time)
+                try {
+                    // If you have getExitPrice(), use it; otherwise comment stays as doc.
+                    price = (Double) Trade.class.getMethod("getExitPrice").invoke(t);
+                } catch (Throwable ignored) {
+                    price = t.getCurrentPrice();
+                }
+            } else {
+                price = t.getCurrentPrice();
+            }
+            Integer qty = t.getQuantity();
+            OrderSide side = t.getSide();
+
+            if (entry == null || price == null || qty == null || side == null) return null;
+            int q = Math.max(0, qty);
+
+            double pnl = (side == OrderSide.SELL)
+                    ? (entry - price) * q
+                    : (price - entry) * q;
+
+            if (Double.isNaN(pnl) || Double.isInfinite(pnl)) return null;
+            return pnl;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    // ===== Accuracy calculator using rolling closed trades =====
+    private Integer computeAccuracyFromClosedTrades(int window) {
+        int winCount = 0, total = 0;
+
+        // Pull recent trades; we’ll filter in-memory to CLOSED
+        Page<Trade> page = tradeRepo.findAll(
+                PageRequest.of(
+                        0,
+                        Math.max(1, Math.min(window * 2, 200)), // fetch a bit more to cover nulls
+                        Sort.by(Sort.Direction.DESC, "exitTime", "updatedAt", "createdAt")
+                )
+        );
+
+        if (page == null || page.getContent() == null || page.getContent().isEmpty()) return null;
+
+        for (Trade t : page.getContent()) {
+            if (t == null || t.getStatus() != TradeStatus.CLOSED) continue;
+
+            Double pnl = realizedPnl(t);
+            if (pnl == null) continue;
+
+            total++;
+            if (pnl > 0.0) winCount++;
+
+            if (total >= window) break; // stop once we have enough samples
+        }
+
+        if (total == 0) return null;
+        int pct = (int) Math.round((winCount * 100.0) / total);
+        // clamp 0..100
+        return Math.max(0, Math.min(100, pct));
     }
 }

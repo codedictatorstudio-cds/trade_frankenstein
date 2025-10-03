@@ -8,9 +8,17 @@ import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.bson.Document;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.aggregation.Aggregation;
+import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
+import org.springframework.data.mongodb.core.aggregation.AggregationResults;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -73,6 +81,37 @@ public class NewsService {
     private MarketSentimentSnapshotRepo sentimentRepo;
     @Autowired
     private StreamGateway stream;
+
+    // ===== Step-11 wiring (add-only) =====
+    @Autowired(required = false)
+    private MongoTemplate mongoTemplate; // used if present
+
+    @Autowired(required = false)
+    private EmbeddingClient embeddingClient; // optional embedder bean
+
+    @Value("${tf.news.collection:news_articles}")
+    private String newsCollection;
+
+    // ===== Step-11 constants & field names (kept local to avoid touching other files) =====
+    private static final String F_ID = "_id";
+    private static final String F_TITLE = "title";
+    private static final String F_DESC = "description";
+    private static final String F_SOURCE = "source";
+    private static final String F_PUBLISHED_AT = "publishedAt";
+    private static final String F_URL = "url";
+    private static final String F_EMBEDDING = "embedding";
+    private static final String F_TOPIC = "topic";
+    private static final String F_HASH = "contentHash";
+    private static final String VECTOR_INDEX_NAME = "news_embedding_idx"; // Atlas Vector Search index
+
+    private static final int EMBEDDING_DIM = 384;
+    private static final double DEDUPE_SIMILARITY_THRESHOLD = 0.86d;
+    private static final double CLUSTER_SIMILARITY_THRESHOLD = 0.80d;
+    private static final int K_NEIGHBORS = 20;
+    private static final int K_REFINE = 50;
+    private static final int LINEAR_SCAN_LIMIT = 1000;
+    private static final int MAX_TITLE_LEN = 400;
+    private static final int MAX_DESC_LEN = 2000;
 
     private static List<String> trim(List<String> in) {
         List<String> out = new ArrayList<String>();
@@ -472,6 +511,18 @@ public class NewsService {
                     List<NewsItem> items = fetchAnyWithRetry(u, maxItemsPerFeed);
                     if (!items.isEmpty()) {
                         successfulFeeds++;
+
+                        // ===== Step-11 injection (non-disruptive): persist + ANN dedupe bookkeeping =====
+                        for (NewsItem it : items) {
+                            try {
+                                Headline hh = it.toHeadline();
+                                processStep11(hh); // best-effort; does not alter sentiment counting
+                            } catch (Throwable t) {
+                                log.debug("NEWS_STEP11_PROCESS_ERROR {}", t.toString());
+                            }
+                        }
+
+                        // === existing business logic (unchanged) ===
                         for (NewsItem it : items) {
                             bull += hits(it, bullish);
                             bear += hits(it, bearish);
@@ -946,4 +997,184 @@ public class NewsService {
     private record NewsEvent(Instant ts, String source, String symbol, String category) {
     }
 
+    // ===================== Step-11 helpers (ADD-ONLY) =====================
+
+    /**
+     * Minimal embedder contract; implement and register as a Spring bean if you want embeddings.
+     */
+    public interface EmbeddingClient {
+        double[] embed(String text);
+    }
+
+    private void processStep11(Headline h) {
+        // Best-effort only: do nothing if Mongo or embedder are unavailable.
+        if (mongoTemplate == null) return;
+        try {
+            String key = contentKeyForEmbeddings(h.getTitle(), h.getDescription());
+            String contentHash = sha256Base64(key);
+
+            // persist-only fast path if already seen
+            if (existsByContentHash(contentHash)) {
+                // Optional: still record event; no-op persist for now
+                log.debug("NEWS_DEDUPE HASH_DUP {}", shortTitle(nvl(h.getTitle())));
+                return;
+            }
+
+            double[] embedding = null;
+            if (embeddingClient != null) {
+                String text = (nvl(h.getTitle()) + " " + nvl(h.getDescription())).trim();
+                embedding = embeddingClient.embed(text);
+                if (embedding == null || embedding.length != EMBEDDING_DIM) {
+                    log.warn("Embedding invalid dim={}, skipping ANN for this item.",
+                            embedding == null ? -1 : embedding.length);
+                    embedding = null;
+                }
+            }
+
+            // Optional ANN dedupe (we don't skip counting; this is only for storage/labels)
+            if (embedding != null) {
+                double sim = nearestSimilarity(embedding);
+                if (sim >= DEDUPE_SIMILARITY_THRESHOLD) {
+                    log.debug("NEWS_DEDUPE ANN_DUP {} score={}", shortTitle(nvl(h.getTitle())),
+                            String.format(java.util.Locale.US, "%.3f", sim));
+                    // still persist for history? choose to persist with topic
+                }
+            }
+
+            String topic = null;
+            if (embedding != null) {
+                double sim2 = nearestSimilarity(embedding);
+                topic = (sim2 >= CLUSTER_SIMILARITY_THRESHOLD)
+                        ? "topic-" + java.time.LocalDate.now()
+                        : "topic-" + java.time.LocalDate.now() + "-new";
+            }
+
+            // Persist
+            saveArticle(h, embedding, topic, contentHash);
+        } catch (Throwable t) {
+            log.debug("NEWS_STEP11_ERROR {}", t.toString());
+        }
+    }
+
+    private String contentKeyForEmbeddings(String title, String desc) {
+        String t = truncate(normalize(title), MAX_TITLE_LEN);
+        String d = truncate(normalize(desc), MAX_DESC_LEN);
+        return t + " | " + d;
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    private static String shortTitle(String t) {
+        if (t == null) return "";
+        return t.length() <= 64 ? t : t.substring(0, 61) + "...";
+    }
+
+    private String sha256Base64(String s) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] dig = md.digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.Base64.getEncoder().encodeToString(dig);
+        } catch (Exception e) {
+            return "hash_err_" + s.hashCode();
+        }
+    }
+
+    private boolean existsByContentHash(String hash) {
+        try {
+            Query q = new Query(Criteria.where(F_HASH).is(hash)).limit(1);
+            return mongoTemplate.exists(q, newsCollection);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private double cosine(double[] a, double[] b) {
+        if (a == null || b == null || a.length != b.length || a.length == 0) return -2.0d;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
+        }
+        if (na == 0 || nb == 0) return -2.0d;
+        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    private double nearestSimilarity(double[] embedding) {
+        if (embedding == null || embedding.length != EMBEDDING_DIM) return -2.0d;
+
+        // Preferred: MongoDB Atlas Vector Search
+        try {
+            org.bson.Document vectorSearch = new org.bson.Document("$vectorSearch", new org.bson.Document()
+                    .append("index", VECTOR_INDEX_NAME)
+                    .append("path", F_EMBEDDING)
+                    .append("queryVector", embedding)
+                    .append("numCandidates", K_REFINE)
+                    .append("limit", K_NEIGHBORS));
+
+            Aggregation agg = Aggregation.newAggregation(
+                    new AggregationOperation() {
+                        @Override
+                        public org.bson.Document toDocument(org.springframework.data.mongodb.core.aggregation.AggregationOperationContext context) {
+                            return vectorSearch;
+                        }
+                    },
+                    Aggregation.project(F_TITLE, F_DESC).andExpression("{ $meta: 'vectorSearchScore' }").as("score")
+            );
+
+            AggregationResults<Document> results = mongoTemplate.aggregate(agg, newsCollection, Document.class);
+            double best = -2.0d;
+            for (Document d : results.getMappedResults()) {
+                Object sc = d.get("score");
+                if (sc instanceof Number) {
+                    double s = ((Number) sc).doubleValue();
+                    if (s > best) best = s;
+                }
+            }
+            if (best > -2.0d) return best;
+        } catch (Throwable t) {
+            log.debug("VectorSearch not available, linear scan fallback. {}", t.toString());
+        }
+
+        // Fallback: linear scan of recent docs
+        try {
+            Query q = new Query().limit(LINEAR_SCAN_LIMIT).with(Sort.by(Sort.Direction.DESC, F_PUBLISHED_AT));
+            List<Document> recent = mongoTemplate.find(q, Document.class, newsCollection);
+            double best = -2.0d;
+            for (Document d : recent) {
+                List<?> arr = (List<?>) d.get(F_EMBEDDING);
+                if (arr == null || arr.size() != EMBEDDING_DIM) continue;
+                double[] other = new double[EMBEDDING_DIM];
+                for (int i = 0; i < EMBEDDING_DIM; i++) {
+                    Object v = arr.get(i);
+                    other[i] = (v instanceof Number) ? ((Number) v).doubleValue() : 0.0d;
+                }
+                double s = cosine(embedding, other);
+                if (s > best) best = s;
+            }
+            return best;
+        } catch (Throwable t) {
+            return -2.0d;
+        }
+    }
+
+    private void saveArticle(Headline h, double[] embedding, String topic, String contentHash) {
+        try {
+            Document doc = new Document();
+            doc.put(F_TITLE, nvl(h.getTitle()));
+            doc.put(F_DESC, nvl(h.getDescription()));
+            doc.put(F_SOURCE, nvl(h.getSource()));
+            doc.put(F_URL, nvl(h.getLink()));
+            doc.put(F_PUBLISHED_AT, h.getPublishedAt() != null ? h.getPublishedAt().toEpochMilli() : System.currentTimeMillis());
+            if (embedding != null) doc.put(F_EMBEDDING, embedding);
+            if (topic != null) doc.put(F_TOPIC, topic);
+            if (contentHash != null) doc.put(F_HASH, contentHash);
+            mongoTemplate.insert(doc, newsCollection);
+        } catch (Throwable t) {
+            // best-effort
+        }
+    }
 }

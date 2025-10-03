@@ -45,7 +45,6 @@ public enum FlagName {
     DELTA_TARGET_HEDGE,
 
     // --- Execution / Broker ---
-    PAPER_TRADING_MODE,
     USE_MARKET_ON_ENTRY,
     PLACE_BO_WITH_SLTP,
     CANCEL_REPLACE_ON_SLIPPAGE,

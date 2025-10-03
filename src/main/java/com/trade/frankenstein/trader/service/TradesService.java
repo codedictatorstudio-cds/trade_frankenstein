@@ -30,20 +30,15 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
-/**
- * TradesService (Java 8, no reflection)
- * - Login guard for all public methods that reach broker
- * - Idempotent create/update of fills using Repo + FastStateStore (daily key)
- * - Emits trade.created / trade.updated via StreamGateway
- */
 @Service
 @Slf4j
 public class TradesService {
 
     // Fallback in-memory idempotency (per-process) for SL events
-    private final java.util.concurrent.ConcurrentMap<String, Long> slOnceKeys =
-            new java.util.concurrent.ConcurrentHashMap<String, Long>();
+    private final ConcurrentMap<String, Long> slOnceKeys = new ConcurrentHashMap<>();
     @Autowired
     private UpstoxService upstoxService;
     @Autowired
@@ -433,7 +428,11 @@ public class TradesService {
     private ObjectNode toJsonTrade(Trade t, String event) {
         final ObjectNode b = mapper.createObjectNode();
 
-        // strings & enums
+        java.time.Instant _now = java.time.Instant.now();
+        b.put("ts", _now.toEpochMilli());
+        b.put("ts_iso", _now.toString());
+        b.put("source", "trade");
+// strings & enums
         b.put("event", nz(event));
         b.put("tradeId", nz(t.getId()));
         b.put("brokerTradeId", nz(t.getBrokerTradeId()));
@@ -472,6 +471,9 @@ public class TradesService {
         try {
             final ObjectNode b = mapper.createObjectNode()
                     .put("event", "trade.stoploss")
+                    .put("source", "trade")
+                    .put("ts", java.time.Instant.now().toEpochMilli())
+                    .put("ts_iso", java.time.Instant.now().toString())
                     .put("instrumentKey", nz(instrumentKey))
                     .put("slEventKey", nz(slEventKey))
                     .put("ts", asIso(Instant.now()));
@@ -625,16 +627,16 @@ public class TradesService {
      * Housekeeping for in-memory idempotency map.
      * Runs hourly and trims keys older than 12h to cap memory.
      */
-    @org.springframework.scheduling.annotation.Scheduled(fixedDelay = 60 * 60 * 1000L)
+    @Scheduled(fixedDelay = 60 * 60 * 1000L)
     public void pruneOldSlOnceKeys() {
         if (!isLoggedIn()) {
             return;
         }
-        long cutoff = java.time.Instant.now().minus(java.time.Duration.ofHours(12)).getEpochSecond();
+        long cutoff = Instant.now().minus(Duration.ofHours(12)).getEpochSecond();
         try {
-            java.util.Iterator<java.util.Map.Entry<String, Long>> it = slOnceKeys.entrySet().iterator();
+            Iterator<Map.Entry<String, Long>> it = slOnceKeys.entrySet().iterator();
             while (it.hasNext()) {
-                java.util.Map.Entry<String, Long> e = it.next();
+                Map.Entry<String, Long> e = it.next();
                 Long when = e.getValue();
                 if (when == null || when.longValue() < cutoff) {
                     it.remove();
@@ -642,6 +644,4 @@ public class TradesService {
             }
         } catch (Throwable ignored) { /* best-effort */ }
     }
-
-
 }

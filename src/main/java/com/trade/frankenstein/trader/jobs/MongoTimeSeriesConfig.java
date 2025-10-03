@@ -1,7 +1,6 @@
 package com.trade.frankenstein.trader.jobs;
 
 import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.IndexOptions;
 import lombok.Data;
 import org.bson.Document;
 import org.slf4j.Logger;
@@ -115,10 +114,17 @@ public class MongoTimeSeriesConfig {
         // Ensure compound index: {symbol:1, timeField:1}
         try {
             Document keys = new Document("symbol", 1).append(timeField, 1);
-            String indexName = "idx_" + collection + "_symbol_" + timeField;
-            IndexOptions opts = new IndexOptions().name(indexName);
-            log.info("Ensuring index '{}' on '{}': {}", indexName, collection, keys.toJson());
-            template.getCollection(collection).createIndex(keys, opts);
+            boolean exists = template.getCollection(collection)
+                    .listIndexes()
+                    .into(new java.util.ArrayList<>())
+                    .stream()
+                    .anyMatch(ix -> keys.toJson().equals(String.valueOf(ix.get("key"))));
+            if (!exists) {
+                log.info("Creating compound index on '{}': {}", collection, keys.toJson());
+                template.getCollection(collection).createIndex(keys); // let Mongo assign a name
+            } else {
+                log.info("Index already present on '{}': {}", collection, keys.toJson());
+            }
         } catch (Throwable t) {
             log.warn("Failed to ensure index on '{}': {}", collection, t.getMessage());
         }

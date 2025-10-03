@@ -59,6 +59,24 @@ public class RegimeDecisionCard extends Div {
     // JSON parser (replace ApiClient.readTree)
     private static final ObjectMapper OM = new ObjectMapper();
 
+    // New: chips from backend "tags" map
+    private final HorizontalLayout tagChips = new HorizontalLayout();
+
+    // New: minimal skeleton state
+    private final Div skeleton = new Div();
+    private volatile boolean hasData = false;
+
+    // Centralize thresholds
+    private static final int THRESH_EXCELLENT = 80;
+    private static final int THRESH_GOOD = 60;
+    private static final int THRESH_OK = 40;
+
+    // Optionally remember the last SSE heartbeat
+    private volatile long lastEventAt = 0L;
+
+    // Endpoint as a constant
+    private static final String PATH_DECISION_QUALITY = "/api/decision/quality";
+
     // Fallback polling
     private Timer refreshTimer;
     private final AtomicBoolean attached = new AtomicBoolean(false);
@@ -300,6 +318,37 @@ public class RegimeDecisionCard extends Div {
             }
         }).addEventData("event.detail");
 
+        // Chips bar (follows RR/Slip/Throttle)
+        tagChips.setPadding(false);
+        tagChips.setSpacing(false);
+        tagChips.getStyle()
+                .set("flex-wrap", "wrap")
+                .set("gap", "8px")
+                .set("width", "100%");
+
+        // Skeleton shimmer
+        skeleton.getStyle()
+                .set("width", "100%")
+                .set("height", "96px")
+                .set("border-radius", "12px")
+                .set("background", "linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 37%, #f3f4f6 63%)")
+                .set("background-size", "400% 100%")
+                .set("animation", "shimmer 1.4s ease infinite")
+                .set("margin-top", "8px");
+
+        // Inject a keyframes rule once
+        getElement().executeJs(
+                "if(!document.getElementById('rdc-kf')){" +
+                        " const s=document.createElement('style'); s.id='rdc-kf';" +
+                        " s.textContent='@keyframes shimmer{0%{background-position:100% 0}100%{background-position:-100% 0}}';" +
+                        " document.head.appendChild(s);" +
+                        "}"
+        );
+
+        // Add chips & skeleton under the existing tags block
+        // (Find where you do: hdLeft.add(title, tags); then append the following line)
+        hdLeft.add(tagChips, skeleton);
+
         // Sync initial visuals
         updateVisuals();
     }
@@ -355,16 +404,25 @@ public class RegimeDecisionCard extends Div {
 
     private void fetchAndApplyDecisionQuality() {
         try {
-            JsonNode j = ApiClient.get("/api/decision/quality", JsonNode.class);
+            // If we got an SSE in the last 5s, skip a redundant fetch
+            if (System.currentTimeMillis() - lastEventAt < 5000) return;
+
+            JsonNode j = ApiClient.get(PATH_DECISION_QUALITY, JsonNode.class);
             if (j != null) {
                 applyDecisionQuality(j, true);
+                lastEventAt = System.currentTimeMillis();
             }
         } catch (Throwable ignored) {
+            // Keep skeleton visible only if no data yet; otherwise stay quiet
+            if (!hasData) skeleton.setVisible(true);
         }
     }
 
     private void applyDecisionQuality(JsonNode j, boolean fireConfidenceChanged) {
         if (j == null) return;
+
+        hasData = true;
+        skeleton.setVisible(false);
 
         // Score / confidence
         int s = j.path("score").asInt(j.path("confidence").asInt(confidence));
@@ -399,11 +457,20 @@ public class RegimeDecisionCard extends Div {
         // Reasons
         reasons.removeAll();
         if (j.has("reasons") && j.get("reasons").isArray() && j.get("reasons").size() > 0) {
-            for (JsonNode r : j.get("reasons")) reasons.add(styledListItem(r.asText()));
+            int count = 0, total = j.get("reasons").size();
+            for (JsonNode r : j.get("reasons")) {
+                if (count < 6) {
+                    reasons.add(styledListItem(r.asText()));
+                }
+                count++;
+            }
+            if (total > 6) {
+                reasons.add(styledListItem("+" + (total - 6) + " more"));
+            }
         } else {
             reasons.add(styledListItem("Signals stable"));
         }
-
+        renderTagChips(j);
         // Visuals
         updateVisuals();
 
@@ -488,12 +555,16 @@ public class RegimeDecisionCard extends Div {
             }
         });
 
+        String[] cc = pickConfidenceColors(confidence);
+        String fg = cc[0], bg = cc[1];
+
         ringVal.setText(String.valueOf(confidence));
         progressFill.getStyle().set("width", confidence + "%");
 
         // Progress color nuance
         if (confidence > 80) {
-            progressFill.getStyle().set("background", "linear-gradient(90deg, " + COLOR_PRIMARY + ", " + COLOR_SUCCESS + ")");
+            progressFill.getStyle().set("background",
+                    (confidence > THRESH_EXCELLENT) ? "linear-gradient(90deg, " + COLOR_PRIMARY + ", " + COLOR_SUCCESS + ")" : fg);
         } else if (confidence > 40) {
             progressFill.getStyle().set("background", COLOR_PRIMARY);
         } else {
@@ -563,5 +634,99 @@ public class RegimeDecisionCard extends Div {
             }
             refreshTimer = null;
         }
+    }
+
+    private void renderTagChips(JsonNode j) {
+        tagChips.removeAll();
+        if (j == null || !j.has("tags") || !j.get("tags").isObject()) return;
+
+        JsonNode t = j.get("tags");
+        // Safe known keys – add more if you emit them
+        addTagIfPresent(t, "Confidence");
+        addTagIfPresent(t, "Headroom");
+        addTagIfPresent(t, "Cooldown");
+        addTagIfPresent(t, "DailyLoss");
+        addTagIfPresent(t, "Entry");
+        addTagIfPresent(t, "Risk");
+    }
+
+    private void addTagIfPresent(JsonNode tags, String key) {
+        if (!tags.has(key)) return;
+        String val = tags.get(key).asText();
+        tagChips.add(buildTagChip(key, val));
+    }
+
+    private Component buildTagChip(String key, String val) {
+        final Span chip = new Span(key + ": " + val);
+        chip.getElement().setAttribute("title", key + " = " + val);
+        chip.getStyle()
+                .set("display", "inline-flex")
+                .set("align-items", "center")
+                .set("padding", "4px 10px")
+                .set("border-radius", "999px")
+                .set("font-weight", "600")
+                .set("font-size", "12px")
+                .set("box-shadow", "0 1px 2px rgba(0,0,0,.05)");
+
+        // Color heuristic by key/value
+        String fg = COLOR_PRIMARY, bg = COLOR_PRIMARY_LIGHT;
+        String v = val.toLowerCase();
+
+        if ("confidence".equalsIgnoreCase(key)) {
+            int c = safeInt(val, confidence);
+            String[] cc = pickConfidenceColors(c);
+            fg = cc[0];
+            bg = cc[1];
+        } else if ("headroom".equalsIgnoreCase(key)) {
+            if (v.contains("high") || v.contains("ok") || v.contains("green")) {
+                fg = COLOR_SUCCESS;
+                bg = COLOR_SUCCESS_LIGHT;
+            } else if (v.contains("low") || v.contains("red")) {
+                fg = COLOR_DANGER;
+                bg = "#fee2e2";
+            }
+        } else if ("cooldown".equalsIgnoreCase(key)) {
+            if (v.contains("active") || v.contains("yes")) {
+                fg = COLOR_DANGER;
+                bg = "#fee2e2";
+            }
+        } else if ("dailyloss".equalsIgnoreCase(key)) {
+            if (v.contains("breach") || v.contains("hit")) {
+                fg = COLOR_DANGER;
+                bg = "#fee2e2";
+            } else if (v.contains("%")) {
+                try {
+                    double pct = Double.parseDouble(v.replace("%", "").trim());
+                    if (pct >= 2.0) {
+                        fg = COLOR_DANGER;
+                        bg = "#fee2e2";
+                    } else if (pct >= 1.0) {
+                        fg = COLOR_PRIMARY_DARK;
+                        bg = COLOR_PRIMARY_LIGHT;
+                    } else {
+                        fg = COLOR_SUCCESS;
+                        bg = COLOR_SUCCESS_LIGHT;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        chip.getStyle().set("color", fg).set("background", bg);
+        return chip;
+    }
+
+    private static int safeInt(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Throwable ignored) {
+            return def;
+        }
+    }
+
+    private String[] pickConfidenceColors(int c) {
+        if (c > THRESH_EXCELLENT) return new String[]{COLOR_SUCCESS, COLOR_SUCCESS_LIGHT};
+        if (c > THRESH_GOOD) return new String[]{COLOR_PRIMARY, COLOR_PRIMARY_LIGHT};
+        if (c > THRESH_OK) return new String[]{COLOR_PRIMARY_DARK, COLOR_PRIMARY_LIGHT};
+        return new String[]{COLOR_LOW, "#fee2e2"};
     }
 }

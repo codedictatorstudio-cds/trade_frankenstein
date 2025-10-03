@@ -16,28 +16,31 @@ import java.util.List;
 public class StreamController {
 
     private static final List<String> DEFAULT_TOPICS = Arrays.asList(
-            "heartbeat",          // gateway heartbeat
-            "engine.state",
-            "engine.heartbeat",   // sent by EngineService.tick()
+            "engine.heartbeat",
             "decision.quality",
             "risk.summary",
             "risk.circuit",
-            "order.*",            // placed/modified/cancelled
-            "orders.*",           // advice path uses orders.created
+            "order.*",
             "trade.*",
-            "sentiment.update"
+            "sentiment.update",
+            "advice.new",
+            "advice.updated",
+            "trade.created",
+            "trade.updates"
     );
 
     private final StreamGateway stream;
 
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@RequestParam(name = "timeoutMs", required = false) String timeoutMs,
-                             @RequestParam(name = "topics", required = false) String topics) {
+    public SseEmitter stream(@RequestParam(name = "id", required = false) String id,
+                             @RequestParam(name = "topics", required = false) String topicsCsv) {
 
-        if (!StringUtils.hasText(topics) || "*".equals(topics.trim())) {
-
-            return stream.subscribe(timeoutMs, DEFAULT_TOPICS);
+        // If topics is blank or "*", subscribe to safe defaults
+        if (!StringUtils.hasText(topicsCsv) || "*".equals(topicsCsv.trim())) {
+            return stream.subscribe(id, DEFAULT_TOPICS);  // subscribe(List<String>)
         }
-        return stream.subscribeCsv(timeoutMs, topics);
+
+        // CSV: "advice.new,trade.created"
+        return stream.subscribeCsv(id, topicsCsv);        // subscribeCsv(String)
     }
 }

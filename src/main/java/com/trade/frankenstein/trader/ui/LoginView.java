@@ -13,7 +13,7 @@ import java.util.List;
 
 @Route("")
 @PageTitle("TradeFrankenstein Login")
-@CssImport("./styles/login-view.css") // your mockup CSS
+@CssImport("./styles/login-view.css")
 public class LoginView extends Div {
 
     public LoginView() {

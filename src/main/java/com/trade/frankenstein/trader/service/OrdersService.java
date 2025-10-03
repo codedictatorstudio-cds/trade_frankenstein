@@ -1,13 +1,11 @@
 package com.trade.frankenstein.trader.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.core.FastStateStore;
-import com.trade.frankenstein.trader.enums.FlagName;
 import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -34,6 +32,7 @@ public class OrdersService {
      * Minimal in-memory tracker so isOrderWorking() has a fallback even if broker status isn't queried here.
      */
     private final Map<String, Instant> workingOrders = new ConcurrentHashMap<>();
+
     @Autowired
     private UpstoxService upstox;
     @Autowired
@@ -41,19 +40,9 @@ public class OrdersService {
     @Autowired
     private FastStateStore fast; // Step-3: idempotency / rate counters
     @Autowired
-    private FlagsService flags;
-    @Autowired
     private ObjectMapper mapper;
     @Autowired
     private EventPublisher events;
-
-    // =====================================================================
-    // WRITE PATHS (market-hours gating + risk + idempotency)
-    // =====================================================================
-
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
 
     /**
      * IST market hours: Mon–Fri, 09:15–15:30.
@@ -116,37 +105,6 @@ public class OrdersService {
 
 
             // Step-9 Flags (feature gates) — additional time-of-day and execution behaviors
-            if (flags != null) {
-                // Block new entries during opening 5-min blackout window
-                if (flags.isOn(FlagName.OPENING_5M_BLACKOUT)) {
-                    return Result.fail("OPENING_BLACKOUT", "Blocked during opening period");
-                }
-                // Block fresh entries after late-entry cut-off (protective orders go via dedicated APIs)
-                if (flags.isOn(FlagName.LATE_ENTRY_CUTOFF)) {
-                    return Result.fail("LATE_ENTRY_CUTOFF", "No new entries allowed after cut-off");
-                }
-                // Avoid partial fills when enabled -> enforce spread guard and require MARKET order type
-                if (flags.isOn(FlagName.AVOID_PARTIAL_FILLS)) {
-                    // Ensure current spread is narrow enough (<= 0.15%) else block
-                    String ik = req.getInstrumentToken();
-                    if (ik != null) {
-                        boolean ok = preflightSlippageGuard(ik, new BigDecimal("0.0015"));
-                        if (!ok) {
-                            return Result.fail("SLIPPAGE_GUARD", "Spread too wide for safe entry");
-                        }
-                    }
-                    // If LIMIT provided under this mode, reject to avoid partials; caller should switch to MARKET
-                    try {
-                        String orderType = req.getOrderType().getValue();
-                        if (orderType != null && !"MARKET".equalsIgnoreCase(orderType)) {
-                            return Result.fail("AVOID_PARTIAL_FILLS", "Only MARKET allowed when AVOID_PARTIAL_FILLS is ON");
-                        }
-                    } catch (Throwable ignored) {
-                        // If we cannot read order type reliably, be permissive
-                    }
-                }
-            }
-// Risk guardrails
             Result<Void> guard = risk.checkOrder(req);
             if (guard == null || !guard.isOk()) {
                 return Result.fail(guard == null ? "RISK_ERROR" : guard.getErrorCode(),
@@ -162,7 +120,6 @@ public class OrdersService {
             if (placed != null && placed.getData() != null && placed.getData().getOrderId() != null) {
                 markWorking(placed.getData().getOrderId());
             }
-
             // Side-effects
             try {
                 risk.noteOrderPlaced();
@@ -174,7 +131,6 @@ public class OrdersService {
             } catch (Exception ex) {
                 log.warn("stream.send failed", ex);
             }
-
             return Result.ok(placed);
         } catch (Exception t) {
             log.error("placeOrder failed", t);
@@ -191,10 +147,6 @@ public class OrdersService {
             return Result.fail("user-not-logged-in");
         }
         try {
-            if (flags != null && flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                return Result.fail("PAPER_MODE", "Paper trading mode is ON; broker call suppressed");
-            }
-
             if (req == null) return Result.fail("BAD_REQUEST", "ModifyOrderRequest is required");
 
             if (!isMarketOpenNowIst()) {
@@ -222,10 +174,6 @@ public class OrdersService {
             return Result.fail("user-not-logged-in");
         }
         try {
-            if (flags != null && flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                return Result.fail("PAPER_MODE", "Paper trading mode is ON; broker call suppressed");
-            }
-
             if (isBlank(orderId)) return Result.fail("BAD_REQUEST", "orderId is required");
 
             if (!isMarketOpenNowIst()) {
@@ -418,18 +366,6 @@ public class OrdersService {
         }
         try {
             // Step-9 Flags gate for new openings
-            if (flags != null) {
-                if (flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)) {
-                    return Result.fail("KILL_SWITCH", "Blocked by kill switch");
-                }
-                if (flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)) {
-                    return Result.fail("CIRCUIT_LOCKOUT", "Blocked by circuit breaker");
-                }
-                if (flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                    return Result.fail("PAPER_MODE", "Paper trading mode is ON; broker order suppressed");
-                }
-            }
-
             if (isBlank(instrumentKey) || qty <= 0 || targetPrice == null) {
                 return Result.fail("BAD_REQUEST", "instrumentKey/qty/price are required");
             }
@@ -459,19 +395,6 @@ public class OrdersService {
             return Result.fail("user-not-logged-in");
         }
         try {
-            // Step-9 Flags gate for new openings
-            if (flags != null) {
-                if (flags.isOn(FlagName.KILL_SWITCH_OPEN_NEW)) {
-                    return Result.fail("KILL_SWITCH", "Blocked by kill switch");
-                }
-                if (flags.isOn(FlagName.CIRCUIT_BREAKER_LOCKOUT)) {
-                    return Result.fail("CIRCUIT_LOCKOUT", "Blocked by circuit breaker");
-                }
-                if (flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                    return Result.fail("PAPER_MODE", "Paper trading mode is ON; broker order suppressed");
-                }
-            }
-
             if (isBlank(instrumentKey) || qty <= 0 || triggerPrice == null) {
                 return Result.fail("BAD_REQUEST", "instrumentKey/qty/trigger are required");
             }
@@ -501,10 +424,6 @@ public class OrdersService {
             return Result.fail("user-not-logged-in");
         }
         try {
-            if (flags != null && flags.isOn(FlagName.PAPER_TRADING_MODE)) {
-                return Result.fail("PAPER_MODE", "Paper trading mode is ON; broker call suppressed");
-            }
-
             if (orderId == null || orderId.trim().isEmpty() || newPrice == null) {
                 return Result.fail("BAD_REQUEST", "orderId/newPrice are required");
             }
@@ -553,12 +472,62 @@ public class OrdersService {
 
     private void publishOrderEvent(String event, Object o) {
         try {
-            JsonNode node = mapper.valueToTree(o);
-            String[] sub = event.split(".");
-            events.publish(EventBusConfig.TOPIC_ORDER, sub[1], node.toPrettyString());
+            // Convert to JsonNode and wrap in kafkaesque envelope
+            final com.fasterxml.jackson.databind.node.ObjectNode wrap = mapper.createObjectNode();
+            final java.time.Instant now = java.time.Instant.now();
+            wrap.put("ts", now.toEpochMilli());
+            wrap.put("ts_iso", now.toString());
+            wrap.put("event", event);
+            wrap.put("source", "orders");
+
+            com.fasterxml.jackson.databind.JsonNode data = (o instanceof com.fasterxml.jackson.databind.JsonNode)
+                    ? (com.fasterxml.jackson.databind.JsonNode) o
+                    : mapper.valueToTree(o);
+            if (data != null) wrap.set("data", data);
+
+            // Best-effort key selection: symbol -> instrument_token/orderId -> id -> event tail
+            String key = null;
+            try {
+                if (data != null && data.hasNonNull("symbol")) key = data.get("symbol").asText();
+            } catch (Throwable ignore) {
+            }
+            if (key == null) {
+                try {
+                    if (data != null && data.hasNonNull("instrument_key")) key = data.get("instrument_key").asText();
+                } catch (Throwable ignore) {
+                }
+            }
+            if (key == null) {
+                try {
+                    if (data != null && data.hasNonNull("instrumentToken")) key = data.get("instrumentToken").asText();
+                } catch (Throwable ignore) {
+                }
+            }
+            if (key == null) {
+                try {
+                    if (data != null && data.hasNonNull("orderId")) key = data.get("orderId").asText();
+                } catch (Throwable ignore) {
+                }
+            }
+            if (key == null) {
+                try {
+                    if (data != null && data.hasNonNull("id")) key = data.get("id").asText();
+                } catch (Throwable ignore) {
+                }
+            }
+            if (key == null) {
+                // Fallback to event tail ("placed"/"modified"/"cancelled")
+                String[] sub = event == null ? null : event.split("\\.");
+                key = (sub != null && sub.length > 1) ? sub[1] : "order";
+            }
+
+            events.publish(EventBusConfig.TOPIC_ORDER, key, wrap.toString());
         } catch (Exception e) {
             log.warn("best-effort publishOrderEvent failed: {}", e.toString());
         }
     }
 
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
 }

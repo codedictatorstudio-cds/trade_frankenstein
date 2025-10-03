@@ -162,8 +162,8 @@ public class MarketSentimentCard extends CardSection {
                 String word = j.path("word").asText("Neutral");
                 int score = j.path("score").asInt(50);
                 int conf = j.path("confidence").asInt(score);
-                int acc = j.path("accuracy").asInt(50);
-                update(word, score, conf, acc);
+
+                update(word, score, conf, 0);
             }
         } catch (Throwable ignored) {
             try {
@@ -171,7 +171,7 @@ public class MarketSentimentCard extends CardSection {
                 if (dq != null) {
                     int score = dq.path("score").asInt(50);
                     int conf = dq.path("confidence").asInt(score);
-                    int acc = dq.path("accuracy").asInt(50);
+                    int acc = dq.path("Accuracy").asInt(50);
                     String trend = dq.path("trend").asText("");
                     String word = trendWordOrScore(trend, score);
                     update(word, score, conf, acc);
