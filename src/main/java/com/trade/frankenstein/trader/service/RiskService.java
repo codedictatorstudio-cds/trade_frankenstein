@@ -9,9 +9,11 @@ import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
-import com.trade.frankenstein.trader.config.RiskConfig;
 import com.trade.frankenstein.trader.core.FastStateStore;
+import com.trade.frankenstein.trader.model.documents.RiskEvent;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
+import com.trade.frankenstein.trader.repo.documents.RiskEventRepo;
+import com.trade.frankenstein.trader.repo.documents.RiskSnapshotRepo;
 import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,16 +27,21 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 @Slf4j
 public class RiskService {
+    // Circuit config
+    private final float dailyDdCapAbs = 0f; // absolute rupee cap (optional)
+    private final float seedStartEquity = 0f; // baseline (optional)
 
-    // ----- Circuit live state -----
+    // Circuit live state
+    private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
     private final AtomicReference<Float> dayStartEquity = new AtomicReference<>(0f);
-    private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number if losing
-    // Local fallback for orders/min when Redis is unavailable
+    private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f);
+    private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
     private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
 
     @Autowired
@@ -50,14 +57,12 @@ public class RiskService {
     @Autowired
     private ObjectMapper mapper;
     @Autowired
-    private RiskConfig riskConfig;
+    private RiskEventRepo riskEventRepo;
+    @Autowired
+    private RiskSnapshotRepo riskSnapshotRepo;
 
-    // --- Dynamic DD Cap (Enhancement 1) ---
-    private volatile float dynamicDailyDdCapPct = 3.0f; // default fallback
+    private volatile float dynamicDailyDdCapPct = 3.0f;
 
-    /**
-     * Call at session open, after sharp swings, or periodically
-     */
     public void refreshDynamicRiskBudget() {
         Result<PortfolioService.PortfolioSummary> result = portfolioService.getPortfolioSummary();
         if (result.isOk()) {
@@ -65,36 +70,28 @@ public class RiskService {
             BigDecimal dayPnlPct = summary.getDayPnlPct();
             BigDecimal totalPnlPct = summary.getTotalPnlPct();
             int positionsCount = summary.getPositionsCount();
-            float minCap = 1.0f, maxCap = 5.0f;
-            float baseCap = 3.0f;
+            float minCap = 1.0f, maxCap = 5.0f, baseCap = 3.0f;
             if (positionsCount > 10) baseCap += 0.5f;
             if (dayPnlPct.signum() < 0) baseCap -= 0.5f;
             if (totalPnlPct.floatValue() > 10f) baseCap += 0.5f;
             dynamicDailyDdCapPct = Math.max(minCap, Math.min(baseCap, maxCap));
-        } else {
-            dynamicDailyDdCapPct = 3.0f;
-        }
+        } else dynamicDailyDdCapPct = 3.0f;
         log.info("Dynamic daily DD cap set to {}%", dynamicDailyDdCapPct);
     }
 
-    /**
-     * Circuit guard using dynamic DD cap
-     */
     private boolean isDailyCircuitTrippedDynamic(float lossAbs, float startEquity) {
         float ddPct = dynamicDailyDdCapPct;
         float cap = startEquity > 0f ? round2((ddPct * startEquity) / 100f) : RiskConstants.DAILY_LOSS_CAP.floatValue();
-        return lossAbs >= cap;
+        boolean tripped = lossAbs >= cap;
+        if (tripped) recordRiskEvent("DAILY_LOSS_BREACH", "Loss breached dynamic cap", null, lossAbs, true);
+        return tripped;
     }
 
-    /**
-     * Automatically updates budget every 30 min during market hours
-     */
     @Scheduled(cron = "0 */30 9-15 * * MON-FRI")
     public void scheduledRiskBudgetRefresh() {
         refreshDynamicRiskBudget();
     }
 
-    // --- Helpers ---
     private static double clamp01(double pct) {
         return Math.max(0.0, Math.min(100.0, pct));
     }
@@ -117,76 +114,55 @@ public class RiskService {
         }
     }
 
-    // --- ORDER CHECK ---
     @Transactional(readOnly = true)
     public Result checkOrder(PlaceOrderRequest req) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in : check Order");
-            return Result.fail("user-not-logged-in");
-        }
-        if (isKillSwitchOpenNew()) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isKillSwitchOpenNew())
             return Result.fail("KILL_SWITCH_OPEN_NEW", "New position lockout: exposure breach active");
-        }
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
-        // 1) Symbol blacklist
         String instrumentKey = req.getInstrumentToken();
-        if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains)) {
+        if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains))
             return Result.fail("SYMBOL_BLOCKED", "Blocked instrument: " + instrumentKey);
-        }
-        // 2) Throttle: orders/minute
-        double ordPct = getOrdersPerMinutePct(); // 0..100
-        if (ordPct >= 100.0) {
-            return Result.fail("THROTTLED", "Orders per minute throttle reached");
-        }
-        // 3) SL cool-down
+
+        double ordPct = getOrdersPerMinutePct();
+        if (ordPct >= 100.0) return Result.fail("THROTTLED", "Orders per minute throttle reached");
         int mins = getMinutesSinceLastSl(instrumentKey);
-        if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES) {
+        if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES)
             return Result.fail("SL_COOLDOWN", "Wait " + (BotConsts.Risk.SL_COOLDOWN_MINUTES - mins) + "m after last SL");
-        }
-        // 4) Disable re-entry after 2 SL
         int rsToday = getRestrikesToday(instrumentKey);
-        if (rsToday >= 2) {
-            return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
-        }
-        // 5) Market hygiene: live 1m bar roughness as slippage proxy
+        if (rsToday >= 2) return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
         try {
             if (instrumentKey != null && !instrumentKey.isEmpty()) {
-                double roughnessPct = readLiveBarRoughnessPct(instrumentKey); // ((H-L)/mid)*100
+                double roughnessPct = readLiveBarRoughnessPct(instrumentKey);
                 double maxSlip = RiskConstants.MAX_SLIPPAGE_PCT.doubleValue();
-                if (!Double.isNaN(roughnessPct) && roughnessPct > maxSlip) {
-                    return Result.fail(
-                            "SLIPPAGE_HIGH",
-                            String.format(Locale.ROOT, "Live bar roughness %.2f%% exceeds %.2f%%", roughnessPct, maxSlip)
-                    );
-                }
+                if (!Double.isNaN(roughnessPct) && roughnessPct > maxSlip)
+                    return Result.fail("SLIPPAGE_HIGH",
+                            String.format(Locale.ROOT, "Live bar roughness %.2f%% exceeds %.2f%%", roughnessPct, maxSlip));
             }
         } catch (Exception t) {
             log.warn("checkOrder: slippage read failed (allowing order): {}", t.toString());
         }
-        // 6) Dynamic daily loss guard
+
         try {
             float lossNow = (float) currentLossRupees();
             float startEquity = nzf(dayStartEquity.get());
-            refreshDynamicRiskBudget(); // update before check
-            if (isDailyCircuitTrippedDynamic(lossNow, startEquity)) {
+            refreshDynamicRiskBudget();
+            if (isDailyCircuitTrippedDynamic(lossNow, startEquity))
                 return Result.fail("DAILY_LOSS_BREACH", "Daily loss cap reached");
-            }
         } catch (Exception t) {
             log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
         }
-        // 7) Exposure headroom: blocks if max lots or net delta would be exceeded
         String underlying = extractUnderlyingFromInstrument(req.getInstrumentToken());
-        int maxLots = 30; // example threshold, tune as needed
-        BigDecimal maxDelta = new BigDecimal("10000"); // e.g., max allowed net delta
-        if (!hasExposureHeadroom(underlying, maxLots, maxDelta)) {
+        int maxLots = 30; // ideally from config
+        BigDecimal maxDelta = new BigDecimal("10000");
+        boolean headroom = hasExposureHeadroom(underlying, maxLots, maxDelta);
+        if (!headroom) {
+            recordRiskEvent("LOTS_CAP", "Max lots exceeded in " + underlying, null, getOpenLotsForUnderlying(underlying), true);
             return Result.fail("EXPOSURE_LIMIT", "Open lots or net delta limit reached for " + underlying);
         }
         return Result.ok(null);
     }
 
-    /**
-     * Implement your own logic based on trading symbol format to extract underlying (e.g., "NIFTY")
-     */
     private String extractUnderlyingFromInstrument(String instrumentTokenOrSymbol) {
         if (instrumentTokenOrSymbol == null) return "";
         String tok = instrumentTokenOrSymbol.toUpperCase();
@@ -196,23 +172,16 @@ public class RiskService {
         return "NIFTY";
     }
 
-    /**
-     * Checks open lots and net delta before order placement
-     */
     public boolean hasExposureHeadroom(String underlyingKey, int maxLots, BigDecimal maxDelta) {
         int lotsOpen = getOpenLotsForUnderlying(underlyingKey);
         BigDecimal netDelta = getNetDeltaForUnderlying(underlyingKey);
-        return lotsOpen <= maxLots && netDelta.abs().compareTo(maxDelta) <= 0;
+        boolean ok = lotsOpen <= maxLots && netDelta.abs().compareTo(maxDelta) <= 0;
+        if (!ok) recordRiskEvent("LOTS_CAP", "Lots/netdelta exposure breached: " + underlyingKey, null, lotsOpen, true);
+        return ok;
     }
 
-    /**
-     * Call AFTER a successful placeOrder to advance the rolling throttle.
-     */
     public void noteOrderPlaced() {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return;
         Instant now = Instant.now();
         try {
             fast.incr("orders_per_min", Duration.ofSeconds(60));
@@ -231,7 +200,6 @@ public class RiskService {
         }
     }
 
-    // --- LIVE COMPUTATIONS (no reflection) ---
     private double getOrdersPerMinutePct() {
         final int cap = Math.max(1, RiskConstants.ORDERS_PER_MINUTE);
         try {
@@ -253,9 +221,7 @@ public class RiskService {
         MarketQuoteOHLCV3 d = q.getData().get(instrumentKey);
         if (d == null || d.getLiveOhlc() == null) return Double.NaN;
         OhlcV3 o = d.getLiveOhlc();
-        double high = o.getHigh();
-        double low = o.getLow();
-        double mid = (high + low) / 2.0;
+        double high = o.getHigh(), low = o.getLow(), mid = (high + low) / 2.0;
         if (mid <= 0.0 || high < low) return Double.NaN;
         return ((high - low) / mid) * 100.0;
     }
@@ -268,13 +234,9 @@ public class RiskService {
         }
     }
 
-    // --- SUMMARIES & CIRCUIT ---
     @Transactional(readOnly = true)
     public Result getSummary() {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return Result.fail("user-not-logged-in");
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return Result.fail("user-not-logged-in");
         try {
             RiskSnapshot snap = buildSnapshot();
             try {
@@ -292,10 +254,7 @@ public class RiskService {
     }
 
     public void refreshDailyLossFromBroker() {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return;
         try {
             float realized = toFloat(upstox.getRealizedPnlToday());
             float lossAbs = realized < 0f ? -realized : 0f;
@@ -318,12 +277,8 @@ public class RiskService {
     }
 
     public Result<Boolean> getCircuitState() {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return Result.fail("user-not-logged-in");
-        }
-        float lossAbs = nzf(dayLossAbs.get());
-        float startEquity = nzf(dayStartEquity.get());
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return Result.fail("user-not-logged-in");
+        float lossAbs = nzf(dayLossAbs.get()), startEquity = nzf(dayStartEquity.get());
         boolean tripped = isDailyCircuitTrippedDynamic(lossAbs, startEquity);
         try {
             stream.publishRisk("circuit", Boolean.valueOf(tripped).toString());
@@ -346,7 +301,7 @@ public class RiskService {
         double dailyLossPct = (cap > 0.0f) ? Math.min(100.0, (loss / cap) * 100.0) : 0.0;
         double ordersPerMinPct = getOrdersPerMinutePct();
         Integer lotsCap = RiskConstants.MAX_LOTS;
-        Integer lotsUsed = null; // derive from live positions when lot sizes are wired
+        Integer lotsUsed = null; // TODO: derive from live positions
         return RiskSnapshot.builder()
                 .asOf(now)
                 .riskBudgetLeft((double) budgetLeft)
@@ -363,25 +318,17 @@ public class RiskService {
             realized = toFloat(upstox.getRealizedPnlToday());
         } catch (Throwable ignored) {
         }
-        double pnl = realized; // +ve profit, -ve loss
+        double pnl = realized;
         return pnl < 0.0 ? -pnl : 0.0;
     }
 
     public void updateDailyLossAbs(float lossAbs) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return;
-        }
-        if (lossAbs >= 0f) {
-            dayLossAbs.set(lossAbs);
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return;
+        if (lossAbs >= 0f) dayLossAbs.set(lossAbs);
     }
 
     public int getMinutesSinceLastSl(String instrumentKey) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return -1;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return -1;
         if (instrumentKey == null || instrumentKey.isEmpty()) return -1;
         try {
             Optional<String> v = fast.get("sl:last:" + instrumentKey);
@@ -396,10 +343,7 @@ public class RiskService {
     }
 
     public int getRestrikesToday(String instrumentKey) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return 0;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return 0;
         if (instrumentKey == null || instrumentKey.isEmpty()) return 0;
         try {
             LocalDate d = LocalDate.now(ZoneId.of("Asia/Kolkata"));
@@ -412,10 +356,7 @@ public class RiskService {
     }
 
     public boolean hasHeadroom(double minBudgetPct) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return false;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return false;
         try {
             float lossAbs = (float) currentLossRupees();
             float startEquity = nzf(dayStartEquity.get());
@@ -423,7 +364,7 @@ public class RiskService {
             float cap = startEquity > 0f ? round2((dynamicDailyDdCapPct * startEquity) / 100f) : RiskConstants.DAILY_LOSS_CAP.floatValue();
             double budgetLeft = Math.max(0.0, cap - lossAbs);
             double budgetPctLeft = (cap > 0.0) ? (budgetLeft * 100.0 / cap) : 100.0;
-            double ordPct = getOrdersPerMinutePct(); // 0..100
+            double ordPct = getOrdersPerMinutePct();
             boolean throttleOk = ordPct < 100.0;
             return budgetPctLeft >= Math.max(0.0, minBudgetPct) && throttleOk && !isDailyCircuitTrippedDynamic(lossAbs, startEquity);
         } catch (Exception e) {
@@ -432,10 +373,7 @@ public class RiskService {
     }
 
     public void recordStopLoss(String instrumentKey) {
-        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
-            log.info("User not logged in");
-            return;
-        }
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) return;
         if (instrumentKey == null || instrumentKey.isEmpty()) return;
         try {
             fast.put("sl:last:" + instrumentKey, String.valueOf(Instant.now().getEpochSecond()), Duration.ofHours(24));
@@ -499,90 +437,60 @@ public class RiskService {
     }
 
     public Optional<Boolean> isDailyCircuitTripped() {
-        float lossAbs = nzf(dayLossAbs.get());
-        float startEquity = nzf(dayStartEquity.get());
+        float lossAbs = nzf(dayLossAbs.get()), startEquity = nzf(dayStartEquity.get());
         boolean tripped = isDailyCircuitTrippedDynamic(lossAbs, startEquity);
         return Optional.of(tripped);
     }
 
-    /**
-     * Returns the current daily loss percentage (0..100),
-     * computed using the dynamic daily drawdown cap.
-     */
     public double getDailyLossPct() {
-        float lossAbs = nzf(dayLossAbs.get());
-        float startEquity = nzf(dayStartEquity.get());
+        float lossAbs = nzf(dayLossAbs.get()), startEquity = nzf(dayStartEquity.get());
         refreshDynamicRiskBudget();
-        float cap = startEquity > 0f
-                ? round2((dynamicDailyDdCapPct * startEquity) / 100f)
-                : RiskConstants.DAILY_LOSS_CAP.floatValue();
+        float cap = startEquity > 0f ? round2((dynamicDailyDdCapPct * startEquity) / 100f) : RiskConstants.DAILY_LOSS_CAP.floatValue();
         return (cap > 0.0f) ? Math.min(100.0, (lossAbs / cap) * 100.0) : 0.0;
     }
 
-    /**
-     * Returns the current invested amount, exposure value, and position count.
-     */
     public PortfolioService.PortfolioSummary getLivePortfolioSummary() {
         Result<PortfolioService.PortfolioSummary> summaryRes = portfolioService.getPortfolioSummary();
-        if (summaryRes.isOk()) {
-            return summaryRes.get();
-        }
+        if (summaryRes.isOk()) return summaryRes.get();
         return new PortfolioService.PortfolioSummary(
                 BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, 0);
     }
 
-    /**
-     * Returns the overall open lots for a specific underlying (e.g., "NIFTY").
-     */
     public int getOpenLotsForUnderlying(String underlyingKey) {
         Result<Integer> lotsRes = portfolioService.getOpenLotsForUnderlying(underlyingKey);
         return lotsRes.isOk() ? lotsRes.get() : 0;
     }
 
-    /**
-     * Returns the net delta (directional risk) for a specific underlying.
-     */
     public BigDecimal getNetDeltaForUnderlying(String underlyingKey) {
         Result<BigDecimal> deltaRes = portfolioService.getNetDeltaForUnderlying(underlyingKey);
         return deltaRes.isOk() ? deltaRes.get() : BigDecimal.ZERO;
     }
 
-    /**
-     * Returns risk greeks for a given underlying (delta, gamma, theta, vega).
-     */
     public PortfolioService.PortfolioGreeks getNetGreeksForUnderlying(String underlyingKey) {
         Result<PortfolioService.PortfolioGreeks> greeksRes = portfolioService.getNetGreeksForUnderlying(underlyingKey);
         return greeksRes.isOk() ? greeksRes.get() : new PortfolioService.PortfolioGreeks(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
     }
 
-    /**
-     * Every 5 minutes, automatically check exposure for key indices.
-     * If open lots or net delta breaches hard limits, trigger kill switch for new trades ("lockout").
-     */
     @Scheduled(cron = "0 */5 9-15 * * MON-FRI")
     public void scheduledExposureSweep() {
-        String[] keys = {"NIFTY", "BANKNIFTY"};
+        String[] keys = {"NIFTY", "BANKNIFTY", "FINNIFTY"};
+        int maxLots = 30;
+        BigDecimal maxDelta = new BigDecimal("10000");
         for (String key : keys) {
-            int maxLots = riskConfig.getMaxLots(key);
-            int maxDelta = riskConfig.getMaxDelta(key);
-            boolean ok = hasExposureHeadroom(key, maxLots, BigDecimal.valueOf(maxDelta));
+            boolean ok = hasExposureHeadroom(key, maxLots, maxDelta);
             int lotsOpen = getOpenLotsForUnderlying(key);
             BigDecimal netDelta = getNetDeltaForUnderlying(key);
             if (!ok) {
                 publishCircuitState(true, "exposure-limit-exceeded:" + key);
                 setKillSwitchOpenNew(true, "Exposure breach: " + key);
                 log.warn("KILL SWITCH TRIGGERED: {} lots={}, netDelta={}", key, lotsOpen, netDelta);
-                // --- AUTO-UNWIND ----
                 int lotsToReduce = Math.max(0, lotsOpen - maxLots);
-                if (lotsToReduce > 0) {
-                    autoHedgeOrUnwind(key, lotsToReduce);
-                }
+                if (lotsToReduce > 0) autoHedgeOrUnwind(key, lotsToReduce);
             } else {
                 setKillSwitchOpenNew(false, "Exposure normalized: " + key);
             }
         }
     }
-
 
     private volatile boolean killSwitchOpenNew = false;
 
@@ -596,30 +504,22 @@ public class RiskService {
         return killSwitchOpenNew;
     }
 
-    /**
-     * Attempts to reduce risk by forcibly unwinding excess lots in the given underlying.
-     * Uses UpstoxService.exitAllPositions or targeted exits if needed.
-     */
     public void autoHedgeOrUnwind(String underlyingKey, int lotsToReduce) {
         if (lotsToReduce <= 0) return;
         try {
-            // Notify operator
             log.warn("AUTO-UNWIND triggered for {}: will try to reduce {} lots", underlyingKey, lotsToReduce);
-
-            // --- (1) Try to find open positions for this underlying ---
             Result<GetPositionResponse> pfRes = portfolioService.getPortfolio();
             if (!pfRes.isOk() || pfRes.get() == null) {
                 log.error("Unable to get portfolio for auto-unwind: {}", pfRes.getError());
                 return;
             }
-            List<PositionData> rows = pfRes.get().getData();
+            List<com.upstox.api.PositionData> rows = pfRes.get().getData();
             if (rows == null || rows.isEmpty()) {
                 log.info("No open positions in portfolio for {}", underlyingKey);
                 return;
             }
-
             int lotsLeft = lotsToReduce;
-            for (PositionData row : rows) {
+            for (com.upstox.api.PositionData row : rows) {
                 if (lotsLeft <= 0) break;
                 if (row == null) continue;
                 String ts = row.getTradingSymbol();
@@ -629,8 +529,6 @@ public class RiskService {
                 int lotSize = portfolioService.defaultLotSizeForSymbol(ts.toUpperCase());
                 int absLots = Math.abs(qty) / lotSize;
                 int exitLots = Math.min(absLots, lotsLeft);
-
-                // --- (2) Place an opposite order to flatten lots ---
                 try {
                     PlaceOrderRequest req = new PlaceOrderRequest();
                     req.setInstrumentToken(row.getInstrumentToken());
@@ -642,7 +540,6 @@ public class RiskService {
                     req.setProduct(row.getProduct() != null ? PlaceOrderRequest.ProductEnum.valueOf(row.getProduct()) : PlaceOrderRequest.ProductEnum.I);
                     req.setValidity(PlaceOrderRequest.ValidityEnum.DAY);
                     req.setTag("AUTO-UNWIND");
-
                     log.warn("Auto-unwind placing {} order for {} ({}) qty={}",
                             req.getTransactionType(), ts, row.getInstrumentToken(), req.getQuantity());
                     upstox.placeOrder(req);
@@ -651,25 +548,51 @@ public class RiskService {
                     log.error("Auto-unwind order failed for {}: {}", ts, e.getMessage());
                 }
             }
-
-            // --- (3) Fallback: if lots still left, trigger "exit all" at the segment level ---
             if (lotsLeft > 0) {
-                String segment = "FO"; // Edit if necessary for equities, etc.
+                String segment = "FO";
                 log.warn("Lots to unwind remain, issuing exitAllPositions for segment {}", segment);
                 upstox.exitAllPositions(segment, "AUTO-UNWIND:" + underlyingKey);
             }
-
             log.warn("Auto-unwind for {} complete. Target: {} lots, remaining: {}", underlyingKey, lotsToReduce, lotsLeft);
-
-            // (Optional): Notify operators via publishRisk
             stream.publishRisk("auto-hedge", "Auto-unwind triggered for " + underlyingKey + " reduced " + (lotsToReduce - lotsLeft) + " lots.");
+            recordRiskEvent("AUTO_UNWIND", "Auto-unwind for exposure breach: " + underlyingKey, null, lotsToReduce, true);
         } catch (Exception ex) {
             log.error("AUTO-UNWIND fatal error for {}: {}", underlyingKey, ex.getMessage());
             try {
                 stream.publishRisk("auto-hedge", "Auto-unwind failed: " + ex.getMessage());
             } catch (Exception ignore) {
             }
+            recordRiskEvent("AUTO_UNWIND_FAILED", "Auto-unwind failed: " + ex.getMessage(), null, lotsToReduce, true);
         }
     }
 
+    // ==== RISK EVENT/AUDIT LOGGING ====
+    public void recordRiskEvent(String type, String reason, String orderRef, double value, boolean breached) {
+        RiskEvent event = RiskEvent.builder()
+                .ts(Instant.now())
+                .type(type)
+                .reason(reason)
+                .orderRef(orderRef)
+                .value(value)
+                .breached(breached)
+                .build();
+        riskEventRepo.save(event);
+        log.info("RiskEvent recorded: {}", event);
+    }
+
+    public List<RiskEvent> getRecentRiskEvents(int lastN) {
+        return riskEventRepo.findTopNByOrderByTsDesc(lastN);
+    }
+
+    public List<RiskEvent> getEventsBetween(Instant start, Instant end) {
+        return riskEventRepo.findByTsBetween(start, end);
+    }
+
+    public List<RiskSnapshot> getRiskSnapshotsBetween(Instant from, Instant to) {
+        return riskSnapshotRepo.findByAsOfBetween(from, to);
+    }
+
+    public List<RiskSnapshot> getRecentRiskSnapshots(int lastN) {
+        return riskSnapshotRepo.findTopNByOrderByAsOfDesc(lastN);
+    }
 }
