@@ -333,12 +333,12 @@ public class PortfolioService {
         }
     }
 
-    private int defaultLotSizeForSymbol(String symUC) {
+    public int defaultLotSizeForSymbol(String symUC) {
         if (symUC == null) return 1;
-        if (symUC.contains("BANKNIFTY")) return 15;   // heuristic
+        if (symUC.contains("BANKNIFTY")) return 35;   // heuristic
         if (symUC.contains("FINNIFTY")) return 40;    // heuristic
         if (symUC.contains("MIDCPNIFTY")) return 25;  // heuristic
-        if (symUC.contains("NIFTY")) return 50;       // heuristic default
+        if (symUC.contains("NIFTY")) return 75;       // heuristic default
         return 1;                                     // equities or unknown
     }
 

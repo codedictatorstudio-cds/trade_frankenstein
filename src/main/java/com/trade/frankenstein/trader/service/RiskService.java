@@ -11,10 +11,7 @@ import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
-import com.upstox.api.GetMarketQuoteOHLCResponseV3;
-import com.upstox.api.MarketQuoteOHLCV3;
-import com.upstox.api.OhlcV3;
-import com.upstox.api.PlaceOrderRequest;
+import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -26,10 +23,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.Locale;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -39,16 +33,13 @@ public class RiskService {
     // ----- Circuit config -----
     private final float dailyDdCapAbs = 0f; // absolute rupee cap (optional)
     private final float seedStartEquity = 0f; // baseline for pct cap (optional)
-
     // ----- Circuit live state -----
     private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
     private final AtomicReference<Float> dayStartEquity = new AtomicReference<>(0f);
     private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number if losing
     private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
-
     // Local fallback for orders/min when Redis is unavailable
     private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
-
     @Autowired
     private UpstoxService upstox;
     @Autowired
@@ -61,7 +52,6 @@ public class RiskService {
     private EventPublisher bus;
     @Autowired
     private ObjectMapper mapper;
-
     // --- Dynamic DD Cap (Enhancement 1) ---
     private volatile float dynamicDailyDdCapPct = 3.0f; // default fallback
 
@@ -198,13 +188,12 @@ public class RiskService {
      * Implement your own logic based on trading symbol format to extract underlying (e.g., "NIFTY")
      */
     private String extractUnderlyingFromInstrument(String instrumentTokenOrSymbol) {
-        // Example: parse symbol string containing "NIFTY", "BANKNIFTY", etc.
         if (instrumentTokenOrSymbol == null) return "";
         String tok = instrumentTokenOrSymbol.toUpperCase();
         if (tok.contains("BANKNIFTY")) return "BANKNIFTY";
         if (tok.contains("NIFTY")) return "NIFTY";
         if (tok.contains("FINNIFTY")) return "FINNIFTY";
-        return "NIFTY"; // Default fallback
+        return "NIFTY";
     }
 
     /**
@@ -228,7 +217,6 @@ public class RiskService {
         try {
             fast.incr("orders_per_min", Duration.ofSeconds(60));
         } catch (Exception e) {
-            // Fallback: local rolling window (best-effort)
             orderTimestamps.addLast(now);
             evictOlderThan(now.minusSeconds(60));
         }
@@ -252,7 +240,8 @@ public class RiskService {
                 long count = Long.parseLong(v.get());
                 return clamp01((count * 100.0) / cap);
             }
-        } catch (Exception ignored) { /* fall back */ }
+        } catch (Exception ignored) {
+        }
         evictOlderThan(Instant.now().minusSeconds(60));
         int count = orderTimestamps.size();
         return clamp01((count * 100.0) / cap);
@@ -308,14 +297,13 @@ public class RiskService {
             return;
         }
         try {
-            float realized = toFloat(upstox.getRealizedPnlToday()); // +ve profit, -ve loss
+            float realized = toFloat(upstox.getRealizedPnlToday());
             float lossAbs = realized < 0f ? -realized : 0f;
             updateDailyLossAbs(lossAbs);
             try {
                 publishRiskEvent("summary", buildSnapshot(), "pnl-refresh");
             } catch (Throwable ignored) {
             }
-            // Auto-trip circuit if needed
             float startEquity = nzf(dayStartEquity.get());
             if (isDailyCircuitTrippedDynamic(lossAbs, startEquity)) {
                 try {
@@ -379,9 +367,6 @@ public class RiskService {
         return pnl < 0.0 ? -pnl : 0.0;
     }
 
-    /**
-     * Call from your PnL updater to keep losses current (pass a positive loss amount).
-     */
     public void updateDailyLossAbs(float lossAbs) {
         if (!AuthCodeHolder.getInstance().isLoggedIn()) {
             log.info("User not logged in");
@@ -453,26 +438,24 @@ public class RiskService {
         }
         if (instrumentKey == null || instrumentKey.isEmpty()) return;
         try {
-            // Store last SL timestamp (secs) with a 24h TTL
             fast.put("sl:last:" + instrumentKey, String.valueOf(Instant.now().getEpochSecond()), Duration.ofHours(24));
-        } catch (Exception ignored) { /* best-effort */ }
+        } catch (Exception ignored) {
+        }
         try {
-            // Increment today's restrike count with TTL until midnight IST
             LocalDate d = LocalDate.now(ZoneId.of("Asia/Kolkata"));
             String key = "sl:count:" + instrumentKey + ":" + d;
             fast.incr(key, Duration.ofHours(16));
-        } catch (Exception ignored) { /* best-effort */ }
+        } catch (Exception ignored) {
+        }
     }
 
-    // --- Event publishing ---
     private void publishRiskEvent(String subTopic, RiskSnapshot snap, String reason) {
         try {
-            // SSE (UI)
             try {
                 JsonNode n = mapper.valueToTree(snap);
                 stream.publishRisk(subTopic, n.toPrettyString());
-            } catch (Throwable ignored) { /* best-effort SSE */ }
-            // Kafka (internal bus)
+            } catch (Throwable ignored) {
+            }
             try {
                 final JsonObject o = new JsonObject();
                 o.addProperty("ts", java.time.Instant.now().toEpochMilli());
@@ -490,17 +473,18 @@ public class RiskService {
                 }
                 String key = "summary";
                 bus.publish(EventBusConfig.TOPIC_RISK, key, o.toString());
-            } catch (Throwable ignored) { /* best-effort Kafka */ }
-        } catch (Throwable ignoredOuter) { /* swallow */ }
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignoredOuter) {
+        }
     }
 
     private void publishCircuitState(boolean tripped, String reason) {
         try {
-            // SSE (UI)
             try {
                 stream.publishRisk("circuit", Boolean.valueOf(tripped).toString());
-            } catch (Throwable ignored) { /* best-effort SSE */ }
-            // Kafka (internal bus)
+            } catch (Throwable ignored) {
+            }
             try {
                 final JsonObject o = new JsonObject();
                 o.addProperty("ts", java.time.Instant.now().toEpochMilli());
@@ -508,8 +492,10 @@ public class RiskService {
                 o.addProperty("circuit", tripped);
                 String key = "circuit";
                 bus.publish(EventBusConfig.TOPIC_RISK, key, o.toString());
-            } catch (Throwable ignored) { /* best-effort Kafka */ }
-        } catch (Throwable ignoredOuter) { /* swallow */ }
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignoredOuter) {
+        }
     }
 
     public Optional<Boolean> isDailyCircuitTripped() {
@@ -526,7 +512,7 @@ public class RiskService {
     public double getDailyLossPct() {
         float lossAbs = nzf(dayLossAbs.get());
         float startEquity = nzf(dayStartEquity.get());
-        refreshDynamicRiskBudget(); // Ensure the latest cap is loaded
+        refreshDynamicRiskBudget();
         float cap = startEquity > 0f
                 ? round2((dynamicDailyDdCapPct * startEquity) / 100f)
                 : RiskConstants.DAILY_LOSS_CAP.floatValue();
@@ -541,7 +527,6 @@ public class RiskService {
         if (summaryRes.isOk()) {
             return summaryRes.get();
         }
-        // fallback: empty summary if not available
         return new PortfolioService.PortfolioSummary(
                 BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, 0);
     }
@@ -581,28 +566,110 @@ public class RiskService {
         BigDecimal maxDelta = new BigDecimal("10000");
         for (String key : keys) {
             boolean ok = hasExposureHeadroom(key, maxLots, maxDelta);
+            int lotsOpen = getOpenLotsForUnderlying(key);
+            BigDecimal netDelta = getNetDeltaForUnderlying(key);
             if (!ok) {
                 publishCircuitState(true, "exposure-limit-exceeded:" + key);
                 setKillSwitchOpenNew(true, "Exposure breach: " + key);
-                log.warn("KILL SWITCH TRIGGERED: {} lots={}, netDelta={}", key, getOpenLotsForUnderlying(key), getNetDeltaForUnderlying(key));
+                log.warn("KILL SWITCH TRIGGERED: {} lots={}, netDelta={}", key, lotsOpen, netDelta);
+                // --- AUTO-UNWIND ----
+                int lotsToReduce = Math.max(0, lotsOpen - maxLots);
+                if (lotsToReduce > 0) {
+                    autoHedgeOrUnwind(key, lotsToReduce);
+                }
             } else {
-                // If exposure recovers, clear kill switch/open trades
                 setKillSwitchOpenNew(false, "Exposure normalized: " + key);
             }
         }
     }
+
 
     private volatile boolean killSwitchOpenNew = false;
 
     public void setKillSwitchOpenNew(boolean value, String reason) {
         killSwitchOpenNew = value;
         log.info("Kill Switch (open new positions) set to {} due to {}", value, reason);
-        // Optionally: Broadcast kill switch state to UI/kafka
         publishCircuitState(value, reason);
     }
 
     public boolean isKillSwitchOpenNew() {
         return killSwitchOpenNew;
+    }
+
+    /**
+     * Attempts to reduce risk by forcibly unwinding excess lots in the given underlying.
+     * Uses UpstoxService.exitAllPositions or targeted exits if needed.
+     */
+    public void autoHedgeOrUnwind(String underlyingKey, int lotsToReduce) {
+        if (lotsToReduce <= 0) return;
+        try {
+            // Notify operator
+            log.warn("AUTO-UNWIND triggered for {}: will try to reduce {} lots", underlyingKey, lotsToReduce);
+
+            // --- (1) Try to find open positions for this underlying ---
+            Result<GetPositionResponse> pfRes = portfolioService.getPortfolio();
+            if (!pfRes.isOk() || pfRes.get() == null) {
+                log.error("Unable to get portfolio for auto-unwind: {}", pfRes.getError());
+                return;
+            }
+            List<PositionData> rows = pfRes.get().getData();
+            if (rows == null || rows.isEmpty()) {
+                log.info("No open positions in portfolio for {}", underlyingKey);
+                return;
+            }
+
+            int lotsLeft = lotsToReduce;
+            for (PositionData row : rows) {
+                if (lotsLeft <= 0) break;
+                if (row == null) continue;
+                String ts = row.getTradingSymbol();
+                if (ts == null || !ts.toUpperCase().contains(underlyingKey.toUpperCase())) continue;
+                int qty = row.getQuantity() == null ? 0 : row.getQuantity();
+                if (qty == 0) continue;
+                int lotSize = portfolioService.defaultLotSizeForSymbol(ts.toUpperCase());
+                int absLots = Math.abs(qty) / lotSize;
+                int exitLots = Math.min(absLots, lotsLeft);
+
+                // --- (2) Place an opposite order to flatten lots ---
+                try {
+                    PlaceOrderRequest req = new PlaceOrderRequest();
+                    req.setInstrumentToken(row.getInstrumentToken());
+                    req.setQuantity(exitLots * lotSize);
+                    req.setTransactionType(qty > 0 ?
+                            PlaceOrderRequest.TransactionTypeEnum.SELL :
+                            PlaceOrderRequest.TransactionTypeEnum.BUY);
+                    req.setOrderType(PlaceOrderRequest.OrderTypeEnum.MARKET);
+                    req.setProduct(row.getProduct() != null ? PlaceOrderRequest.ProductEnum.valueOf(row.getProduct()) : PlaceOrderRequest.ProductEnum.I);
+                    req.setValidity(PlaceOrderRequest.ValidityEnum.DAY);
+                    req.setTag("AUTO-UNWIND");
+
+                    log.warn("Auto-unwind placing {} order for {} ({}) qty={}",
+                            req.getTransactionType(), ts, row.getInstrumentToken(), req.getQuantity());
+                    upstox.placeOrder(req);
+                    lotsLeft -= exitLots;
+                } catch (Exception e) {
+                    log.error("Auto-unwind order failed for {}: {}", ts, e.getMessage());
+                }
+            }
+
+            // --- (3) Fallback: if lots still left, trigger "exit all" at the segment level ---
+            if (lotsLeft > 0) {
+                String segment = "FO"; // Edit if necessary for equities, etc.
+                log.warn("Lots to unwind remain, issuing exitAllPositions for segment {}", segment);
+                upstox.exitAllPositions(segment, "AUTO-UNWIND:" + underlyingKey);
+            }
+
+            log.warn("Auto-unwind for {} complete. Target: {} lots, remaining: {}", underlyingKey, lotsToReduce, lotsLeft);
+
+            // (Optional): Notify operators via publishRisk
+            stream.publishRisk("auto-hedge", "Auto-unwind triggered for " + underlyingKey + " reduced " + (lotsToReduce - lotsLeft) + " lots.");
+        } catch (Exception ex) {
+            log.error("AUTO-UNWIND fatal error for {}: {}", underlyingKey, ex.getMessage());
+            try {
+                stream.publishRisk("auto-hedge", "Auto-unwind failed: " + ex.getMessage());
+            } catch (Exception ignore) {
+            }
+        }
     }
 
 }
