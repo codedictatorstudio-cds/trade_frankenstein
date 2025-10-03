@@ -36,7 +36,6 @@ import java.util.concurrent.atomic.AtomicReference;
 @Service
 @Slf4j
 public class RiskService {
-
     // ----- Circuit config -----
     private final float dailyDdCapAbs = 0f; // absolute rupee cap (optional)
     private final float seedStartEquity = 0f; // baseline for pct cap (optional)
@@ -76,7 +75,6 @@ public class RiskService {
             BigDecimal dayPnlPct = summary.getDayPnlPct();
             BigDecimal totalPnlPct = summary.getTotalPnlPct();
             int positionsCount = summary.getPositionsCount();
-
             float minCap = 1.0f, maxCap = 5.0f;
             float baseCap = 3.0f;
             if (positionsCount > 10) baseCap += 0.5f;
@@ -137,31 +135,26 @@ public class RiskService {
             return Result.fail("user-not-logged-in");
         }
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
-
         // 1) Symbol blacklist
         String instrumentKey = req.getInstrumentToken();
         if (instrumentKey != null && RiskConstants.BLACKLIST_SYMBOLS.stream().anyMatch(instrumentKey::contains)) {
             return Result.fail("SYMBOL_BLOCKED", "Blocked instrument: " + instrumentKey);
         }
-
         // 2) Throttle: orders/minute
         double ordPct = getOrdersPerMinutePct(); // 0..100
         if (ordPct >= 100.0) {
             return Result.fail("THROTTLED", "Orders per minute throttle reached");
         }
-
         // 3) SL cool-down
         int mins = getMinutesSinceLastSl(instrumentKey);
         if (mins >= 0 && mins < BotConsts.Risk.SL_COOLDOWN_MINUTES) {
             return Result.fail("SL_COOLDOWN", "Wait " + (BotConsts.Risk.SL_COOLDOWN_MINUTES - mins) + "m after last SL");
         }
-
         // 4) Disable re-entry after 2 SL
         int rsToday = getRestrikesToday(instrumentKey);
         if (rsToday >= 2) {
             return Result.fail("REENTRY_DISABLED", "Max re-entries reached for today");
         }
-
         // 5) Market hygiene: live 1m bar roughness as slippage proxy
         try {
             if (instrumentKey != null && !instrumentKey.isEmpty()) {
@@ -177,7 +170,6 @@ public class RiskService {
         } catch (Exception t) {
             log.warn("checkOrder: slippage read failed (allowing order): {}", t.toString());
         }
-
         // 6) Dynamic daily loss guard
         try {
             float lossNow = (float) currentLossRupees();
@@ -189,8 +181,36 @@ public class RiskService {
         } catch (Exception t) {
             log.warn("checkOrder: PnL read failed (allowing order): {}", t.toString());
         }
-
+        // 7) Exposure headroom: blocks if max lots or net delta would be exceeded
+        String underlying = extractUnderlyingFromInstrument(req.getInstrumentToken());
+        int maxLots = 30; // example threshold, tune as needed
+        BigDecimal maxDelta = new BigDecimal("10000"); // e.g., max allowed net delta
+        if (!hasExposureHeadroom(underlying, maxLots, maxDelta)) {
+            return Result.fail("EXPOSURE_LIMIT", "Open lots or net delta limit reached for " + underlying);
+        }
         return Result.ok(null);
+    }
+
+    /**
+     * Implement your own logic based on trading symbol format to extract underlying (e.g., "NIFTY")
+     */
+    private String extractUnderlyingFromInstrument(String instrumentTokenOrSymbol) {
+        // Example: parse symbol string containing "NIFTY", "BANKNIFTY", etc.
+        if (instrumentTokenOrSymbol == null) return "";
+        String tok = instrumentTokenOrSymbol.toUpperCase();
+        if (tok.contains("BANKNIFTY")) return "BANKNIFTY";
+        if (tok.contains("NIFTY")) return "NIFTY";
+        if (tok.contains("FINNIFTY")) return "FINNIFTY";
+        return "NIFTY"; // Default fallback
+    }
+
+    /**
+     * Checks open lots and net delta before order placement
+     */
+    public boolean hasExposureHeadroom(String underlyingKey, int maxLots, BigDecimal maxDelta) {
+        int lotsOpen = getOpenLotsForUnderlying(underlyingKey);
+        BigDecimal netDelta = getNetDeltaForUnderlying(underlyingKey);
+        return lotsOpen <= maxLots && netDelta.abs().compareTo(maxDelta) <= 0;
     }
 
     /**
@@ -507,7 +527,6 @@ public class RiskService {
         float cap = startEquity > 0f
                 ? round2((dynamicDailyDdCapPct * startEquity) / 100f)
                 : RiskConstants.DAILY_LOSS_CAP.floatValue();
-
         return (cap > 0.0f) ? Math.min(100.0, (lossAbs / cap) * 100.0) : 0.0;
     }
 
@@ -547,5 +566,4 @@ public class RiskService {
         Result<PortfolioService.PortfolioGreeks> greeksRes = portfolioService.getNetGreeksForUnderlying(underlyingKey);
         return greeksRes.isOk() ? greeksRes.get() : new PortfolioService.PortfolioGreeks(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
     }
-
 }
