@@ -9,6 +9,7 @@ import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.BotConsts;
 import com.trade.frankenstein.trader.common.constants.RiskConstants;
+import com.trade.frankenstein.trader.config.RiskConfig;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.upstox.api.*;
@@ -24,22 +25,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 @Slf4j
 public class RiskService {
-    // ----- Circuit config -----
-    private final float dailyDdCapAbs = 0f; // absolute rupee cap (optional)
-    private final float seedStartEquity = 0f; // baseline for pct cap (optional)
+
     // ----- Circuit live state -----
-    private final AtomicReference<LocalDate> ddDay = new AtomicReference<>(LocalDate.now(ZoneId.of("Asia/Kolkata")));
     private final AtomicReference<Float> dayStartEquity = new AtomicReference<>(0f);
     private final AtomicReference<Float> dayLossAbs = new AtomicReference<>(0f); // positive number if losing
-    private final AtomicBoolean circuitTripped = new AtomicBoolean(false);
     // Local fallback for orders/min when Redis is unavailable
     private final Deque<Instant> orderTimestamps = new ArrayDeque<>();
+
     @Autowired
     private UpstoxService upstox;
     @Autowired
@@ -52,6 +49,9 @@ public class RiskService {
     private EventPublisher bus;
     @Autowired
     private ObjectMapper mapper;
+    @Autowired
+    private RiskConfig riskConfig;
+
     // --- Dynamic DD Cap (Enhancement 1) ---
     private volatile float dynamicDailyDdCapPct = 3.0f; // default fallback
 
@@ -561,11 +561,11 @@ public class RiskService {
      */
     @Scheduled(cron = "0 */5 9-15 * * MON-FRI")
     public void scheduledExposureSweep() {
-        String[] keys = {"NIFTY", "BANKNIFTY", "FINNIFTY"};
-        int maxLots = 30;
-        BigDecimal maxDelta = new BigDecimal("10000");
+        String[] keys = {"NIFTY", "BANKNIFTY"};
         for (String key : keys) {
-            boolean ok = hasExposureHeadroom(key, maxLots, maxDelta);
+            int maxLots = riskConfig.getMaxLots(key);
+            int maxDelta = riskConfig.getMaxDelta(key);
+            boolean ok = hasExposureHeadroom(key, maxLots, BigDecimal.valueOf(maxDelta));
             int lotsOpen = getOpenLotsForUnderlying(key);
             BigDecimal netDelta = getNetDeltaForUnderlying(key);
             if (!ok) {
