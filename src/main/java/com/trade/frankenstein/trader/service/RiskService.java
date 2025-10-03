@@ -134,6 +134,9 @@ public class RiskService {
             log.info("User not logged in : check Order");
             return Result.fail("user-not-logged-in");
         }
+        if (isKillSwitchOpenNew()) {
+            return Result.fail("KILL_SWITCH_OPEN_NEW", "New position lockout: exposure breach active");
+        }
         if (req == null) return Result.fail("BAD_REQUEST", "PlaceOrderRequest is required");
         // 1) Symbol blacklist
         String instrumentKey = req.getInstrumentToken();
@@ -566,4 +569,40 @@ public class RiskService {
         Result<PortfolioService.PortfolioGreeks> greeksRes = portfolioService.getNetGreeksForUnderlying(underlyingKey);
         return greeksRes.isOk() ? greeksRes.get() : new PortfolioService.PortfolioGreeks(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
     }
+
+    /**
+     * Every 5 minutes, automatically check exposure for key indices.
+     * If open lots or net delta breaches hard limits, trigger kill switch for new trades ("lockout").
+     */
+    @Scheduled(cron = "0 */5 9-15 * * MON-FRI")
+    public void scheduledExposureSweep() {
+        String[] keys = {"NIFTY", "BANKNIFTY", "FINNIFTY"};
+        int maxLots = 30;
+        BigDecimal maxDelta = new BigDecimal("10000");
+        for (String key : keys) {
+            boolean ok = hasExposureHeadroom(key, maxLots, maxDelta);
+            if (!ok) {
+                publishCircuitState(true, "exposure-limit-exceeded:" + key);
+                setKillSwitchOpenNew(true, "Exposure breach: " + key);
+                log.warn("KILL SWITCH TRIGGERED: {} lots={}, netDelta={}", key, getOpenLotsForUnderlying(key), getNetDeltaForUnderlying(key));
+            } else {
+                // If exposure recovers, clear kill switch/open trades
+                setKillSwitchOpenNew(false, "Exposure normalized: " + key);
+            }
+        }
+    }
+
+    private volatile boolean killSwitchOpenNew = false;
+
+    public void setKillSwitchOpenNew(boolean value, String reason) {
+        killSwitchOpenNew = value;
+        log.info("Kill Switch (open new positions) set to {} due to {}", value, reason);
+        // Optionally: Broadcast kill switch state to UI/kafka
+        publishCircuitState(value, reason);
+    }
+
+    public boolean isKillSwitchOpenNew() {
+        return killSwitchOpenNew;
+    }
+
 }
