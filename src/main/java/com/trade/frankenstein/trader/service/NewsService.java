@@ -2,7 +2,9 @@ package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.TradeNewsConstants;
+import com.trade.frankenstein.trader.enums.RiskLevel;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
+import com.trade.frankenstein.trader.model.dto.RiskAssessment;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
@@ -19,6 +21,7 @@ import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
 import org.springframework.data.mongodb.core.aggregation.AggregationResults;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,9 +39,7 @@ import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -52,12 +53,31 @@ import java.util.zip.GZIPInputStream;
 public class NewsService {
 
     private static final int MAX_BUFFER_EVENTS = 2000; // ring buffer cap
+    // ==== Step-11 constants & field names (kept local to avoid touching other files) ====
+    private static final String F_ID = "_id";
+    private static final String F_TITLE = "title";
+    private static final String F_DESC = "description";
+    private static final String F_SOURCE = "source";
+    private static final String F_PUBLISHED_AT = "publishedAt";
+    private static final String F_URL = "url";
+    private static final String F_EMBEDDING = "embedding";
+    private static final String F_TOPIC = "topic";
+    private static final String F_HASH = "contentHash";
+    private static final String VECTOR_INDEX_NAME = "news_embedding_idx"; // Atlas Vector Search index
+    private static final int EMBEDDING_DIM = 384;
+    private static final double DEDUPE_SIMILARITY_THRESHOLD = 0.86d;
+    private static final double CLUSTER_SIMILARITY_THRESHOLD = 0.80d;
+    private static final int K_NEIGHBORS = 20;
+    private static final int K_REFINE = 50;
+    private static final int LINEAR_SCAN_LIMIT = 1000;
+    private static final int MAX_TITLE_LEN = 400;
+    private static final int MAX_DESC_LEN = 2000;
     private final int defaultBurstWindowMin = 10;
     /**
      * In-memory rolling log of recent news events (append-only, auto-pruned).
      */
     private final Deque<NewsEvent> newsEvents = new ConcurrentLinkedDeque<>();
-    // -------------------- Config --------------------
+    // ---------- Config ----------
     private final List<String> feedUrls = Arrays.asList(TradeNewsConstants.NEWS_URLS);
     private final List<String> bullish = TradeNewsConstants.bullish;
     private final List<String> bearish = TradeNewsConstants.bearish;
@@ -73,48 +93,42 @@ public class NewsService {
     // Cache/health
     private final int cacheTtlMinutes = TradeNewsConstants.NEWS_CACHE_TTL_MINUTES;
     private final int healthTtlMinutes = TradeNewsConstants.NEWS_HEALTH_TTL_MINUTES;
-    // -------------------- Caches --------------------
+    // ---------- Caches ----------
     private final Map<String, CachedResult> resultCache = new ConcurrentHashMap<>();
     private final Map<String, FeedHealth> feedHealth = new ConcurrentHashMap<>();
     private final List<String> allowedContentTypes = List.of(TradeNewsConstants.NEWS_ALLOWED_CONTENT_TYPES);
+    // ---- Data structures for signals, performance, and risk ----
+    private final Map<String, Double> symbolSentimentWeights = new ConcurrentHashMap<>();
+    private final Map<String, List<TradingSignal>> activeSignals = new ConcurrentHashMap<>();
+    private final Deque<PriceImpactEvent> priceImpactHistory = new ConcurrentLinkedDeque<>();
+    private final Map<String, SignalPerformance> signalPerformanceMap = new ConcurrentHashMap<>();
+    private final Map<String, Double> sourceAccuracyRatings = new ConcurrentHashMap<>();
+    private final Map<String, MarketContext> symbolMarketContext = new ConcurrentHashMap<>();
+    private final Set<String> highVolatilitySymbols = ConcurrentHashMap.newKeySet();
+    private final Map<String, RiskThreshold> newsRiskThresholds = new ConcurrentHashMap<>();
+    private final ExecutorService newsProcessingPool = Executors.newFixedThreadPool(4);
     @Autowired
     private MarketSentimentSnapshotRepo sentimentRepo;
     @Autowired
     private StreamGateway stream;
-
-    // ===== Step-11 wiring (add-only) =====
+    // ==== Step-11 wiring (add-only) ====
     @Autowired(required = false)
     private MongoTemplate mongoTemplate; // used if present
-
     @Autowired(required = false)
     private EmbeddingClient embeddingClient; // optional embedder bean
-
     @Value("${tf.news.collection:news_articles}")
     private String newsCollection;
-
-    // ===== Step-11 constants & field names (kept local to avoid touching other files) =====
-    private static final String F_ID = "_id";
-    private static final String F_TITLE = "title";
-    private static final String F_DESC = "description";
-    private static final String F_SOURCE = "source";
-    private static final String F_PUBLISHED_AT = "publishedAt";
-    private static final String F_URL = "url";
-    private static final String F_EMBEDDING = "embedding";
-    private static final String F_TOPIC = "topic";
-    private static final String F_HASH = "contentHash";
-    private static final String VECTOR_INDEX_NAME = "news_embedding_idx"; // Atlas Vector Search index
-
-    private static final int EMBEDDING_DIM = 384;
-    private static final double DEDUPE_SIMILARITY_THRESHOLD = 0.86d;
-    private static final double CLUSTER_SIMILARITY_THRESHOLD = 0.80d;
-    private static final int K_NEIGHBORS = 20;
-    private static final int K_REFINE = 50;
-    private static final int LINEAR_SCAN_LIMIT = 1000;
-    private static final int MAX_TITLE_LEN = 400;
-    private static final int MAX_DESC_LEN = 2000;
+    // ---- Configuration for trading signals ----
+    @Value("${tf.news.trading.enabled:false}")
+    private boolean tradingSignalsEnabled;
+    @Value("${tf.news.signal.confidence.threshold:0.7}")
+    private double signalConfidenceThreshold;
+    @Value("${tf.news.price.impact.threshold:0.02}")
+    private double priceImpactThreshold;
+    private volatile boolean emergencyNewsHalt = false;
 
     private static List<String> trim(List<String> in) {
-        List<String> out = new ArrayList<String>();
+        List<String> out = new ArrayList<>();
         for (String s : in) if (s != null && !s.trim().isEmpty()) out.add(s.trim());
         return out;
     }
@@ -126,8 +140,7 @@ public class NewsService {
         return normalize(k);
     }
 
-    // -------------------- Public API --------------------
-
+    // ---------- Public API ----------
     private static String normalize(String s) {
         if (s == null) return "";
         return s.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
@@ -167,17 +180,16 @@ public class NewsService {
         return out;
     }
 
-    // -------------------- Internals --------------------
-
+    // ---------- Internals ----------
     // ---- Parse helpers ----
     private static boolean looksLikeXml(String s) {
         if (s == null) return false;
         String t = s.trim();
-        return t.startsWith("<?xml") || t.startsWith("<rss") || t.startsWith("<feed");
+        return t.startsWith("xml ") || t.startsWith("<rss") || t.startsWith("<feed");
     }
 
     private static List<NewsItem> parseRssOrAtom(String xml, String sourceUrl, int maxItems) throws Exception {
-        List<NewsItem> items = new ArrayList<NewsItem>();
+        List<NewsItem> items = new ArrayList<>();
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(false);
         dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -247,13 +259,13 @@ public class NewsService {
     }
 
     private static List<NewsItem> parseHtmlBasic(String pageUrl, String html, int maxItems) {
-        List<NewsItem> out = new ArrayList<NewsItem>();
+        List<NewsItem> out = new ArrayList<>();
         String source = hostOf(pageUrl);
 
-        String ogTitle = metaContent(html, "(?i)<meta\\s+property\\s*=\\s*\"og:title\"\\s+content\\s*=\\s*\"([^\"]+)\"");
-        String ogDesc = metaContent(html, "(?i)<meta\\s+property\\s*=\\s*\"og:description\"\\s+content\\s*=\\s*\"([^\"]+)\"");
+        String ogTitle = metaContent(html, "(?i)<meta[^>]*property=['\"]og:title['\"][^>]*content=['\"]([^'\"]+)['\"][^>]*>");
+        String ogDesc = metaContent(html, "(?i)<meta[^>]*property=['\"]og:description['\"][^>]*content=['\"]([^'\"]+)['\"][^>]*>");
         if (ogTitle == null || ogTitle.trim().isEmpty()) ogTitle = extractTagText(html, "title");
-        String pageDesc = (ogDesc != null && !ogDesc.isEmpty()) ? ogDesc : metaContent(html, "(?i)<meta\\s+name\\s*=\\s*\"description\"\\s+content\\s*=\\s*\"([^\"]+)\"");
+        String pageDesc = (ogDesc != null && !ogDesc.isEmpty()) ? ogDesc : metaContent(html, "(?i)<meta[^>]*name=['\"]description['\"][^>]*content=['\"]([^'\"]+)['\"][^>]*>");
         if (ogTitle != null && !ogTitle.trim().isEmpty()) {
             out.add(new NewsItem(ogTitle.trim(), nvl(pageDesc), pageUrl, null, source));
         }
@@ -265,7 +277,7 @@ public class NewsService {
                 String heading = stripTags(hm.group(1)).trim();
                 if (heading.length() > 20 && heading.length() < 150) {
                     String nearbyHtml = html.substring(Math.max(0, hm.start() - 100), Math.min(html.length(), hm.end() + 100));
-                    Pattern linkPattern = Pattern.compile("(?is)<a\\s+[^>]*href=['\"]([^'\"]+)['\"][^>]*>");
+                    Pattern linkPattern = Pattern.compile("(?is)<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>");
                     Matcher lm = linkPattern.matcher(nearbyHtml);
                     if (lm.find()) {
                         String href = lm.group(1);
@@ -283,29 +295,25 @@ public class NewsService {
         } catch (Exception ignored) {
         }
 
-        Pattern aTag = Pattern.compile("(?is)<a\\s+([^>]+)>(.*?)</a>");
+        Pattern aTag = Pattern.compile("(?is)<a([^>]*)>(.*?)</a>");
         Matcher m = aTag.matcher(html);
-        Set<String> seen = new HashSet<String>();
+        Set<String> seen = new HashSet<>();
         try {
             URI base = new URI(pageUrl);
             int guard = 0;
             while (m.find()) {
                 if (out.size() >= maxItems) break;
                 if (++guard > 8000) break;
-
                 String attrs = m.group(1);
                 String text = stripTags(m.group(2)).trim();
                 if (text.length() < 20 || text.length() > 150) continue;
-
                 String href = attrValue(attrs, "href");
                 if (href == null || href.trim().isEmpty()) continue;
                 if (href.startsWith("javascript:")) continue;
-
                 String abs = resolve(base, href.trim());
                 String key = normalize(text);
                 if (seen.contains(key)) continue;
                 seen.add(key);
-
                 out.add(new NewsItem(text, "", abs, null, source));
             }
         } catch (Exception ignored) {
@@ -373,7 +381,7 @@ public class NewsService {
 
     private static String htmlDecode(String s) {
         if (s == null) return "";
-        return s.replace("&nbsp;", " ")
+        return s.replace(" ", " ")
                 .replace("&amp;", "&")
                 .replace("&lt;", "<")
                 .replace("&gt;", ">")
@@ -399,7 +407,17 @@ public class NewsService {
         }
     }
 
-    // -------------- Lifecycle / Preflight -----------
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    private static String shortTitle(String t) {
+        if (t == null) return "";
+        return t.length() <= 64 ? t : t.substring(0, 61) + "...";
+    }
+
+    // ---------- Lifecycle / Preflight ----------
     @PostConstruct
     public void init() {
         try {
@@ -424,9 +442,9 @@ public class NewsService {
                 FeedHealth h = probe(url);
                 feedHealth.put(url, h);
                 log.info("NEWS FEED HEALTH [{}]: ok={}, code={}, type={}, size~{}B, xmlLike={}, latencyMs={}, finalUrl={}",
-                        shortUrl(url), Boolean.valueOf(h.isOk()), Integer.valueOf(h.getHttpCode()),
-                        safe(h.getContentType()), Long.valueOf(h.getApproxBytes()),
-                        Boolean.valueOf(h.isXmlLike()), Long.valueOf(h.getLatencyMs()), safe(h.getFinalUrl()));
+                        shortUrl(url), h.isOk(), h.getHttpCode(),
+                        safe(h.getContentType()), h.getApproxBytes(),
+                        h.isXmlLike(), h.getLatencyMs(), safe(h.getFinalUrl()));
             } catch (Exception e) {
                 FeedHealth h = new FeedHealth();
                 h.setOk(false);
@@ -444,7 +462,7 @@ public class NewsService {
             List<String> urls = (feedUrls == null) ? Collections.emptyList() : trim(feedUrls);
             if (urls.isEmpty()) return Result.fail("NEWS_DISABLED_OR_NO_FEEDS");
 
-            Map<String, Headline> byKey = new LinkedHashMap<String, Headline>();
+            Map<String, Headline> byKey = new LinkedHashMap<>();
             int errorCount = 0;
             int skippedUnhealthy = 0;
 
@@ -464,7 +482,7 @@ public class NewsService {
                         }
                     }
                     if (byKey.size() >= maxTotalItems) break;
-                    log.info("Fetched {} items from {}", Integer.valueOf(items.size()), u);
+                    log.info("Fetched {} items from {}", items.size(), u);
                     markHealthy(u);
                 } catch (Exception ex) {
                     errorCount++;
@@ -473,20 +491,22 @@ public class NewsService {
                 }
             }
 
-            List<Headline> out = new ArrayList<Headline>(byKey.values());
+            List<Headline> out = new ArrayList<>(byKey.values());
+
             if (broadcastNewsUpdate) {
                 try {
-                    Map<String, Object> payload = new HashMap<String, Object>();
+                    Map<String, Object> payload = new HashMap<>();
                     payload.put("asOf", Instant.now().toString());
-                    payload.put("count", Integer.valueOf(out.size()));
-                    payload.put("sources", Integer.valueOf(urls.size()));
-                    payload.put("errors", Integer.valueOf(errorCount));
-                    payload.put("skippedUnhealthy", Integer.valueOf(skippedUnhealthy));
+                    payload.put("count", out.size());
+                    payload.put("sources", urls.size());
+                    payload.put("errors", errorCount);
+                    payload.put("skippedUnhealthy", skippedUnhealthy);
                     stream.send("news.update", payload);
                 } catch (Exception t) {
                     log.error("Broadcast news.update failed: {}", t);
                 }
             }
+
             return out.isEmpty() ? Result.fail("NO_NEWS_ITEMS") : Result.ok(out);
         } catch (Exception e) {
             log.error("NEWS_READ_FAILED", e);
@@ -512,7 +532,7 @@ public class NewsService {
                     if (!items.isEmpty()) {
                         successfulFeeds++;
 
-                        // ===== Step-11 injection (non-disruptive): persist + ANN dedupe bookkeeping =====
+                        // ==== Step-11 injection (non-disruptive): persist + ANN dedupe bookkeeping ====
                         for (NewsItem it : items) {
                             try {
                                 Headline hh = it.toHeadline();
@@ -522,7 +542,7 @@ public class NewsService {
                             }
                         }
 
-                        // === existing business logic (unchanged) ===
+                        // ==== existing business logic (unchanged) ====
                         for (NewsItem it : items) {
                             bull += hits(it, bullish);
                             bear += hits(it, bearish);
@@ -559,21 +579,22 @@ public class NewsService {
             snap.setConfidence(conf);
 
             log.info("Sentiment update: score={}, confidence={}, bull={}, bear={}, items={}, feeds={}, skippedUnhealthy={}",
-                    Integer.valueOf(score), Integer.valueOf(conf), Integer.valueOf(bull), Integer.valueOf(bear),
-                    Integer.valueOf(total), Integer.valueOf(successfulFeeds), Integer.valueOf(skippedUnhealthy));
+                    score, conf, bull, bear, total, successfulFeeds, skippedUnhealthy);
 
             MarketSentimentSnapshot saved = sentimentRepo.save(snap);
+
             try {
-                Map<String, Object> streamData = new HashMap<String, Object>();
+                Map<String, Object> streamData = new HashMap<>();
                 streamData.put("entity", saved);
-                streamData.put("bull", Integer.valueOf(bull));
-                streamData.put("bear", Integer.valueOf(bear));
-                streamData.put("total", Integer.valueOf(total));
-                streamData.put("feeds", Integer.valueOf(successfulFeeds));
+                streamData.put("bull", bull);
+                streamData.put("bear", bear);
+                streamData.put("total", total);
+                streamData.put("feeds", successfulFeeds);
                 stream.send("sentiment.update", streamData);
             } catch (Exception t) {
                 log.error("WebSocket stream send failed: {}", t);
             }
+
             return Result.ok(saved);
         } catch (Exception e) {
             log.error("NEWS_INGEST_FAILED", e);
@@ -593,7 +614,7 @@ public class NewsService {
      * Health snapshot (can expose via controller if desired).
      */
     public Map<String, FeedHealth> getFeedHealth() {
-        return new LinkedHashMap<String, FeedHealth>(feedHealth);
+        return new LinkedHashMap<>(feedHealth);
     }
 
     private boolean isRecentlyUnhealthy(String url) {
@@ -624,20 +645,19 @@ public class NewsService {
         feedHealth.put(url, h);
     }
 
+    // ===================== Step-11 helpers (ADD-ONLY) =====================
+
     // ---- Fetch with caching + special handlers ----
     private List<NewsItem> fetchAnyWithRetry(String url, int maxItems) throws Exception {
         String cacheKey = url.toLowerCase(Locale.ROOT);
-
         CachedResult cached = resultCache.get(cacheKey);
         if (cached != null && !cached.isExpired(cacheTtlMinutes)) {
             log.debug("Cache hit for {}", url);
             return cached.items;
         }
-
         String lowercaseUrl = url.toLowerCase(Locale.ROOT);
         try {
             List<NewsItem> items;
-
             if (lowercaseUrl.contains("sebi.gov.in")) {
                 items = fetchSebiNews(url, maxItems);
             } else if (lowercaseUrl.contains("moneycontrol.com")) {
@@ -647,14 +667,12 @@ public class NewsService {
             } else {
                 items = fetchAny(url, maxItems);
             }
-
             resultCache.put(cacheKey, new CachedResult(items));
             return items;
         } catch (Exception e) {
             log.error("Initial fetch failed for {}, trying alternate UA", url, e);
             String altUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0";
             String altReferer = "https://www.google.com/search?q=market+news";
-
             String body = httpGet(url, connectTimeoutMs, readTimeoutMs, altUserAgent, altReferer, true);
             List<NewsItem> items;
             if (looksLikeXml(body)) {
@@ -678,7 +696,6 @@ public class NewsService {
             String referer = "https://www.google.com/";
             body = httpGet(url, connectTimeoutMs, readTimeoutMs, altUa, referer, true);
         }
-
         if (looksLikeXml(body)) return parseRssOrAtom(body, url, maxItems);
         if (allowHtmlScrape) return parseHtmlBasic(url, body, maxItems);
         log.debug("Fallback fetch returned non-XML and HTML scraping disabled: {}", url);
@@ -688,27 +705,30 @@ public class NewsService {
     // ---- Special handlers ----
     private List<NewsItem> fetchSebiNews(String url, int maxItems) throws Exception {
         String body = httpGet(url, connectTimeoutMs, readTimeoutMs, userAgent, null, true);
-        List<NewsItem> items = new ArrayList<NewsItem>();
+        List<NewsItem> items = new ArrayList<>();
         String source = "SEBI";
 
-        Pattern newsPattern = Pattern.compile("<tr[^>]*>\\s*<td[^>]*>(.*?)</td>\\s*<td[^>]*>(.*?)</td>\\s*<td[^>]*>(.*?)</td>\\s*</tr>",
+        Pattern newsPattern = Pattern.compile(
+                "(?is)<div[^>]*class=['\"]news-list['\"][^>]*>\\s*"
+                        + "<div[^>]*class=['\"]date['\"][^>]*>(.*?)</div>\\s*"
+                        + "<div[^>]*class=['\"]title['\"][^>]*>(.*?)</div>\\s*"
+                        + "<div[^>]*class=['\"]desc['\"][^>]*>(.*?)</div>\\s*",
                 Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
-        Matcher matcher = newsPattern.matcher(body);
 
+        Matcher matcher = newsPattern.matcher(body);
         int count = 0;
         while (matcher.find() && count < maxItems) {
             try {
                 String dateText = stripTags(matcher.group(1)).trim();
                 String title = stripTags(matcher.group(2)).trim();
-                String pdfLink = null;
 
+                String pdfLink = null;
                 Matcher linkMatcher = Pattern.compile("href=['\"]([^'\"]+\\.pdf)['\"]", Pattern.CASE_INSENSITIVE)
                         .matcher(matcher.group(2));
                 if (linkMatcher.find()) {
                     pdfLink = linkMatcher.group(1);
                     if (pdfLink.startsWith("/")) pdfLink = "https://www.sebi.gov.in" + pdfLink;
                 }
-
                 if (!title.isEmpty()) {
                     items.add(new NewsItem(title, "SEBI Notification: " + dateText,
                             pdfLink != null ? pdfLink : url, null, source));
@@ -726,23 +746,20 @@ public class NewsService {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "https://www.google.com/", true);
 
-        List<NewsItem> items = new ArrayList<NewsItem>();
+        List<NewsItem> items = new ArrayList<>();
         String source = "Moneycontrol";
 
         Pattern cardPattern = Pattern.compile(
-                "<div[^>]*class=['\"][^'\"]*card[^'\"]*['\"][^>]*>\\s*"
-                        + "<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>\\s*"
-                        + "(?:.*?<h3[^>]*>(.*?)</h3>|.*?<div[^>]*class=['\"][^'\"]*headline[^'\"]*['\"][^>]*>(.*?)</div>)",
+                "(?is)<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>\\s*"
+                        + "(?:<h3[^>]*>(.*?)</h3>|.*?class=['\"][^'\"]*headline[^'\"]*['\"][^>]*>(.*?))",
                 Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
 
         Matcher cardMatcher = cardPattern.matcher(body);
         int count = 0;
-
         while (cardMatcher.find() && count < maxItems) {
             try {
                 String link = cardMatcher.group(1);
                 String title = cardMatcher.group(2) != null ? cardMatcher.group(2) : cardMatcher.group(3);
-
                 if (title != null) {
                     title = stripTags(title).trim();
                     if (!title.isEmpty() && link != null) {
@@ -767,21 +784,20 @@ public class NewsService {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
                 "https://www.google.com/", true);
 
-        List<NewsItem> items = new ArrayList<NewsItem>();
+        List<NewsItem> items = new ArrayList<>();
         String source = "Yahoo Finance";
 
         Pattern newsPattern = Pattern.compile(
-                "<div[^>]*class=['\"]Ov\\([^'\"]*\\)[^>]*>\\s*<div[^>]*>\\s*<h3[^>]*>\\s*<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+                "(?is)<li[^>]*class=['\"][^'\"]*Ov\\([^'\"]*\\)[^'\"]*['\"][^>]*>\\s*"
+                        + ".*?<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
                 Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
 
         Matcher newsMatcher = newsPattern.matcher(body);
         int count = 0;
-
         while (newsMatcher.find() && count < maxItems) {
             try {
                 String link = newsMatcher.group(1);
                 String title = stripTags(newsMatcher.group(2)).trim();
-
                 if (!title.isEmpty()) {
                     if (!link.startsWith("http")) {
                         link = "https://sg.finance.yahoo.com" + (link.startsWith("/") ? link : "/" + link);
@@ -793,6 +809,7 @@ public class NewsService {
                 log.error("Error parsing Yahoo Finance news item: {}", e);
             }
         }
+
         if (items.isEmpty()) items = parseHtmlBasic(url, body, maxItems);
         return items;
     }
@@ -801,7 +818,7 @@ public class NewsService {
     private FeedHealth probe(String url) throws Exception {
         long t0 = System.currentTimeMillis();
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setRequestMethod("GET");                   // HEAD is often blocked; use light GET
+        c.setRequestMethod("GET"); // HEAD is often blocked; use light GET
         c.setInstanceFollowRedirects(true);
         c.setConnectTimeout(Math.min(5000, connectTimeoutMs));
         c.setReadTimeout(Math.min(5000, readTimeoutMs));
@@ -835,7 +852,6 @@ public class NewsService {
 
         boolean typeAllowed = allowedContentTypes == null || allowedContentTypes.isEmpty()
                 || (c.getContentType() != null && allowedContentTypes.contains(c.getContentType().toLowerCase(Locale.ROOT)));
-
         boolean htmlOk = allowHtmlScrape && s.toLowerCase(Locale.ROOT).contains("<html");
         h.setOk((xmlLike || htmlOk) && typeAllowed);
         h.setLatencyMs(System.currentTimeMillis() - t0);
@@ -873,7 +889,6 @@ public class NewsService {
         if (handleGzip && "gzip".equalsIgnoreCase(c.getContentEncoding())) {
             is = new GZIPInputStream(is);
         }
-
         try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();
             String line;
@@ -931,80 +946,9 @@ public class NewsService {
         while (newsEvents.size() > MAX_BUFFER_EVENTS) newsEvents.pollFirst();
     }
 
-    // -------------------- Models --------------------
-    private static final class CachedResult {
-        final List<NewsItem> items;
-        final long timestamp;
-
-        CachedResult(List<NewsItem> items) {
-            this.items = items;
-            this.timestamp = System.currentTimeMillis();
-        }
-
-        boolean isExpired(int ttlMinutes) {
-            return System.currentTimeMillis() - timestamp > TimeUnit.MINUTES.toMillis(ttlMinutes);
-        }
-    }
-
-    @Getter
-    @Setter
-    public static class FeedHealth {
-        private boolean ok;
-        private int httpCode;
-        private String contentType;
-        private String finalUrl;
-        private String error;
-        private long latencyMs;
-        private long approxBytes;
-        private boolean xmlLike;
-        private Instant lastChecked;
-    }
-
-    private record NewsItem(String title, String description, String link, Instant publishedAt, String source) {
-        private NewsItem(String title, String description) {
-            this(title, description, "", null, "");
-        }
-
-        private NewsItem(String title, String description, String link, Instant publishedAt, String source) {
-            this.title = (title == null) ? "" : title;
-            this.description = (description == null) ? "" : description;
-            this.link = (link == null) ? "" : link;
-            this.publishedAt = publishedAt;
-            this.source = (source == null) ? "" : source;
-        }
-
-        Headline toHeadline() {
-            Headline h = new Headline();
-            h.setTitle(nvl(title));
-            h.setDescription(nvl(description));
-            h.setLink(nvl(link));
-            h.setSource(nvl(source));
-            h.setPublishedAt(publishedAt);
-            return h;
-        }
-    }
-
-    @Getter
-    @Setter
-    public static class Headline {
-        private String title;
-        private String description;
-        private String link;
-        private String source;
-        private Instant publishedAt;
-    }
-
-    private record NewsEvent(Instant ts, String source, String symbol, String category) {
-    }
-
-    // ===================== Step-11 helpers (ADD-ONLY) =====================
-
-    /**
-     * Minimal embedder contract; implement and register as a Spring bean if you want embeddings.
-     */
-    public interface EmbeddingClient {
-        double[] embed(String text);
-    }
+    // =====================================================================
+    // ===================== NEW: Auto-Trading Enhancements =================
+    // =====================================================================
 
     private void processStep11(Headline h) {
         // Best-effort only: do nothing if Mongo or embedder are unavailable.
@@ -1035,7 +979,8 @@ public class NewsService {
             if (embedding != null) {
                 double sim = nearestSimilarity(embedding);
                 if (sim >= DEDUPE_SIMILARITY_THRESHOLD) {
-                    log.debug("NEWS_DEDUPE ANN_DUP {} score={}", shortTitle(nvl(h.getTitle())),
+                    log.debug("NEWS_DEDUPE ANN_DUP {} score={}",
+                            shortTitle(nvl(h.getTitle())),
                             String.format(java.util.Locale.US, "%.3f", sim));
                     // still persist for history? choose to persist with topic
                 }
@@ -1060,16 +1005,6 @@ public class NewsService {
         String t = truncate(normalize(title), MAX_TITLE_LEN);
         String d = truncate(normalize(desc), MAX_DESC_LEN);
         return t + " | " + d;
-    }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        return s.length() <= max ? s : s.substring(0, max);
-    }
-
-    private static String shortTitle(String t) {
-        if (t == null) return "";
-        return t.length() <= 64 ? t : t.substring(0, 61) + "...";
     }
 
     private String sha256Base64(String s) {
@@ -1145,7 +1080,8 @@ public class NewsService {
             List<Document> recent = mongoTemplate.find(q, Document.class, newsCollection);
             double best = -2.0d;
             for (Document d : recent) {
-                List<?> arr = (List<?>) d.get(F_EMBEDDING);
+                @SuppressWarnings("unchecked")
+                List<Object> arr = (List<Object>) d.get(F_EMBEDDING);
                 if (arr == null || arr.size() != EMBEDDING_DIM) continue;
                 double[] other = new double[EMBEDDING_DIM];
                 for (int i = 0; i < EMBEDDING_DIM; i++) {
@@ -1176,5 +1112,617 @@ public class NewsService {
         } catch (Throwable t) {
             // best-effort
         }
+    }
+
+    /**
+     * Generate trading signals from recent news for the provided symbols.
+     */
+    public Result<List<TradingSignal>> generateTradingSignals(List<String> symbols) {
+        if (!tradingSignalsEnabled) {
+            return Result.fail("TRADING_SIGNALS_DISABLED");
+        }
+        if (symbols == null || symbols.isEmpty()) {
+            return Result.fail("NO_SYMBOLS");
+        }
+        if (shouldHaltTrading()) {
+            return Result.fail("NEWS_TRADING_HALTED");
+        }
+
+        try {
+            List<TradingSignal> signals = Collections.synchronizedList(new ArrayList<>());
+            Instant cutoff = Instant.now().minus(Duration.ofMinutes(30));
+
+            List<Callable<Void>> tasks = new ArrayList<>();
+            for (String symbol : symbols) {
+                tasks.add(() -> {
+                    List<NewsItem> recentNews = getSymbolRecentNews(symbol, cutoff);
+                    if (recentNews.isEmpty()) return null;
+
+                    SentimentAnalysis sentiment = calculateSymbolSentiment(symbol, recentNews);
+                    MarketImpactAssessment impact = assessMarketImpact(symbol, recentNews, sentiment);
+
+                    if (impact.getConfidence() >= signalConfidenceThreshold &&
+                            impact.getPredictedPriceImpact() >= priceImpactThreshold) {
+                        TradingSignal signal = createTradingSignal(symbol, sentiment, impact, recentNews);
+                        signals.add(signal);
+                        activeSignals.computeIfAbsent(symbol, k -> new ArrayList<>()).add(signal);
+                    }
+                    return null;
+                });
+            }
+            newsProcessingPool.invokeAll(tasks);
+
+            if (!signals.isEmpty() && broadcastNewsUpdate) {
+                broadcastTradingSignals(signals);
+            }
+
+            return signals.isEmpty() ? Result.fail("NO_SIGNALS") : Result.ok(signals);
+        } catch (Exception e) {
+            log.error("SIGNAL_GENERATION_FAILED", e);
+            return Result.fail("SIGNAL_GENERATION_FAILED: " + e.getMessage());
+        }
+    }
+
+    private TradingSignal createTradingSignal(String symbol,
+                                              SentimentAnalysis sentiment,
+                                              MarketImpactAssessment impact,
+                                              List<NewsItem> news) {
+        TradingSignal signal = new TradingSignal();
+        signal.setId(UUID.randomUUID().toString());
+        signal.setSymbol(symbol);
+        signal.setTimestamp(Instant.now());
+        signal.setConfidence(impact.getConfidence());
+        signal.setNewsCount(news.size());
+        signal.setPredictedPriceImpact(impact.getPredictedPriceImpact());
+
+        if (sentiment.getScore() > 0.6) {
+            signal.setDirection(SignalDirection.BUY);
+            signal.setStrength(Math.min(1.0, sentiment.getScore() * impact.getVolatilityMultiplier()));
+        } else if (sentiment.getScore() < -0.6) {
+            signal.setDirection(SignalDirection.SELL);
+            signal.setStrength(Math.min(1.0, Math.abs(sentiment.getScore()) * impact.getVolatilityMultiplier()));
+        } else {
+            signal.setDirection(SignalDirection.HOLD);
+            signal.setStrength(0.0);
+        }
+
+        RiskAssessment risk = calculateNewsRisk(symbol, news, sentiment);
+        signal.setRiskLevel(risk.getLevel());
+        signal.setMaxPositionSize(risk.getMaxPositionSize());
+        signal.setStopLossAdjustment(risk.getStopLossAdjustment());
+
+        signal.setExecutionWindow(determineExecutionWindow(impact, sentiment));
+        signal.setUrgency(calculateUrgency(news, impact));
+
+        // Attach minimal source provenance for performance updates
+        List<String> sources = new ArrayList<>();
+        for (NewsItem n : news) sources.add(n.source);
+        signal.setSourceNewsSources(sources);
+
+        return signal;
+    }
+
+    // ---- Sentiment & impact helpers ----
+    private SentimentAnalysis calculateSymbolSentiment(String symbol, List<NewsItem> news) {
+        double totalScore = 0.0;
+        double totalWeight = 0.0;
+        int bullishCount = 0, bearishCount = 0;
+
+        for (NewsItem item : news) {
+            int bullHits = hits(item, bullish);
+            int bearHits = hits(item, bearish);
+            if (bullHits + bearHits == 0) continue;
+
+            double itemScore = (bullHits - bearHits) / (double) (bullHits + bearHits);
+
+            double symbolWeight = symbolSentimentWeights.getOrDefault(symbol, 1.0);
+            double sourceWeight = sourceAccuracyRatings.getOrDefault(item.source, 1.0);
+            double timeWeight = calculateTimeDecay(item.publishedAt);
+            double categoryWeight = getCategoryWeight(item, symbol);
+
+            double finalWeight = symbolWeight * sourceWeight * timeWeight * categoryWeight;
+            totalScore += itemScore * finalWeight;
+            totalWeight += finalWeight;
+
+            if (itemScore > 0.1) bullishCount++;
+            if (itemScore < -0.1) bearishCount++;
+        }
+
+        SentimentAnalysis analysis = new SentimentAnalysis();
+        analysis.setScore(totalWeight > 0 ? totalScore / totalWeight : 0.0);
+        analysis.setConfidence(calculateSentimentConfidence(news.size(), totalWeight));
+        analysis.setBullishCount(bullishCount);
+        analysis.setBearishCount(bearishCount);
+        analysis.setNewsVolume(news.size());
+        return analysis;
+    }
+
+    private double calculateTimeDecay(Instant publishedAt) {
+        if (publishedAt == null) return 0.5;
+        long minutesAgo = Duration.between(publishedAt, Instant.now()).toMinutes();
+        if (minutesAgo <= 15) return 1.0;
+        if (minutesAgo <= 60) return 0.8;
+        if (minutesAgo <= 240) return 0.6;
+        if (minutesAgo <= 1440) return 0.3;
+        return 0.1;
+    }
+
+    private double getCategoryWeight(NewsItem item, String symbol) {
+        // Lightweight placeholder: can be extended with NLP/topic detection
+        String text = (nvl(item.title) + " " + nvl(item.description)).toLowerCase(Locale.ROOT);
+        double w = 1.0;
+        if (text.contains("earnings") || text.contains("results")) w *= 1.3;
+        if (text.contains("merger") || text.contains("acquisition")) w *= 1.25;
+        if (text.contains("regulator") || text.contains("policy")) w *= 1.2;
+        if (symbol != null && text.contains(symbol.toLowerCase(Locale.ROOT))) w *= 1.15;
+        return w;
+    }
+
+    private double calculateSentimentConfidence(int newsCount, double totalWeight) {
+        double base = Math.min(1.0, newsCount / 10.0);
+        double weightFactor = Math.min(1.0, totalWeight / Math.max(1.0, newsCount));
+        return clamp((base * 0.6) + (weightFactor * 0.4), 0.0, 1.0);
+    }
+
+    private MarketImpactAssessment assessMarketImpact(String symbol, List<NewsItem> news, SentimentAnalysis sentiment) {
+        MarketImpactAssessment assessment = new MarketImpactAssessment();
+
+        double baseImpact = Math.abs(sentiment.getScore()) * 0.1; // 10% max base
+        double volumeMultiplier = Math.min(2.0, 1.0 + Math.max(0, news.size() - 1) * 0.1);
+        double credibilityMultiplier = calculateCredibilityMultiplier(news);
+        MarketContext context = symbolMarketContext.get(symbol);
+        double contextMultiplier = context != null ? context.getVolatilityMultiplier() : 1.0;
+        double sectorMultiplier = calculateSectorSpillover(symbol, news);
+
+        double predictedImpact = baseImpact * volumeMultiplier * credibilityMultiplier * contextMultiplier * sectorMultiplier;
+
+        assessment.setPredictedPriceImpact(Math.min(0.5, predictedImpact));
+        assessment.setVolatilityMultiplier(contextMultiplier);
+        assessment.setConfidence(calculateImpactConfidence(sentiment, news));
+        assessment.setTimeHorizon(determineTimeHorizon(news, sentiment));
+        return assessment;
+    }
+
+    private double calculateCredibilityMultiplier(List<NewsItem> news) {
+        if (news.isEmpty()) return 1.0;
+        double sum = 0.0;
+        for (NewsItem n : news) sum += sourceAccuracyRatings.getOrDefault(n.source, 1.0);
+        return clamp(sum / news.size(), 0.7, 1.3);
+    }
+
+    private double calculateSectorSpillover(String symbol, List<NewsItem> news) {
+        // Placeholder for sector mapping; default mild boost
+        return 1.05;
+    }
+
+    private double calculateImpactConfidence(SentimentAnalysis sentiment, List<NewsItem> news) {
+        double s = Math.min(1.0, Math.abs(sentiment.getScore()));
+        double v = Math.min(1.0, news.size() / 10.0);
+        return clamp((s * 0.6) + (v * 0.4), 0.0, 1.0);
+    }
+
+    private Duration determineTimeHorizon(List<NewsItem> news, SentimentAnalysis sentiment) {
+        if (sentiment.getScore() > 0.7 || sentiment.getScore() < -0.7) return Duration.ofMinutes(30);
+        if (news.size() >= 5) return Duration.ofHours(2);
+        return Duration.ofHours(6);
+    }
+
+    private Duration determineExecutionWindow(MarketImpactAssessment impact, SentimentAnalysis sentiment) {
+        if (impact.getConfidence() > 0.85) return Duration.ofMinutes(5);
+        if (impact.getConfidence() > 0.7) return Duration.ofMinutes(15);
+        return Duration.ofMinutes(30);
+    }
+
+    private SignalUrgency calculateUrgency(List<NewsItem> news, MarketImpactAssessment impact) {
+        if (impact.getConfidence() > 0.85 && impact.getPredictedPriceImpact() > 0.05) return SignalUrgency.HIGH;
+        if (impact.getConfidence() > 0.7) return SignalUrgency.MEDIUM;
+        return SignalUrgency.LOW;
+    }
+
+    private RiskAssessment calculateNewsRisk(String symbol, List<NewsItem> news, SentimentAnalysis sentiment) {
+        RiskAssessment risk = new RiskAssessment();
+
+        double baseRisk = 1.0 - sentiment.getConfidence();
+        double conflictRisk = calculateConflictingNewsRisk(news);
+        double sourceRisk = calculateSourceReliabilityRisk(news);
+        double volatilityRisk = highVolatilitySymbols.contains(symbol) ? 0.3 : 0.1;
+
+        double totalRisk = Math.min(1.0, baseRisk + conflictRisk + sourceRisk + volatilityRisk);
+
+        risk.setLevel(RiskLevel.fromScore(totalRisk));
+        risk.setMaxPositionSize(calculateMaxPositionSize(totalRisk));
+        risk.setStopLossAdjustment(calculateStopLossAdjustment(totalRisk));
+        return risk;
+    }
+
+    private double calculateConflictingNewsRisk(List<NewsItem> news) {
+        int pos = 0, neg = 0;
+        for (NewsItem n : news) {
+            int bullHits = hits(n, bullish);
+            int bearHits = hits(n, bearish);
+            if (bullHits > bearHits) pos++;
+            else if (bearHits > bullHits) neg++;
+        }
+        int total = Math.max(1, news.size());
+        double ratio = Math.abs(pos - neg) / (double) total;
+        return 1.0 - ratio; // more balance => higher conflict risk
+    }
+
+    private double calculateSourceReliabilityRisk(List<NewsItem> news) {
+        if (news.isEmpty()) return 0.2;
+        double avg = 0.0;
+        for (NewsItem n : news) avg += sourceAccuracyRatings.getOrDefault(n.source, 1.0);
+        avg /= news.size();
+        return clamp(1.2 - avg, 0.0, 0.5);
+    }
+
+    private double calculateMaxPositionSize(double riskScore) {
+        return clamp(1.0 - riskScore, 0.1, 0.8); // as fraction of normal position
+    }
+
+    private double calculateStopLossAdjustment(double riskScore) {
+        return clamp(riskScore * 0.5, 0.0, 0.5); // widen stop up to +50% under high risk
+    }
+
+    // ---- Performance tracking ----
+    public void recordSignalOutcome(String signalId, double actualPriceChange, Duration timeToImpact) {
+        try {
+            TradingSignal signal = findSignalById(signalId);
+            if (signal == null) return;
+
+            SignalPerformance performance = signalPerformanceMap.computeIfAbsent(
+                    signal.getSymbol(), k -> new SignalPerformance()
+            );
+
+            boolean accurate = Math.signum(actualPriceChange) == Math.signum(signal.getDirection().numeric);
+            performance.addOutcome(accurate, Math.abs(actualPriceChange), signal.getConfidence(), timeToImpact);
+
+            updateSourceAccuracyRatings(signal.getSourceNewsSources(), accurate);
+
+            priceImpactHistory.addLast(new PriceImpactEvent(Instant.now(), signal.getSymbol(), actualPriceChange));
+            while (priceImpactHistory.size() > 5000) priceImpactHistory.pollFirst();
+
+            log.info("SIGNAL_OUTCOME: symbol={}, predicted={}, actual={}, accurate={}, confidence={}",
+                    signal.getSymbol(), signal.getDirection(), actualPriceChange, accurate, signal.getConfidence());
+        } catch (Exception e) {
+            log.error("Error recording signal outcome", e);
+        }
+    }
+
+    public Result<Map<String, SignalPerformanceMetrics>> getSignalPerformanceMetrics() {
+        try {
+            Map<String, SignalPerformanceMetrics> metrics = new HashMap<>();
+            for (Map.Entry<String, SignalPerformance> entry : signalPerformanceMap.entrySet()) {
+                SignalPerformance perf = entry.getValue();
+                SignalPerformanceMetrics metric = new SignalPerformanceMetrics();
+                metric.setSymbol(entry.getKey());
+                metric.setAccuracyRate(perf.getAccuracyRate());
+                metric.setAveragePriceImpact(perf.getAveragePriceImpact());
+                metric.setAverageTimeToImpact(perf.getAverageTimeToImpact());
+                metric.setTotalSignals(perf.getTotalSignals());
+                metric.setProfitabilityScore(perf.calculateProfitabilityScore());
+                metrics.put(entry.getKey(), metric);
+            }
+            return Result.ok(metrics);
+        } catch (Exception e) {
+            log.error("METRICS_ERROR", e);
+            return Result.fail("METRICS_ERROR: " + e.getMessage());
+        }
+    }
+
+    private TradingSignal findSignalById(String signalId) {
+        for (List<TradingSignal> list : activeSignals.values()) {
+            for (TradingSignal s : list) {
+                if (signalId.equals(s.getId())) return s;
+            }
+        }
+        return null;
+    }
+
+    private void updateSourceAccuracyRatings(List<String> sources, boolean accurate) {
+        if (sources == null || sources.isEmpty()) return;
+        for (String s : sources) {
+            double cur = sourceAccuracyRatings.getOrDefault(s, 1.0);
+            if (accurate) cur = clamp(cur + 0.02, 0.8, 1.3);
+            else cur = clamp(cur - 0.02, 0.7, 1.2);
+            sourceAccuracyRatings.put(s, cur);
+        }
+    }
+
+    // ---- Risk controls ----
+    public void enableEmergencyNewsHalt(String reason) {
+        emergencyNewsHalt = true;
+        log.warn("EMERGENCY_NEWS_HALT_ENABLED: {}", reason);
+        activeSignals.clear();
+        try {
+            Map<String, Object> haltData = new HashMap<>();
+            haltData.put("halted", true);
+            haltData.put("reason", reason);
+            haltData.put("timestamp", Instant.now());
+            stream.send("news.emergency.halt", haltData);
+        } catch (Exception e) {
+            log.error("Failed to broadcast emergency halt", e);
+        }
+    }
+
+    public void disableEmergencyNewsHalt() {
+        emergencyNewsHalt = false;
+        log.info("EMERGENCY_NEWS_HALT_DISABLED");
+        try {
+            Map<String, Object> data = new HashMap<>();
+            data.put("halted", false);
+            data.put("timestamp", Instant.now());
+            stream.send("news.emergency.halt", data);
+        } catch (Exception e) {
+            log.error("Failed to broadcast emergency halt disable", e);
+        }
+    }
+
+    private boolean shouldHaltTrading() {
+        if (emergencyNewsHalt) return true;
+        long conflictingSignalsCount = activeSignals.values().stream()
+                .flatMap(List::stream)
+                .filter(signal -> signal.getConfidence() > 0.8)
+                .map(TradingSignal::getSymbol)
+                .distinct()
+                .count();
+        return conflictingSignalsCount > 5;
+    }
+
+    public void adjustRiskThresholds(String symbol, double volatility, double liquidity) {
+        RiskThreshold threshold = newsRiskThresholds.computeIfAbsent(symbol, k -> new RiskThreshold());
+        if (volatility > 0.05) {
+            threshold.setMaxPositionSize(threshold.getMaxPositionSize() * 0.7);
+            threshold.setConfidenceThreshold(Math.min(0.9, threshold.getConfidenceThreshold() + 0.1));
+            highVolatilitySymbols.add(symbol);
+        } else {
+            highVolatilitySymbols.remove(symbol);
+        }
+        if (liquidity < 0.3) {
+            threshold.setMaxPositionSize(threshold.getMaxPositionSize() * 0.5);
+        }
+        log.info("Risk thresholds adjusted for {}: maxPosition={}, confidence={}",
+                symbol, threshold.getMaxPositionSize(), threshold.getConfidenceThreshold());
+    }
+
+    public void updateSymbolSentimentWeights(Map<String, Double> newWeights) {
+        if (newWeights == null || newWeights.isEmpty()) return;
+        symbolSentimentWeights.putAll(newWeights);
+        log.info("Updated sentiment weights for {} symbols", newWeights.size());
+    }
+
+    // ---- Maintenance ----
+    @Scheduled(fixedRate = 300_000) // every 5 minutes
+    public void cleanupExpiredData() {
+        Instant cutoff = Instant.now().minus(Duration.ofHours(24));
+        activeSignals.forEach((symbol, signals) ->
+                signals.removeIf(signal -> signal.getTimestamp().isBefore(cutoff)));
+
+        while (!priceImpactHistory.isEmpty()
+                && priceImpactHistory.peekFirst().timestamp().isBefore(cutoff)) {
+            priceImpactHistory.pollFirst();
+        }
+    }
+
+    private void broadcastTradingSignals(List<TradingSignal> signals) {
+        try {
+            Map<String, Object> broadcast = new HashMap<>();
+            broadcast.put("signals", signals);
+            broadcast.put("timestamp", Instant.now());
+            broadcast.put("count", signals.size());
+            stream.send("trading.signals", broadcast);
+        } catch (Exception e) {
+            log.error("Failed to broadcast trading signals", e);
+        }
+    }
+
+    private List<NewsItem> getSymbolRecentNews(String symbol, Instant since) {
+        List<NewsItem> list = new ArrayList<>();
+        for (NewsEvent e : newsEvents) {
+            if (e.ts.isAfter(since)) {
+                boolean match = (symbol != null && symbol.equalsIgnoreCase(e.symbol))
+                        || (e.category != null && e.category.toLowerCase(Locale.ROOT).contains(symbol.toLowerCase(Locale.ROOT)));
+                if (match) {
+                    list.add(new NewsItem(
+                            e.category != null ? e.category : "",
+                            "",
+                            "", e.ts, e.source != null ? e.source : ""
+                    ));
+                }
+            }
+        }
+        return list;
+    }
+
+    @Getter
+    public enum SignalDirection {
+        BUY(1), SELL(-1), HOLD(0);
+        final int numeric;
+
+        SignalDirection(int n) {
+            this.numeric = n;
+        }
+    }
+
+    public enum SignalUrgency {LOW, MEDIUM, HIGH}
+
+    /**
+     * Minimal embedder contract; implement and register as a Spring bean if you want embeddings.
+     */
+    public interface EmbeddingClient {
+        double[] embed(String text);
+    }
+
+    // ---------- Models ----------
+    private static final class CachedResult {
+        final List<NewsItem> items;
+        final long timestamp;
+
+        CachedResult(List<NewsItem> items) {
+            this.items = items;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        boolean isExpired(int ttlMinutes) {
+            return System.currentTimeMillis() - timestamp > TimeUnit.MINUTES.toMillis(ttlMinutes);
+        }
+    }
+
+    @Getter
+    @Setter
+    public static class FeedHealth {
+        private boolean ok;
+        private int httpCode;
+        private String contentType;
+        private String finalUrl;
+        private String error;
+        private long latencyMs;
+        private long approxBytes;
+        private boolean xmlLike;
+        private Instant lastChecked;
+    }
+
+    // ---------- NEW Inner classes & enums for auto-trading ----------
+
+    private record NewsItem(String title, String description, String link, Instant publishedAt, String source) {
+        private NewsItem(String title, String description) {
+            this(title, description, "", null, "");
+        }
+
+        private NewsItem(String title, String description, String link, Instant publishedAt, String source) {
+            this.title = (title == null) ? "" : title;
+            this.description = (description == null) ? "" : description;
+            this.link = (link == null) ? "" : link;
+            this.publishedAt = publishedAt;
+            this.source = (source == null) ? "" : source;
+        }
+
+        Headline toHeadline() {
+            Headline h = new Headline();
+            h.setTitle(nvl(title));
+            h.setDescription(nvl(description));
+            h.setLink(nvl(link));
+            h.setSource(nvl(source));
+            h.setPublishedAt(publishedAt);
+            return h;
+        }
+    }
+
+    @Getter
+    @Setter
+    public static class Headline {
+        private String title;
+        private String description;
+        private String link;
+        private String source;
+        private Instant publishedAt;
+    }
+
+    private record NewsEvent(Instant ts, String source, String symbol, String category) {
+    }
+
+    @Getter
+    @Setter
+    public static class TradingSignal {
+        private String id;
+        private String symbol;
+        private SignalDirection direction;
+        private double strength;
+        private double confidence;
+        private double predictedPriceImpact;
+        private Instant timestamp;
+        private RiskLevel riskLevel;
+        private double maxPositionSize;
+        private double stopLossAdjustment;
+        private Duration executionWindow;
+        private SignalUrgency urgency;
+        private int newsCount;
+        private List<String> sourceNewsSources;
+    }
+
+    @Getter
+    @Setter
+    public static class SentimentAnalysis {
+        private double score;
+        private double confidence;
+        private int bullishCount;
+        private int bearishCount;
+        private int newsVolume;
+    }
+
+    @Getter
+    @Setter
+    public static class MarketImpactAssessment {
+        private double predictedPriceImpact;
+        private double volatilityMultiplier;
+        private double confidence;
+        private Duration timeHorizon;
+    }
+
+    @Getter
+    @Setter
+    public static class SignalPerformance {
+        private int totalSignals = 0;
+        private int accurateSignals = 0;
+        private double totalPriceImpact = 0.0;
+        private long totalTimeToImpactMs = 0L;
+
+        public void addOutcome(boolean accurate, double priceImpact, double confidence, Duration timeToImpact) {
+            totalSignals++;
+            if (accurate) accurateSignals++;
+            totalPriceImpact += priceImpact * Math.max(0.5, confidence);
+            if (timeToImpact != null) totalTimeToImpactMs += timeToImpact.toMillis();
+        }
+
+        public double getAccuracyRate() {
+            return totalSignals > 0 ? (double) accurateSignals / totalSignals : 0.0;
+        }
+
+        public double getAveragePriceImpact() {
+            return totalSignals > 0 ? totalPriceImpact / totalSignals : 0.0;
+        }
+
+        public long getAverageTimeToImpact() {
+            return totalSignals > 0 ? totalTimeToImpactMs / totalSignals : 0L;
+        }
+
+        public int getTotalSignals() {
+            return totalSignals;
+        }
+
+        public double calculateProfitabilityScore() {
+            double acc = getAccuracyRate();
+            double imp = getAveragePriceImpact();
+            return clamp((acc * 0.7) + (Math.min(imp, 0.05) * 6.0 * 0.3), 0.0, 1.0);
+        }
+    }
+
+    @Getter
+    @Setter
+    public static class SignalPerformanceMetrics {
+        private String symbol;
+        private double accuracyRate;
+        private double averagePriceImpact;
+        private long averageTimeToImpact;
+        private int totalSignals;
+        private double profitabilityScore;
+    }
+
+    private record PriceImpactEvent(Instant timestamp, String symbol, double priceChange) {
+    }
+
+    @Getter
+    @Setter
+    public static class MarketContext {
+        private double volatilityMultiplier = 1.0;
+        private boolean withinMarketHours = true;
+        private boolean eventRiskWindow = false;
+    }
+
+    @Getter
+    @Setter
+    public static class RiskThreshold {
+        private double maxPositionSize = 1.0;
+        private double confidenceThreshold = 0.7;
     }
 }
