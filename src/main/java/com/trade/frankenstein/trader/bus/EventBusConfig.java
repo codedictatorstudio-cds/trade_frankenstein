@@ -22,4 +22,6 @@ public final class EventBusConfig {
     public static final String TOPIC_ORDER = "order";
 
     public static final String TOPIC_METRICS= "metrics";
+
+    public static final String TOPIC_SENTIMENT = "sentiment";
 }

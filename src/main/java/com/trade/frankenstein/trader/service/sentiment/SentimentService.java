@@ -1,10 +1,14 @@
 package com.trade.frankenstein.trader.service.sentiment;
 
+import com.google.gson.JsonObject;
+import com.trade.frankenstein.trader.bus.EventBusConfig;
+import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
 import com.trade.frankenstein.trader.service.MarketDataService;
 import com.trade.frankenstein.trader.service.NewsService;
+import com.trade.frankenstein.trader.service.StreamGateway;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
@@ -37,6 +41,10 @@ public class SentimentService {
     private MarketSentimentSnapshotRepo sentimentRepo;
     @Autowired
     private PositionSizer positionSizer;
+    @Autowired
+    private StreamGateway stream;
+    @Autowired
+    private EventPublisher bus;
 
     // Multi-source providers
     private final List<SentimentProvider> providers;
@@ -197,19 +205,71 @@ public class SentimentService {
             BigDecimal score = computeScoreNow();
             if (score == null) return;
             recordSentimentSample(score);
+
             MarketSentimentSnapshot snap = new MarketSentimentSnapshot();
             snap.setAsOf(Instant.now());
             snap.setScore(score.setScale(0, RoundingMode.HALF_UP).intValue());
+
+            // Persist to MongoDB
             try {
                 sentimentRepo.save(snap);
             } catch (Exception t) {
                 log.error("refresh(): repo save failed: {}", t);
             }
-            // Optional: publish to event bus, dashboard, etc.
+
+            // --- Publish to StreamGateway ("sentiment.update") ---
+            try {
+                stream.send("sentiment.update", snap);
+                log.info("Sentiment snapshot published to StreamGateway: {}", snap.getScore());
+            } catch (Exception e) {
+                log.error("Failed to publish sentiment.update to stream: {}", e.getMessage());
+            }
+
+            // --- Publish Event to Kafka (via EventPublisher) ---
+            try {
+                if (bus != null) {
+                    // Use a standard topic
+                    String topic = EventBusConfig.TOPIC_SENTIMENT;
+                    // Compose JSON payload
+                    JsonObject event = new JsonObject();
+                    event.addProperty("ts", snap.getAsOf().toEpochMilli());
+                    event.addProperty("score", snap.getScore());
+                    bus.publish(topic, "sentiment", event.toString());
+                    log.info("Sentiment event published to Kafka topic {}: {}", topic, event);
+                }
+            } catch (Throwable ignore) {
+                log.error("Sentiment Kafka publish failed");
+            }
+
+            // --- Audit log for compliance ---
+            try {
+                JsonObject auditPayload = new JsonObject();
+                auditPayload.addProperty("asOf", snap.getAsOf().toString());
+                auditPayload.addProperty("score", snap.getScore());
+                audit("sentiment.update", auditPayload);
+            } catch (Throwable ignore) {
+            }
+
         } catch (Exception t) {
             log.error("refresh() failed: {}", t);
         }
     }
+
+    // Kafkaesque audit helper (optional). Emits to TOPIC_AUDIT.
+    private void audit(String event, JsonObject data) {
+        try {
+            if (bus == null) return;
+            Instant now = Instant.now();
+            JsonObject o = new JsonObject();
+            o.addProperty("ts", now.toEpochMilli());
+            o.addProperty("ts_iso", now.toString());
+            o.addProperty("event", event);
+            o.addProperty("source", "sentiment");
+            if (data != null) o.add("data", data);
+            bus.publish(EventBusConfig.TOPIC_AUDIT, "sentiment", o.toString());
+        } catch (Throwable ignore) { /* best-effort */ }
+    }
+
 
     // --- Dynamic Position Sizing Example (in INR) ---
     public BigDecimal getOptimalPositionSize(String symbol, int days, BigDecimal maxRiskPct, BigDecimal portfolioValueINR) {
