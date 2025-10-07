@@ -28,10 +28,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
@@ -59,6 +56,8 @@ public class MarketDataService {
     private EventPublisher bus;
     @Autowired
     private ObjectMapper mapper;
+    @Autowired
+    private UpstoxService upstoxService;
 
     private volatile Instant lastRegimeFlip = Instant.EPOCH; // hourly flip tracker
 
@@ -87,16 +86,6 @@ public class MarketDataService {
     private static Object idx(List<List<Object>> rows, int i, int j) {
         List<Object> r = rows.get(i);
         return (r == null || r.size() <= j) ? null : r.get(j);
-    }
-
-    private static double asDouble(Object o) {
-        if (o == null) return Double.NaN;
-        if (o instanceof Number) return ((Number) o).doubleValue();
-        try {
-            return Double.parseDouble(String.valueOf(o));
-        } catch (Exception e) {
-            return Double.NaN;
-        }
     }
 
     private static Instant parseTs(Object tsObj) {
@@ -917,13 +906,17 @@ public class MarketDataService {
                 Object vObj = r.get(5);
                 double vol = 0;
                 if (vObj instanceof Number) vol = ((Number) vObj).doubleValue();
-                else try { vol = Double.parseDouble(String.valueOf(vObj)); } catch(Exception e){vol=0;}
+                else try {
+                    vol = Double.parseDouble(String.valueOf(vObj));
+                } catch (Exception e) {
+                    vol = 0;
+                }
                 if (vol > maxVolume) maxVolume = vol;
                 totalVolume += vol;
             }
             if (totalVolume <= 0) return Optional.empty();
             return Optional.of(maxVolume / totalVolume);
-        } catch(Exception e) {
+        } catch (Exception e) {
             return Optional.empty();
         }
     }
@@ -1044,6 +1037,136 @@ public class MarketDataService {
     public Optional<Double> getPriceImpact(String instrumentKey) {
         // Needs tick data: For now, as placeholder, return 0.0.
         return Optional.of(0.0);
+    }
+
+    /**
+     * Returns current daily volatility (percent) for a symbol using business data source.
+     *
+     * @param symbol asset symbol (e.g., "RELIANCE", "NIFTY")
+     * @param days   lookback period
+     */
+    public Optional<BigDecimal> getCurrentVolatility(String symbol, int days) {
+        try {
+            List<BigDecimal> closes = getRecentClosePrices(symbol, days + 1);
+            if (closes == null || closes.size() < 2) return Optional.empty();
+
+            double[] logReturns = new double[closes.size() - 1];
+            for (int i = 1; i < closes.size(); i++) {
+                double prev = closes.get(i - 1).doubleValue();
+                double curr = closes.get(i).doubleValue();
+                if (prev <= 0 || curr <= 0) return Optional.empty();
+                logReturns[i - 1] = Math.log(curr / prev);
+            }
+
+            double mean = 0.0;
+            for (double r : logReturns) mean += r;
+            mean /= logReturns.length;
+
+            double variance = 0.0;
+            for (double r : logReturns) variance += Math.pow(r - mean, 2);
+            variance /= logReturns.length;
+
+            double stdDev = Math.sqrt(variance);
+            double volPct = stdDev * 100.0; // percent
+            return Optional.of(BigDecimal.valueOf(volPct));
+        } catch (Exception e) {
+            log.error("Volatility calculation failed for symbol {}: {}", symbol, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    public List<BigDecimal> getRecentClosePrices(String symbol, int days) {
+        try {
+            if (symbol == null || symbol.trim().isEmpty()) {
+                throw new RuntimeException("Symbol cannot be null or empty");
+            }
+
+            if (days <= 0) {
+                throw new RuntimeException("Days must be positive");
+            }
+
+            // Use the existing UpstoxService to fetch historical candle data
+            // Format dates for Upstox API (DD-MM-YYYY format)
+            LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+            LocalDate fromDate = today.minusDays(days + 5); // Extra buffer for weekends/holidays
+
+            String toDateStr = today.format(DateTimeFormatter.ofPattern("dd-MM-yyyy"));
+            String fromDateStr = fromDate.format(DateTimeFormatter.ofPattern("dd-MM-yyyy"));
+
+            // Fetch historical daily candles using the existing upstoxService
+            GetHistoricalCandleResponse response = upstoxService.getHistoricalCandleData(
+                    symbol, "day", "1", toDateStr, fromDateStr);
+
+            if (response == null || response.getData() == null || response.getData().getCandles() == null) {
+                log.warn("No historical candle data available for symbol: {}", symbol);
+                return new ArrayList<>();
+            }
+
+            List<List<Object>> candles = response.getData().getCandles();
+            List<BigDecimal> closePrices = new ArrayList<>();
+
+            // Extract close prices from candles
+            // Candle format: [timestamp, open, high, low, close, volume]
+            for (List<Object> candle : candles) {
+                if (candle != null && candle.size() >= 5) {
+                    Object closeObj = candle.get(4); // Close price is at index 4
+                    double closePrice = asDouble(closeObj);
+                    if (!Double.isNaN(closePrice) && closePrice > 0) {
+                        closePrices.add(BigDecimal.valueOf(closePrice));
+                    }
+                }
+            }
+
+            // Sort by timestamp (oldest first) - Upstox may return in different order
+            // We need to sort the candles by timestamp first, then extract closes
+            candles.sort((a, b) -> {
+                long timestampA = toEpochMillis(a.get(0));
+                long timestampB = toEpochMillis(b.get(0));
+                return Long.compare(timestampA, timestampB);
+            });
+
+            // Re-extract closes in correct chronological order
+            closePrices.clear();
+            for (List<Object> candle : candles) {
+                if (candle != null && candle.size() >= 5) {
+                    Object closeObj = candle.get(4);
+                    double closePrice = asDouble(closeObj);
+                    if (!Double.isNaN(closePrice) && closePrice > 0) {
+                        closePrices.add(BigDecimal.valueOf(closePrice).setScale(2, RoundingMode.HALF_UP));
+                    }
+                }
+            }
+
+            // Ensure we have enough data points
+            if (closePrices.size() < days) {
+                log.warn("Insufficient historical data for {}: got {} days, requested {} days",
+                        symbol, closePrices.size(), days);
+            }
+
+            // Return the most recent 'days' number of closes
+            int startIndex = Math.max(0, closePrices.size() - days);
+            List<BigDecimal> result = closePrices.subList(startIndex, closePrices.size());
+
+            log.debug("Fetched {} close prices for symbol {} (requested {} days)",
+                    result.size(), symbol, days);
+
+            return new ArrayList<>(result); // Return defensive copy
+
+        } catch (Exception e) {
+            log.error("Failed to fetch recent close prices for symbol {}: {}", symbol, e.getMessage());
+            throw new RuntimeException("Failed to fetch historical prices for " + symbol, e);
+        }
+    }
+
+    // Helper method to safely convert Object to double (already exists in your class)
+    private static double asDouble(Object o) {
+        if (o == null) return Double.NaN;
+        if (o instanceof Number) return ((Number) o).doubleValue();
+        try {
+            return Double.parseDouble(String.valueOf(o));
+        } catch (Exception e) {
+            return Double.NaN;
+        }
     }
 
 }

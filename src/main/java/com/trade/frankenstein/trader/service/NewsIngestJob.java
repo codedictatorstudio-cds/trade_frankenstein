@@ -3,6 +3,7 @@ package com.trade.frankenstein.trader.service;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.TradeNewsConstants;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
+import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;

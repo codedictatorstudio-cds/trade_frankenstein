@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.Result;
-import com.trade.frankenstein.trader.service.DecisionService;
+import com.trade.frankenstein.trader.service.decision.DecisionService;
 import com.trade.frankenstein.trader.service.EngineService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;

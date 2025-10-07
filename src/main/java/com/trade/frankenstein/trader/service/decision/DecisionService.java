@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.decision;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,6 +16,8 @@ import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.model.documents.Trade;
 import com.trade.frankenstein.trader.model.dto.*;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
+import com.trade.frankenstein.trader.service.*;
+import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.GetIntraDayCandleResponse;
 import com.upstox.api.IntraDayCandleData;
 import lombok.extern.slf4j.Slf4j;

@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.decision;
 
 import com.trade.frankenstein.trader.config.DecisionServiceConfig;
 import com.trade.frankenstein.trader.core.FastStateStore;

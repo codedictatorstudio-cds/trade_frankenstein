@@ -13,6 +13,8 @@ import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
+import com.trade.frankenstein.trader.service.decision.DecisionService;
+import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.GetIntraDayCandleResponse;
 import com.upstox.api.GetMarketQuoteLastTradedPriceResponseV3;
 import lombok.AllArgsConstructor;

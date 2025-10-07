@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.exception.Http;
-import com.trade.frankenstein.trader.service.SentimentService;
+import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;

@@ -12,6 +12,8 @@ import com.trade.frankenstein.trader.enums.OptionType;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.DecisionQuality;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
+import com.trade.frankenstein.trader.service.decision.DecisionService;
+import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.*;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
