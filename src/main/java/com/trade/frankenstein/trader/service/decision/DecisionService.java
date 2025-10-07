@@ -101,7 +101,7 @@ public class DecisionService {
         MicrostructureSignals micro = computeMicrostructureScore();
 
         // 2) Base components
-        int sScore = safe(() -> sentimentService.getNow().get().getScore()).orElse(50);
+        int sScore = sentimentService.getNow().get().getScore();
         int regimeScore = normalizeRegimeScore(regime.getPrimary());
         BigDecimal momZ = safe(() -> marketDataService.getMomentumNow(Instant.now()).get()).orElse(BigDecimal.ZERO);
 

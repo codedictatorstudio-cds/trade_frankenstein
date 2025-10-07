@@ -58,7 +58,7 @@ public class SentimentService {
 
     // --- Public API ---
 
-    public Result getNow() {
+    public Result<MarketSentimentSnapshot> getNow() {
         try {
             MarketSentimentSnapshot latest = null;
             try {
