@@ -1,7 +1,8 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.risk;
 
 import com.trade.frankenstein.trader.dto.DirectionPrediction;
 import com.trade.frankenstein.trader.dto.VolatilityPrediction;
+import com.trade.frankenstein.trader.service.OptionChainService;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;

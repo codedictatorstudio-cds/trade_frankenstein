@@ -2,7 +2,7 @@ package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.exception.Http;
 import com.trade.frankenstein.trader.model.documents.Advice;
-import com.trade.frankenstein.trader.service.AdviceService;
+import com.trade.frankenstein.trader.service.advice.AdviceService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;

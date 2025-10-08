@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.news;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.TradeNewsConstants;
@@ -6,6 +6,7 @@ import com.trade.frankenstein.trader.enums.RiskLevel;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.dto.RiskAssessment;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
+import com.trade.frankenstein.trader.service.StreamGateway;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.Setter;

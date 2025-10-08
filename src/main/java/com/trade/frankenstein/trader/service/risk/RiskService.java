@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.risk;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,6 +14,9 @@ import com.trade.frankenstein.trader.model.documents.RiskEvent;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.trade.frankenstein.trader.repo.documents.RiskEventRepo;
 import com.trade.frankenstein.trader.repo.documents.RiskSnapshotRepo;
+import com.trade.frankenstein.trader.service.PortfolioService;
+import com.trade.frankenstein.trader.service.StreamGateway;
+import com.trade.frankenstein.trader.service.UpstoxService;
 import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;

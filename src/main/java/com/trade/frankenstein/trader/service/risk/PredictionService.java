@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.risk;
 
 import com.trade.frankenstein.trader.dto.DirectionPrediction;
 import com.trade.frankenstein.trader.dto.VolatilityPrediction;

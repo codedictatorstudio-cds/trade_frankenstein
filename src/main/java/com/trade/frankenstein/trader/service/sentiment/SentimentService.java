@@ -7,7 +7,7 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
-import com.trade.frankenstein.trader.service.NewsService;
+import com.trade.frankenstein.trader.service.news.NewsService;
 import com.trade.frankenstein.trader.service.StreamGateway;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;

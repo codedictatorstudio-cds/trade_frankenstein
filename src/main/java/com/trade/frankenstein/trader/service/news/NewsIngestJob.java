@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.news;
 
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.TradeNewsConstants;

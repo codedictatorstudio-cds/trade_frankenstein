@@ -1,6 +1,6 @@
 package com.trade.frankenstein.trader.jobs;
 
-import com.trade.frankenstein.trader.service.RiskService;
+import com.trade.frankenstein.trader.service.risk.RiskService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;

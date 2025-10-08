@@ -1,6 +1,6 @@
 package com.trade.frankenstein.trader.service.sentiment;
 
-import com.trade.frankenstein.trader.service.NewsService;
+import com.trade.frankenstein.trader.service.news.NewsService;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
