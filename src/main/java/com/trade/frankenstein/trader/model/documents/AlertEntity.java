@@ -6,6 +6,7 @@ import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 import org.springframework.data.mongodb.core.mapping.Field;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.Map;
 
@@ -36,7 +37,7 @@ public class AlertEntity {
 
     @Field("timestamp")
     @Indexed
-    private LocalDateTime timestamp;
+    private Instant timestamp;
 
     @Field("source")
     private String source;
@@ -52,7 +53,7 @@ public class AlertEntity {
     private String acknowledgedBy;
 
     @Field("acknowledged_at")
-    private LocalDateTime acknowledgedAt;
+    private Instant acknowledgedAt;
 
     @CreatedDate
     @Field("created_at")
@@ -111,11 +112,11 @@ public class AlertEntity {
         this.message = message;
     }
 
-    public LocalDateTime getTimestamp() {
+    public Instant getTimestamp() {
         return timestamp;
     }
 
-    public void setTimestamp(LocalDateTime timestamp) {
+    public void setTimestamp(Instant timestamp) {
         this.timestamp = timestamp;
     }
 
@@ -151,11 +152,11 @@ public class AlertEntity {
         this.acknowledgedBy = acknowledgedBy;
     }
 
-    public LocalDateTime getAcknowledgedAt() {
+    public Instant getAcknowledgedAt() {
         return acknowledgedAt;
     }
 
-    public void setAcknowledgedAt(LocalDateTime acknowledgedAt) {
+    public void setAcknowledgedAt(Instant acknowledgedAt) {
         this.acknowledgedAt = acknowledgedAt;
     }
 

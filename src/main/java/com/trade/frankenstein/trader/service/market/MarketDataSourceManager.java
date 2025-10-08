@@ -13,6 +13,7 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -314,7 +315,7 @@ public class MarketDataSourceManager {
                 AlertDTO.AlertSeverity.HIGH,
                 instrumentKey,
                 "All market data sources failed: " + String.join(", ", failedSources),
-                LocalDateTime.now(),
+                Instant.now(),
                 "MarketDataSourceManager",
                 Map.of("failed_sources", failedSources),
                 false, null, null
@@ -328,7 +329,7 @@ public class MarketDataSourceManager {
                 AlertDTO.AlertSeverity.MEDIUM,
                 null,
                 "Market data source down: " + source + " - " + errorMessage,
-                LocalDateTime.now(),
+                Instant.now(),
                 "MarketDataSourceManager",
                 Map.of("source", source, "error", errorMessage),
                 false, null, null

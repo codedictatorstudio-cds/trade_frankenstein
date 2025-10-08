@@ -40,4 +40,6 @@ public interface TickRepo extends MongoRepository<Tick, String> {
      * Maintenance helper (e.g., purge a backfill range before re-ingest).
      */
     long deleteBySymbolAndTsBetween(String symbol, Instant from, Instant to);
+
+    List<Tick> findBySymbolOrderByTsDesc(String instrumentKey);
 }

@@ -10,7 +10,7 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +28,7 @@ public class TickIntegrityMonitor {
 
     // Recent tick history for validation
     private final Map<String, Queue<InstrumentTickDTO>> recentTickHistory = new ConcurrentHashMap<>();
-    private final Map<String, LocalDateTime> lastTickTimestamps = new ConcurrentHashMap<>();
+    private final Map<String, Instant> lastTickTimestamps = new ConcurrentHashMap<>();
 
     // Configuration thresholds
     private static final int MAX_HISTORY_SIZE = 100;
@@ -148,7 +148,7 @@ public class TickIntegrityMonitor {
                 AlertDTO.AlertSeverity.MEDIUM,
                 instrumentKey,
                 "Data anomaly detected: " + anomalyType,
-                LocalDateTime.now(),
+                Instant.now(),
                 "TickIntegrityMonitor",
                 details,
                 false, null, null
@@ -164,7 +164,7 @@ public class TickIntegrityMonitor {
     public DataQualityStats getQualityStats(String instrumentKey) {
         Queue<InstrumentTickDTO> history = recentTickHistory.get(instrumentKey);
         if (history == null || history.isEmpty()) {
-            return new DataQualityStats(0, BigDecimal.ZERO, 0, LocalDateTime.now());
+            return new DataQualityStats(0, BigDecimal.ZERO, 0, Instant.now());
         }
 
         long totalTicks = history.size();
@@ -178,7 +178,7 @@ public class TickIntegrityMonitor {
                 .mapToLong(tick -> tick.qualityFlags() != null && tick.qualityFlags().hasAnomalies() ? 1 : 0)
                 .sum();
 
-        LocalDateTime lastUpdate = lastTickTimestamps.get(instrumentKey);
+        Instant lastUpdate = lastTickTimestamps.get(instrumentKey);
 
         return new DataQualityStats(totalTicks, BigDecimal.valueOf(averageQuality),
                 anomalousTickCount, lastUpdate);
@@ -271,7 +271,7 @@ public class TickIntegrityMonitor {
         boolean isStale = false;
         boolean hasGaps = false;
 
-        LocalDateTime now = LocalDateTime.now();
+        Instant now = Instant.now();
 
         // Check if tick is stale
         long secondsOld = ChronoUnit.SECONDS.between(tick.timestamp(), now);
@@ -288,7 +288,7 @@ public class TickIntegrityMonitor {
         }
 
         // Check for gaps
-        LocalDateTime lastTimestamp = lastTickTimestamps.get(tick.instrumentKey());
+        Instant lastTimestamp = lastTickTimestamps.get(tick.instrumentKey());
         if (lastTimestamp != null) {
             long gapSeconds = ChronoUnit.SECONDS.between(lastTimestamp, tick.timestamp());
             if (gapSeconds > 30) { // More than 30 seconds gap
@@ -350,7 +350,7 @@ public class TickIntegrityMonitor {
                         AlertDTO.AlertSeverity.HIGH : AlertDTO.AlertSeverity.MEDIUM,
                 tick.instrumentKey(),
                 "Poor data quality detected: " + String.join(", ", anomalies),
-                LocalDateTime.now(),
+                Instant.now(),
                 "TickIntegrityMonitor",
                 Map.of(
                         "quality_score", qualityScore,
@@ -435,7 +435,7 @@ public class TickIntegrityMonitor {
             long totalTicks,
             BigDecimal averageQuality,
             long anomalousTickCount,
-            LocalDateTime lastUpdate
+            Instant lastUpdate
     ) {
     }
 }

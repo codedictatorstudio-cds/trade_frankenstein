@@ -5,7 +5,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.Map;
 
 public record InstrumentTickDTO(
@@ -20,7 +20,7 @@ public record InstrumentTickDTO(
         Long volume,
 
         @NotNull(message = "Timestamp cannot be null")
-        LocalDateTime timestamp,
+        Instant timestamp,
 
         @NotBlank(message = "Source cannot be blank")
         String source,
@@ -36,7 +36,7 @@ public record InstrumentTickDTO(
         Map<String, Object> metadata
 ) {
     public boolean isStale(int maxAgeSeconds) {
-        return timestamp.isBefore(LocalDateTime.now().minusSeconds(maxAgeSeconds));
+        return timestamp.isBefore(Instant.now().minusSeconds(maxAgeSeconds));
     }
 
     public boolean hasQualityIssues() {

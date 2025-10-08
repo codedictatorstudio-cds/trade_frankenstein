@@ -6,7 +6,7 @@ import org.springframework.data.mongodb.repository.MongoRepository;
 import org.springframework.data.mongodb.repository.Query;
 import org.springframework.stereotype.Repository;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -19,17 +19,17 @@ public interface AlertRepository extends MongoRepository<AlertEntity, String> {
 
     List<AlertEntity> findByInstrumentKeyOrderByTimestampDesc(String instrumentKey);
 
-    List<AlertEntity> findBySeverityAndTimestampAfterOrderByTimestampDesc(String severity, LocalDateTime since);
+    List<AlertEntity> findBySeverityAndTimestampAfterOrderByTimestampDesc(String severity, Instant since);
 
     List<AlertEntity> findBySeverityAndAcknowledgedFalseOrderByTimestampDesc(String severity);
 
-    List<AlertEntity> findByTimestampAfter(LocalDateTime since);
+    List<AlertEntity> findByTimestampAfter(Instant since);
 
-    List<AlertEntity> findByAcknowledgedTrueAndTimestampBefore(LocalDateTime cutoff);
+    List<AlertEntity> findByAcknowledgedTrueAndTimestampBefore(Instant cutoff);
 
     @Query(value = "{'acknowledged': false, 'severity': {'$in': ['HIGH', 'CRITICAL']}}")
     List<AlertEntity> findCriticalUnacknowledgedAlerts(Pageable pageable);
 
     @Query(value = "{'type': ?0, 'timestamp': {'$gte': ?1}}")
-    List<AlertEntity> findByTypeAndTimestampAfter(String type, LocalDateTime since);
+    List<AlertEntity> findByTypeAndTimestampAfter(String type, Instant since);
 }

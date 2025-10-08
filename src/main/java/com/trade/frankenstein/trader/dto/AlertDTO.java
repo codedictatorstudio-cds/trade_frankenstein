@@ -3,7 +3,7 @@ package com.trade.frankenstein.trader.dto;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.Map;
 
 public record AlertDTO(
@@ -21,13 +21,13 @@ public record AlertDTO(
         String message,
 
         @NotNull(message = "Timestamp cannot be null")
-        LocalDateTime timestamp,
+        Instant timestamp,
 
         String source,
         Map<String, Object> context,
         boolean acknowledged,
         String acknowledgedBy,
-        LocalDateTime acknowledgedAt
+        Instant acknowledgedAt
 ) {
     public boolean isCritical() {
         return severity == AlertSeverity.CRITICAL;

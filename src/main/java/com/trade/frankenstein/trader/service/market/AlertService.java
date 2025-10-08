@@ -10,7 +10,8 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -34,7 +35,7 @@ public class AlertService {
     private final Set<Consumer<AlertDTO>> globalSubscriptions = ConcurrentHashMap.newKeySet();
 
     // Alert deduplication cache
-    private final Map<String, LocalDateTime> recentAlerts = new ConcurrentHashMap<>();
+    private final Map<String, Instant> recentAlerts = new ConcurrentHashMap<>();
     private static final int DEDUPLICATION_WINDOW_MINUTES = 5;
 
     /**
@@ -154,7 +155,7 @@ public class AlertService {
                 AlertEntity alert = alertOpt.get();
                 alert.setAcknowledged(true);
                 alert.setAcknowledgedBy(acknowledgedBy);
-                alert.setAcknowledgedAt(LocalDateTime.now());
+                alert.setAcknowledgedAt(Instant.now());
                 alertRepository.save(alert);
 
                 logger.info("Alert acknowledged: {} by {}", alertId, acknowledgedBy);
@@ -190,7 +191,7 @@ public class AlertService {
     /**
      * Get alerts by severity
      */
-    public List<AlertDTO> getAlertsBySeverity(AlertDTO.AlertSeverity severity, LocalDateTime since) {
+    public List<AlertDTO> getAlertsBySeverity(AlertDTO.AlertSeverity severity, Instant since) {
         return alertRepository.findBySeverityAndTimestampAfterOrderByTimestampDesc(
                         severity.name(), since)
                 .stream()
@@ -211,7 +212,7 @@ public class AlertService {
     /**
      * Get alert statistics
      */
-    public AlertStatistics getAlertStatistics(LocalDateTime since) {
+    public AlertStatistics getAlertStatistics(Instant since) {
         List<AlertEntity> alerts = alertRepository.findByTimestampAfter(since);
 
         long totalAlerts = alerts.size();
@@ -232,7 +233,7 @@ public class AlertService {
      * Clean up old acknowledged alerts
      */
     public int cleanupOldAlerts(int daysOld) {
-        LocalDateTime cutoff = LocalDateTime.now().minusDays(daysOld);
+        Instant cutoff = Instant.now().minus(Duration.ofDays(daysOld));
         List<AlertEntity> oldAlerts = alertRepository.findByAcknowledgedTrueAndTimestampBefore(cutoff);
         alertRepository.deleteAll(oldAlerts);
 
@@ -322,10 +323,10 @@ public class AlertService {
 
     private boolean isDuplicateAlert(AlertDTO alert) {
         String alertKey = generateAlertKey(alert);
-        LocalDateTime lastAlert = recentAlerts.get(alertKey);
+        Instant lastAlert = recentAlerts.get(alertKey);
 
         if (lastAlert != null) {
-            return lastAlert.isAfter(LocalDateTime.now().minusMinutes(DEDUPLICATION_WINDOW_MINUTES));
+            return lastAlert.isAfter(Instant.now().minus(Duration.ofMinutes(DEDUPLICATION_WINDOW_MINUTES)));
         }
 
         return false;
@@ -344,7 +345,7 @@ public class AlertService {
         recentAlerts.put(alertKey, alert.timestamp());
 
         // Cleanup old entries
-        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(DEDUPLICATION_WINDOW_MINUTES * 2);
+        Instant cutoff = Instant.now().minus(Duration.ofMinutes(DEDUPLICATION_WINDOW_MINUTES * 2));
         recentAlerts.entrySet().removeIf(entry -> entry.getValue().isBefore(cutoff));
     }
 
@@ -371,7 +372,7 @@ public class AlertService {
             enrichedContext.putAll(alert.context());
         }
         enrichedContext.put("persistent_id", persistedId);
-        enrichedContext.put("processed_at", LocalDateTime.now());
+        enrichedContext.put("processed_at", Instant.now());
 
         return new AlertDTO(
                 persistedId,
