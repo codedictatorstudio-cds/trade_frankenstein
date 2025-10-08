@@ -12,7 +12,7 @@ import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.model.documents.Candle;
 import com.trade.frankenstein.trader.model.documents.Tick;
-import com.trade.frankenstein.trader.model.dto.MicrostructureSignals;
+import com.trade.frankenstein.trader.dto.MicrostructureSignals;
 import com.trade.frankenstein.trader.repo.documents.CandleRepo;
 import com.trade.frankenstein.trader.repo.documents.TickRepo;
 import com.trade.frankenstein.trader.service.StrategyService;

@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.model.dto;
+package com.trade.frankenstein.trader.dto;
 
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.enums.VolatilityLevel;

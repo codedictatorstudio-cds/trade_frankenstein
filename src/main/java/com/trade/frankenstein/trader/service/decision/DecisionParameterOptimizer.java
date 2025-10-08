@@ -3,7 +3,7 @@ package com.trade.frankenstein.trader.service.decision;
 import com.trade.frankenstein.trader.config.DecisionServiceConfig;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.StrategyName;
-import com.trade.frankenstein.trader.model.dto.StrategyWeights;
+import com.trade.frankenstein.trader.dto.StrategyWeights;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;

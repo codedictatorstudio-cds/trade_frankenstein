@@ -9,7 +9,7 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.OptionType;
-import com.trade.frankenstein.trader.model.dto.OptionsFlowBias;
+import com.trade.frankenstein.trader.dto.OptionsFlowBias;
 import com.upstox.api.GetMarketQuoteOptionGreekResponseV3;
 import com.upstox.api.GetOptionContractResponse;
 import com.upstox.api.InstrumentData;

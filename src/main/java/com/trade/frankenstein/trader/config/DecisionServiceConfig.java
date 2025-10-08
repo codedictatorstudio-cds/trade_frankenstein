@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.config;
 
 import com.trade.frankenstein.trader.enums.StrategyName;
-import com.trade.frankenstein.trader.model.dto.StrategyWeights;
+import com.trade.frankenstein.trader.dto.StrategyWeights;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;

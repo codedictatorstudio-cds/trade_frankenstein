@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.model.dto;
+package com.trade.frankenstein.trader.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;

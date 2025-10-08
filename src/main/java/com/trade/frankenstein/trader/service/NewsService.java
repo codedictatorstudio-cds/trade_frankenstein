@@ -4,7 +4,7 @@ import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.constants.TradeNewsConstants;
 import com.trade.frankenstein.trader.enums.RiskLevel;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
-import com.trade.frankenstein.trader.model.dto.RiskAssessment;
+import com.trade.frankenstein.trader.dto.RiskAssessment;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
