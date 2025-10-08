@@ -16,6 +16,7 @@ import com.trade.frankenstein.trader.service.advice.AdviceService;
 import com.trade.frankenstein.trader.service.decision.DecisionService;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
 import com.trade.frankenstein.trader.service.news.NewsService;
+import com.trade.frankenstein.trader.service.options.OptionChainService;
 import com.trade.frankenstein.trader.service.risk.RiskService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.*;
