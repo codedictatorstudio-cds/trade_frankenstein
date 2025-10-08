@@ -5,7 +5,7 @@ public enum TradeStatus {
     CLOSED,
     PENDING,
     EXITED,
-    CANCELLED, REJECTED, FAILED, FILLED, PARTIAL
+    CANCELLED, REJECTED, FAILED, FILLED
 }
 
 

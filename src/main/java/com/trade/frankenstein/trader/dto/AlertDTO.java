@@ -46,11 +46,10 @@ public record AlertDTO(
         VOLATILITY_SPIKE,
         DATA_LOSS,
         API_FAILURE,
-        REGIME_CHANGE,
-        RISK_MANAGEMENT
+        REGIME_CHANGE
     }
 
     public enum AlertSeverity {
-        LOW, MEDIUM, HIGH, CRITICAL,WARNING, INFO
+        LOW, MEDIUM, HIGH, CRITICAL
     }
 }

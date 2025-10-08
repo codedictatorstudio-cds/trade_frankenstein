@@ -8,8 +8,6 @@ public enum OrderStatus {
     FILLED,
     CANCELLED,
     REJECTED,
-    EXPIRED,
-    COMPLETE,
-    OPEN
+    EXPIRED
 }
 

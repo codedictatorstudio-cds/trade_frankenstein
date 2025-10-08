@@ -2,7 +2,7 @@ package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.exception.Http;
 import com.trade.frankenstein.trader.enums.OptionType;
-import com.trade.frankenstein.trader.service.options.OptionChainService;
+import com.trade.frankenstein.trader.service.OptionChainService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
