@@ -15,15 +15,18 @@ Trade Frankenstein is an automated trading bot designed to execute trades based 
 - **Trade Reconciliation**: Automatic reconciliation of trades with broker data
 - **Swagger API Documentation**: Full API documentation for integration
 - **Feature Flags**: Toggle features on/off for phased deployment
+- **Resilience Patterns**: Circuit breaker and retry mechanisms for broker APIs
 
 ## Tech Stack
 
 - **Backend**: Java 17, Spring Boot 3.5.5
-- **Frontend**: Vaadin 24.8.3, React, TypeScript
+- **Frontend**: Vaadin 24.8.3, React 18.3.1, TypeScript
 - **Database**: MongoDB
-- **Messaging**: Apache Kafka/Redpanda
+- **Messaging**: Apache Kafka 3.7/Redpanda
 - **Documentation**: OpenAPI/Swagger
 - **Build Tool**: Maven
+- **Resilience**: Resilience4j
+- **Testing**: Testcontainers 1.21.3
 
 ## Prerequisites
 
@@ -94,7 +97,7 @@ The main application configuration is in `src/main/resources/application.propert
 
 ```properties
 # Trading mode: sandbox or live
-trade.mode=sandbox
+trade.mode=${TRADE_MODE:sandbox}
 
 # Broker selection
 trade.broker=mock
@@ -104,6 +107,13 @@ trade.symbols.allowed=NIFTY,BANKNIFTY
 
 # Trade reconciliation interval (ms)
 trade.trades.reconcile-ms=45000
+
+# Server configuration
+server.port=8080
+server.address=127.0.0.1
+
+# MongoDB configuration
+spring.data.mongodb.uri=mongodb://localhost:27017/TFS
 ```
 
 ### Feature Flags
@@ -135,6 +145,7 @@ The application follows a modular architecture:
 3. **Broker Integration**: Adapters for different brokerages
 4. **Analytics Engine**: Analyzes market data and generates trading signals
 5. **Dashboard**: Web interface for monitoring and configuration
+6. **Resilience Layer**: Ensures robustness with circuit breakers and retries
 
 ## Data Model
 
