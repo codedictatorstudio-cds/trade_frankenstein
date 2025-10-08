@@ -17,6 +17,7 @@ import com.trade.frankenstein.trader.model.documents.Trade;
 import com.trade.frankenstein.trader.model.dto.*;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
 import com.trade.frankenstein.trader.service.*;
+import com.trade.frankenstein.trader.service.market.MarketDataService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.GetIntraDayCandleResponse;
 import com.upstox.api.IntraDayCandleData;

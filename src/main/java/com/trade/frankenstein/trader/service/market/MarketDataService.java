@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.market;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,6 +15,9 @@ import com.trade.frankenstein.trader.model.documents.Tick;
 import com.trade.frankenstein.trader.model.dto.MicrostructureSignals;
 import com.trade.frankenstein.trader.repo.documents.CandleRepo;
 import com.trade.frankenstein.trader.repo.documents.TickRepo;
+import com.trade.frankenstein.trader.service.StrategyService;
+import com.trade.frankenstein.trader.service.StreamGateway;
+import com.trade.frankenstein.trader.service.UpstoxService;
 import com.upstox.api.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;

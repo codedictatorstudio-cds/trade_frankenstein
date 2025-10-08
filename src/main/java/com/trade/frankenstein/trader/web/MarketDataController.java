@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.web;
 
 import com.trade.frankenstein.trader.common.exception.Http;
-import com.trade.frankenstein.trader.service.MarketDataService;
+import com.trade.frankenstein.trader.service.market.MarketDataService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;

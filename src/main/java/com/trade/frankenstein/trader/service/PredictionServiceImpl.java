@@ -2,6 +2,7 @@ package com.trade.frankenstein.trader.service;
 
 import com.trade.frankenstein.trader.model.dto.DirectionPrediction;
 import com.trade.frankenstein.trader.model.dto.VolatilityPrediction;
+import com.trade.frankenstein.trader.service.market.MarketDataService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 

@@ -10,6 +10,7 @@ import com.trade.frankenstein.trader.enums.*;
 import com.trade.frankenstein.trader.model.documents.Advice;
 import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
 import com.trade.frankenstein.trader.repo.documents.AdviceRepo;
+import com.trade.frankenstein.trader.service.market.MarketDataService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.GetOrderDetailsResponse;
 import com.upstox.api.PlaceOrderRequest;

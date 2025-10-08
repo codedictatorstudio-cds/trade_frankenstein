@@ -13,6 +13,9 @@ public class RiskAssessment {
     private RiskLevel level;
     private double maxPositionSize;
     private double stopLossAdjustment;
+    private double predictedVolatility;
+    private double riskScore;
+    private double confidenceInterval;
 
     public RiskAssessment() {
         this.level = RiskLevel.MEDIUM;
