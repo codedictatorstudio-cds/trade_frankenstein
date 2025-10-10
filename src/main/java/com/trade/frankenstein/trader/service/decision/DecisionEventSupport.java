@@ -37,7 +37,7 @@ import java.util.List;
 public class DecisionEventSupport {
 
     @Autowired
-    private EventPublisher publisher;
+    private final EventPublisher publisher;
 
     // core fields
     private String event;

@@ -315,19 +315,12 @@ public class SocialMediaApiClient {
 
     // --- Cache Helper ---
 
-    private static class CachedSentiment {
-        final double polarity;
-        final Instant timestamp;
-
-        CachedSentiment(double polarity, Instant timestamp) {
-            this.polarity = polarity;
-            this.timestamp = timestamp;
-        }
+    private record CachedSentiment(double polarity, Instant timestamp) {
 
         boolean isValid() {
-            return Duration.between(timestamp, Instant.now()).compareTo(Duration.ofMinutes(5)) < 0;
+                return Duration.between(timestamp, Instant.now()).compareTo(Duration.ofMinutes(5)) < 0;
+            }
         }
-    }
 
     // --- Health Check ---
 

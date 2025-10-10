@@ -417,16 +417,7 @@ public class AlertService {
     }
 
     // Inner classes and events
-    public static class AlertEvent {
-        private final AlertDTO alert;
-
-        public AlertEvent(AlertDTO alert) {
-            this.alert = alert;
-        }
-
-        public AlertDTO getAlert() {
-            return alert;
-        }
+        public record AlertEvent(AlertDTO alert) {
     }
 
     public record AlertStatistics(

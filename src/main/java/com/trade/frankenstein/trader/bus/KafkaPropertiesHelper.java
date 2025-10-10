@@ -129,8 +129,7 @@ public final class KafkaPropertiesHelper {
 
         for (Map.Entry<Object, Object> e : target.entrySet()) {
             Object val = e.getValue();
-            if (val instanceof String) {
-                String s = (String) val;
+            if (val instanceof String s) {
                 String expanded = expandOne(s, source);
                 if (!s.equals(expanded)) {
                     target.setProperty(String.valueOf(e.getKey()), expanded);

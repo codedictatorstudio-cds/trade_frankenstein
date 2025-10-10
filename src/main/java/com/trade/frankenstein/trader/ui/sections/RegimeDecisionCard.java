@@ -54,7 +54,7 @@ public class RegimeDecisionCard extends Div {
     private static final String COLOR_DANGER = "#dc2626";
 
     private int confidence = 72;
-    private Registration busReg;
+    private final Registration busReg;
 
     // JSON parser (replace ApiClient.readTree)
     private static final ObjectMapper OM = new ObjectMapper();
@@ -542,11 +542,10 @@ public class RegimeDecisionCard extends Div {
 
         // Update arc fill
         ring.getChildren().findFirst().ifPresent(arcTrackComp -> {
-            if (arcTrackComp instanceof Div) {
-                Div arcTrack = (Div) arcTrackComp;
+            if (arcTrackComp instanceof Div arcTrack) {
                 arcTrack.getChildren().findFirst().ifPresent(arcFillComp -> {
                     if (arcFillComp instanceof Div) {
-                        ((Div) arcFillComp).getStyle()
+                        arcFillComp.getStyle()
                                 .set("clip-path", "polygon(50% 50%, " + (50 - confidence / 2) + "% 0%, " + (50 + confidence / 2) + "% 0%)")
                                 .set("background", "linear-gradient(135deg, " + COLOR_PRIMARY + ", " +
                                         (confidence > 60 ? COLOR_SUCCESS : COLOR_LOW) + ")");

@@ -520,14 +520,7 @@ public final class ControlsBar extends FlexLayout {
     }
 
     // ---- Data container ----
-    private static class DecisionSnapshot {
-        final int score;
-        final String trend;
-
-        public DecisionSnapshot(int score, String trend) {
-            this.score = score;
-            this.trend = trend;
-        }
+        private record DecisionSnapshot(int score, String trend) {
     }
 
     private void animateAction(Runnable action) {
