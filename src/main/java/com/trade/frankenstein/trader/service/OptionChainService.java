@@ -1,6 +1,5 @@
 package com.trade.frankenstein.trader.service;
 
-import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
@@ -8,8 +7,8 @@ import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
 import com.trade.frankenstein.trader.core.FastStateStore;
-import com.trade.frankenstein.trader.enums.OptionType;
 import com.trade.frankenstein.trader.dto.OptionsFlowBias;
+import com.trade.frankenstein.trader.enums.OptionType;
 import com.upstox.api.GetMarketQuoteOptionGreekResponseV3;
 import com.upstox.api.GetOptionContractResponse;
 import com.upstox.api.InstrumentData;
@@ -42,19 +41,6 @@ public class OptionChainService {
     private FastStateStore fast;
     @Autowired
     private EventPublisher eventPublisher;
-
-    // Track last delta-pick per symbol+expiry for audit diffs
-    private final ConcurrentHashMap<String, DeltaPick> lastPickByKey = new ConcurrentHashMap<>();
-
-
-    private static String joinCsv(List<String> keys, int from, int to) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = from; i < to; i++) {
-            if (i > from) sb.append(',');
-            sb.append(keys.get(i));
-        }
-        return sb.toString();
-    }
 
     // =================================================================================
     // Real-time metrics (PCR, Max Pain, Greeks snapshot)
@@ -116,15 +102,6 @@ public class OptionChainService {
     // Fast snapshot (Step-3): total CE/PE OI per expiry with Redis TTL=10s
     // =================================================================================
 
-    private static double safeDouble(Number n) {
-        if (n == null) return Double.NaN;
-        try {
-            return n.doubleValue();
-        } catch (Exception e) {
-            return Double.NaN;
-        }
-    }
-
     private static long safeLong(Number n) {
         if (n == null) return 0L;
         try {
@@ -132,18 +109,6 @@ public class OptionChainService {
         } catch (Exception e) {
             return 0L;
         }
-    }
-
-    // Approximate ATM strike for tie-breaker
-    private static int strikeIntApprox(List<InstrumentData> instruments) {
-        // Fallback: median strike among instruments (quick & stable)
-        if (instruments == null || instruments.isEmpty()) return 0;
-        int n = instruments.size();
-        int[] arr = new int[n];
-        int i = 0;
-        for (InstrumentData oi : instruments) arr[i++] = strikeInt(oi);
-        Arrays.sort(arr);
-        return arr[n / 2];
     }
 
     // =================================================================================
@@ -156,7 +121,7 @@ public class OptionChainService {
     public Result<List<InstrumentData>> listContractsByStrikeRange(
             String underlyingKey, LocalDate expiry, BigDecimal minStrike, BigDecimal maxStrike) {
 
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || minStrike == null || maxStrike == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, minStrike, maxStrike are required");
         }
@@ -168,12 +133,7 @@ public class OptionChainService {
 
         List<InstrumentData> filtered = all.stream()
                 .filter(c -> strikeInt(c) >= minK && strikeInt(c) <= maxK)
-                .sorted(new Comparator<InstrumentData>() {
-                    @Override
-                    public int compare(InstrumentData a, InstrumentData b) {
-                        return Integer.compare(strikeInt(a), strikeInt(b));
-                    }
-                })
+                .sorted(Comparator.comparingInt(OptionChainService::strikeInt))
                 .collect(Collectors.<InstrumentData>toList());
         return Result.ok(filtered);
     }
@@ -183,12 +143,12 @@ public class OptionChainService {
      * We probe upcoming Wed/Thu/Fri and keep the ones for which Upstox actually returns contracts.
      */
     public Result<List<LocalDate>> listNearestExpiries(String underlyingKey, int count) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey)) return Result.fail("BAD_REQUEST", "underlyingKey required");
 
         final LocalDate today = LocalDate.now();
         final LocalDate horizon = today.plusDays(56);
-        Set<LocalDate> candidates = new LinkedHashSet<LocalDate>();
+        Set<LocalDate> candidates = new LinkedHashSet<>();
         for (LocalDate d = today; !d.isAfter(horizon); d = d.plusDays(1)) {
             DayOfWeek dow = d.getDayOfWeek();
             if (dow == DayOfWeek.WEDNESDAY || dow == DayOfWeek.THURSDAY || dow == DayOfWeek.FRIDAY) {
@@ -196,7 +156,7 @@ public class OptionChainService {
             }
         }
 
-        List<LocalDate> found = new ArrayList<LocalDate>();
+        List<LocalDate> found = new ArrayList<>();
         for (LocalDate d : candidates) {
             try {
                 if (!fetchInstruments(underlyingKey, d).isEmpty()) {
@@ -219,7 +179,7 @@ public class OptionChainService {
     public Result<InstrumentData> findContract(
             String underlyingKey, LocalDate expiry, BigDecimal strike, OptionType type) {
 
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || strike == null || type == null) {
             return Result.fail("BAD_REQUEST", "params required");
         }
@@ -241,33 +201,91 @@ public class OptionChainService {
      * OI Put/Call ratio (PE OI / CE OI) for an expiry, from live greeks.
      */
     public Result<BigDecimal> getOiPcr(String underlyingKey, LocalDate expiry) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
-        if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
-
-        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
-        if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
-
-        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
-        if (greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
-
-        long ceOi = 0L, peOi = 0L;
-        for (InstrumentData oi : instruments) {
-            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
-            if (g == null) continue;
-            long oiVal = safeLong(g.getOi());
-            if (sideEquals(oi, "CE")) ceOi += oiVal;
-            else if (sideEquals(oi, "PE")) peOi += oiVal;
+        // Enhanced validation
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.warn("Unauthorized OI PCR request for underlying: {}", underlyingKey);
+            return Result.fail("UNAUTHORIZED", "User not authenticated");
         }
-        if (ceOi == 0L) return Result.fail("DIV_BY_ZERO", "Call OI zero");
-        BigDecimal pcr = BigDecimal.valueOf(peOi).divide(BigDecimal.valueOf(ceOi), 6, RoundingMode.HALF_UP);
-        return Result.ok(pcr);
+
+        if (isBlank(underlyingKey) || expiry == null) {
+            log.warn("Invalid parameters for OI PCR: underlying={}, expiry={}", underlyingKey, expiry);
+            return Result.fail("BAD_REQUEST", "underlyingKey and expiry are required");
+        }
+
+        try {
+            // Fetch instruments with enhanced error handling
+            List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
+            if (instruments.isEmpty()) {
+                log.info("No option instruments found for underlying: {} expiry: {}", underlyingKey, expiry);
+                return Result.fail("NOT_FOUND", "No option instruments available for the specified expiry");
+            }
+
+            // Fetch Greeks with comprehensive validation
+            Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
+            if (greeks.isEmpty()) {
+                log.warn("No Greeks data available for underlying: {} expiry: {}", underlyingKey, expiry);
+                return Result.fail("NOT_FOUND", "Greeks data unavailable");
+            }
+
+            // Calculate OI with proper aggregation
+            long ceOi = 0L, peOi = 0L;
+            int processedInstruments = 0;
+
+            for (InstrumentData instrument : instruments) {
+                MarketQuoteOptionGreekV3 greek = greeks.get(instrument.getInstrumentKey());
+                if (greek == null) continue;
+
+                long oiValue = safeLong(greek.getOi());
+                if (oiValue <= 0) continue; // Skip zero/negative OI
+
+                if (sideEquals(instrument, "CE")) {
+                    ceOi += oiValue;
+                } else if (sideEquals(instrument, "PE")) {
+                    peOi += oiValue;
+                }
+                processedInstruments++;
+            }
+
+            // Enhanced validation and logging
+            if (ceOi == 0L) {
+                log.warn("Zero Call OI for underlying: {} expiry: {}", underlyingKey, expiry);
+                return Result.fail("INVALID_DATA", "Call option open interest is zero");
+            }
+
+            if (peOi == 0L) {
+                log.warn("Zero Put OI for underlying: {} expiry: {}", underlyingKey, expiry);
+            }
+
+            BigDecimal pcrRatio = BigDecimal.valueOf(peOi)
+                    .divide(BigDecimal.valueOf(ceOi), 6, RoundingMode.HALF_UP);
+
+            log.debug("OI PCR calculated for {}: CE_OI={}, PE_OI={}, PCR={}, processed_instruments={}",
+                    underlyingKey, ceOi, peOi, pcrRatio, processedInstruments);
+
+            // Audit the calculation
+            audit("oi.pcr.calculated", createAuditData(
+                    "underlying", underlyingKey,
+                    "expiry", expiry.toString(),
+                    "ceOi", String.valueOf(ceOi),
+                    "peOi", String.valueOf(peOi),
+                    "pcr", pcrRatio.toString(),
+                    "instruments", String.valueOf(processedInstruments)
+            ));
+
+            return Result.ok(pcrRatio);
+
+        } catch (Exception ex) {
+            log.error("Failed to calculate OI PCR for underlying: {} expiry: {}",
+                    underlyingKey, expiry, ex);
+            return Result.fail("INTERNAL_ERROR", "Failed to calculate OI PCR: " + ex.getMessage());
+        }
     }
 
     /**
      * Volume Put/Call ratio (PE Vol / CE Vol) for an expiry, from live greeks volume.
      */
     public Result<BigDecimal> getVolumePcr(String underlyingKey, LocalDate expiry) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
         List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
@@ -293,7 +311,7 @@ public class OptionChainService {
      * Raw greeks map (keyed by instrument_key) for all contracts of an expiry.
      */
     public Result<Map<String, MarketQuoteOptionGreekV3>> getGreeksForExpiry(String underlyingKey, LocalDate expiry) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
         List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
@@ -311,7 +329,7 @@ public class OptionChainService {
     public Result<LinkedHashMap<Integer, Long>> topOiChange(
             String underlyingKey, LocalDate expiry, OptionType type, int limit) {
 
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || type == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, type required");
         }
@@ -329,9 +347,9 @@ public class OptionChainService {
         Map<Integer, Long> prev = cache.get(key);
 
         // compute positive deltas (curr - prev)
-        Map<Integer, Long> deltas = new HashMap<Integer, Long>();
+        Map<Integer, Long> deltas = new HashMap<>();
         for (Map.Entry<Integer, Long> e : curr.entrySet()) {
-            long before = (prev == null) ? 0L : (prev.containsKey(e.getKey()) ? prev.get(e.getKey()) : 0L);
+            long before = (prev == null) ? 0L : (prev.getOrDefault(e.getKey(), 0L));
             long d = e.getValue() - before;
             if (d > 0L) deltas.put(e.getKey(), d);
         }
@@ -340,14 +358,9 @@ public class OptionChainService {
         cache.put(key, curr);
 
         // sort desc by delta, limit, and return
-        List<Map.Entry<Integer, Long>> entries = new ArrayList<Map.Entry<Integer, Long>>(deltas.entrySet());
-        Collections.sort(entries, new Comparator<Map.Entry<Integer, Long>>() {
-            @Override
-            public int compare(Map.Entry<Integer, Long> a, Map.Entry<Integer, Long> b) {
-                return Long.compare(b.getValue(), a.getValue());
-            }
-        });
-        LinkedHashMap<Integer, Long> out = new LinkedHashMap<Integer, Long>();
+        List<Map.Entry<Integer, Long>> entries = new ArrayList<>(deltas.entrySet());
+        entries.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
+        LinkedHashMap<Integer, Long> out = new LinkedHashMap<>();
         int max = Math.max(1, limit);
         for (int i = 0; i < entries.size() && i < max; i++) {
             Map.Entry<Integer, Long> e = entries.get(i);
@@ -365,7 +378,7 @@ public class OptionChainService {
     public Result<BigDecimal> getIvPercentile(
             String underlyingKey, LocalDate expiry, BigDecimal strike, OptionType type) {
 
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || strike == null || type == null) {
             return Result.fail("BAD_REQUEST", "params required");
         }
@@ -380,7 +393,7 @@ public class OptionChainService {
         int k = strike.setScale(0, RoundingMode.HALF_UP).intValue();
 
         // gather same-side IVs and find target IV
-        List<BigDecimal> ivs = new ArrayList<BigDecimal>();
+        List<BigDecimal> ivs = new ArrayList<>();
         BigDecimal targetIv = null;
 
         for (InstrumentData oi : instruments) {
@@ -411,7 +424,7 @@ public class OptionChainService {
             String underlyingKey, LocalDate expiry, BigDecimal underlyingLtp,
             int strikesEachSide, int strikeStep) {
 
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || underlyingLtp == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, underlyingLtp required");
         }
@@ -427,8 +440,8 @@ public class OptionChainService {
         if (greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
 
         // Collect IVs within the range by side
-        List<BigDecimal> ceIvs = new ArrayList<BigDecimal>();
-        List<BigDecimal> peIvs = new ArrayList<BigDecimal>();
+        List<BigDecimal> ceIvs = new ArrayList<>();
+        List<BigDecimal> peIvs = new ArrayList<>();
         for (InstrumentData oi : instruments) {
             int k = strikeInt(oi);
             if (k < min.intValue() || k > max.intValue()) continue;
@@ -465,7 +478,7 @@ public class OptionChainService {
      * When offset != 0 we recompute live and do not cache historical points.
      */
     public Optional<OiSnapshot> getLatestOiSnapshot(String underlyingKey, LocalDate expiry, int offset) {
-        if (!isLoggedIn()) return Optional.empty();
+        if (isLoggedIn()) return Optional.empty();
         if (isBlank(underlyingKey) || expiry == null) return Optional.empty();
 
         final String key = "oi:" + underlyingKey + ":" + expiry.format(DateTimeFormatter.ISO_DATE);
@@ -504,27 +517,116 @@ public class OptionChainService {
     }
 
     private OiSnapshot computeOiSnapshot(String underlyingKey, LocalDate expiry) {
+        if (isBlank(underlyingKey) || expiry == null) {
+            log.warn("Invalid parameters for OI snapshot computation");
+            return null;
+        }
+
+        Instant computationStart = Instant.now();
+
         try {
+            // Fetch instruments with validation
             List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
-            if (instruments == null || instruments.isEmpty()) return null;
-
-            Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
-            if (greeks.isEmpty()) return null;
-
-            long ceOi = 0L, peOi = 0L;
-            for (InstrumentData oi : instruments) {
-                MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
-                if (g == null) continue;
-                long val = safeLong(g.getOi());
-                if (sideEquals(oi, "CE")) ceOi += val;
-                else if (sideEquals(oi, "PE")) peOi += val;
+            if (instruments.isEmpty()) {
+                log.debug("No instruments available for OI snapshot: {} {}", underlyingKey, expiry);
+                return null;
             }
-            return new OiSnapshot(BigDecimal.valueOf(ceOi), BigDecimal.valueOf(peOi), Instant.now().truncatedTo(ChronoUnit.SECONDS));
-        } catch (Exception t) {
-            log.error("computeOiSnapshot failed", t);
+
+            // Fetch Greeks data
+            Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
+            if (greeks.isEmpty()) {
+                log.debug("No Greeks data for OI snapshot: {} {}", underlyingKey, expiry);
+                return null;
+            }
+
+            // Calculate aggregated OI with detailed tracking
+            long totalCeOi = 0L, totalPeOi = 0L;
+            int ceContracts = 0, peContracts = 0;
+            int skippedContracts = 0;
+
+            for (InstrumentData instrument : instruments) {
+                MarketQuoteOptionGreekV3 greek = greeks.get(instrument.getInstrumentKey());
+                if (greek == null) {
+                    skippedContracts++;
+                    continue;
+                }
+
+                long oiValue = safeLong(greek.getOi());
+                if (oiValue <= 0) {
+                    skippedContracts++;
+                    continue;
+                }
+
+                if (sideEquals(instrument, "CE")) {
+                    totalCeOi += oiValue;
+                    ceContracts++;
+                } else if (sideEquals(instrument, "PE")) {
+                    totalPeOi += oiValue;
+                    peContracts++;
+                } else {
+                    log.debug("Unknown option type for instrument: {}", instrument.getInstrumentKey());
+                    skippedContracts++;
+                }
+            }
+
+            Instant snapshotTime = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+            long computationDuration = ChronoUnit.MILLIS.between(computationStart, snapshotTime);
+
+            log.debug("OI snapshot computed for {}: CE_OI={} ({}contracts), PE_OI={} ({}contracts), " +
+                            "skipped={}, duration={}ms",
+                    underlyingKey, totalCeOi, ceContracts, totalPeOi, peContracts,
+                    skippedContracts, computationDuration);
+
+            // Create snapshot with enhanced metadata
+            OiSnapshot snapshot = new OiSnapshot(
+                    BigDecimal.valueOf(totalCeOi),
+                    BigDecimal.valueOf(totalPeOi),
+                    snapshotTime
+            );
+
+            // Publish snapshot event for real-time consumers
+            if (eventPublisher != null) {
+                publishOiSnapshotEvent(underlyingKey, expiry, snapshot,
+                        ceContracts, peContracts, computationDuration);
+            }
+
+            return snapshot;
+
+        } catch (Exception ex) {
+            log.error("Failed to compute OI snapshot for underlying: {} expiry: {}",
+                    underlyingKey, expiry, ex);
+
+            // Audit the failure
+            audit("oi.snapshot.failed", createAuditData(
+                    "underlying", underlyingKey,
+                    "expiry", expiry.toString(),
+                    "error", ex.getMessage()
+            ));
+
             return null;
         }
     }
+
+    private void publishOiSnapshotEvent(String underlyingKey, LocalDate expiry, OiSnapshot snapshot,
+                                        int ceContracts, int peContracts, long computationDuration) {
+        try {
+            JsonObject event = new JsonObject();
+            event.addProperty("type", "oi.snapshot");
+            event.addProperty("underlying", underlyingKey);
+            event.addProperty("expiry", expiry.toString());
+            event.addProperty("ceOi", snapshot.totalCeOi().longValue());
+            event.addProperty("peOi", snapshot.totalPeOi().longValue());
+            event.addProperty("ceContracts", ceContracts);
+            event.addProperty("peContracts", peContracts);
+            event.addProperty("computationMs", computationDuration);
+            event.addProperty("timestamp", snapshot.asOf().toEpochMilli());
+
+            eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, underlyingKey, event.toString());
+        } catch (Exception ex) {
+            log.warn("Failed to publish OI snapshot event", ex);
+        }
+    }
+
 
     /**
      * Round price to nearest step (e.g., 50 for NIFTY).
@@ -540,13 +642,31 @@ public class OptionChainService {
     }
 
     private List<InstrumentData> fetchInstruments(String underlyingKey, LocalDate expiry) {
+        if (!AuthCodeHolder.getInstance().isLoggedIn()) {
+            log.warn("Attempted to fetch instruments without authentication for underlying: {}", underlyingKey);
+            return Collections.emptyList();
+        }
+
         try {
-            // Expecting underlyingKey like "NSE_INDEX|Nifty 50" to be handled properly inside UpstoxService.
             GetOptionContractResponse resp = upstox.getOptionInstrument(underlyingKey, expiry.toString());
-            if (resp == null || resp.getData() == null) return Collections.emptyList();
-            return resp.getData();
-        } catch (Exception t) {
-            log.error("fetchInstruments failed: {}", t.toString());
+            if (resp == null || resp.getData() == null) {
+                log.debug("No instrument data returned for underlying: {} expiry: {}", underlyingKey, expiry);
+                return Collections.emptyList();
+            }
+
+            List<InstrumentData> instruments = resp.getData();
+            log.debug("Retrieved {} instruments for underlying: {} expiry: {}",
+                    instruments.size(), underlyingKey, expiry);
+
+            // Audit successful fetch
+            audit("instruments.fetched", createAuditData("underlying", underlyingKey,
+                    "expiry", expiry.toString(),
+                    "count", String.valueOf(instruments.size())));
+            return instruments;
+
+        } catch (Exception ex) {
+            log.error("Failed to fetch instruments for underlying: {} expiry: {}",
+                    underlyingKey, expiry, ex);
             return Collections.emptyList();
         }
     }
@@ -555,28 +675,55 @@ public class OptionChainService {
      * Call greeks in batches to respect CSV limits on the Upstox endpoint.
      */
     private Map<String, MarketQuoteOptionGreekV3> fetchGreeksMap(List<InstrumentData> instruments) {
-        Map<String, MarketQuoteOptionGreekV3> out = new HashMap<String, MarketQuoteOptionGreekV3>();
-        if (instruments == null || instruments.isEmpty()) return out;
+        Map<String, MarketQuoteOptionGreekV3> greeksMap = new ConcurrentHashMap<>();
 
-        List<String> keys = new ArrayList<String>(instruments.size());
-        for (InstrumentData oi : instruments) {
-            String k = oi.getInstrumentKey();
-            if (k != null && !k.trim().isEmpty()) keys.add(k);
+        if (instruments == null || instruments.isEmpty()) {
+            log.debug("No instruments provided for Greeks fetch");
+            return greeksMap;
         }
-        if (keys.isEmpty()) return out;
 
-        final int BATCH = 100; // raise if API allows larger CSV
-        for (int i = 0; i < keys.size(); i += BATCH) {
-            String csv = joinCsv(keys, i, Math.min(i + BATCH, keys.size()));
+        List<String> validKeys = instruments.stream()
+                .map(InstrumentData::getInstrumentKey)
+                .filter(key -> key != null && !key.trim().isEmpty())
+                .toList();
+
+        if (validKeys.isEmpty()) {
+            log.warn("No valid instrument keys found from {} instruments", instruments.size());
+            return greeksMap;
+        }
+
+        final int batchSize = 100; // Could be externalized to configuration
+        int totalBatches = (validKeys.size() + batchSize - 1) / batchSize;
+        log.debug("Fetching Greeks for {} instruments in {} batches", validKeys.size(), totalBatches);
+
+        for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+            int start = batchIndex * batchSize;
+            int end = Math.min(start + batchSize, validKeys.size());
+
+            String csv = String.join(",", validKeys.subList(start, end));
+
             try {
-                GetMarketQuoteOptionGreekResponseV3 g = upstox.getOptionGreeks(csv);
-                if (g != null && g.getData() != null) out.putAll(g.getData());
-            } catch (Exception t) {
-                log.error("fetchGreeksMap batch failed: {}", t.toString());
+                GetMarketQuoteOptionGreekResponseV3 response = upstox.getOptionGreeks(csv);
+                if (response != null && response.getData() != null) {
+                    Map<String, MarketQuoteOptionGreekV3> batchData = response.getData();
+                    greeksMap.putAll(batchData);
+                    log.debug("Successfully fetched Greeks for batch {}/{}: {} instruments",
+                            batchIndex + 1, totalBatches, batchData.size());
+                } else {
+                    log.warn("Empty Greeks response for batch {}/{}", batchIndex + 1, totalBatches);
+                }
+            } catch (Exception ex) {
+                log.error("Failed to fetch Greeks for batch {}/{} with {} keys",
+                        batchIndex + 1, totalBatches, end - start, ex);
+
+                // Continue with other batches rather than failing completely
             }
         }
-        return out;
+
+        log.debug("Total Greeks fetched: {}/{} instruments", greeksMap.size(), validKeys.size());
+        return greeksMap;
     }
+
 
     // =================================================================================
     // Hedge sizing helpers — pick closest |delta| strikes (Java 8, SDK-safe)
@@ -585,21 +732,20 @@ public class OptionChainService {
     private Map<Integer, Long> oiByStrike(List<InstrumentData> instruments,
                                           Map<String, MarketQuoteOptionGreekV3> greeks,
                                           String side) {
-        Map<Integer, Long> map = new HashMap<Integer, Long>();
+        Map<Integer, Long> map = new HashMap<>();
         for (InstrumentData oi : instruments) {
             if (!sideEquals(oi, side)) continue;
             MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
             if (g == null) continue;
             int k = strikeInt(oi);
             long add = safeLong(g.getOi());
-            Long prev = map.get(k);
-            map.put(k, (prev == null ? 0L : prev) + add);
+            map.compute(k, (key, prev) -> (prev == null ? 0L : prev) + add);
         }
         return map;
     }
 
     public Optional<MarketQuoteOptionGreekV3> getGreek(String instrumentKey) {
-        if (!isLoggedIn()) return Optional.empty();
+        if (isLoggedIn()) return Optional.empty();
         try {
             Result<List<LocalDate>> expsRes = listNearestExpiries(Underlyings.NIFTY, 3);
             if (expsRes == null || !expsRes.isOk() || expsRes.get() == null) return Optional.empty();
@@ -618,282 +764,31 @@ public class OptionChainService {
         return Optional.empty();
     }
 
-    /**
-     * Pick the closest-|delta| option contracts for a given side (CALL/PUT).
-     * Uses live greeks from Upstox; skips contracts without a delta.
-     *
-     * @param underlyingKey  e.g., "NSE_INDEX|Nifty 50"
-     * @param expiry         expiry date
-     * @param type           CALL or PUT
-     * @param targetAbsDelta target absolute delta in 0..1 (e.g., 0.20). If null, defaults to 0.20.
-     * @param count          how many contracts to return (>=1)
-     */
-    public Result<List<InstrumentData>> pickClosestDeltaStrikes(String underlyingKey,
-                                                                LocalDate expiry,
-                                                                OptionType type,
-                                                                BigDecimal targetAbsDelta,
-                                                                int count) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
-        if (underlyingKey == null || underlyingKey.trim().isEmpty() || expiry == null || type == null) {
-            return Result.fail("BAD_REQUEST", "params required");
-        }
-
-        List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
-        if (instruments.isEmpty()) return Result.fail("NOT_FOUND", "No option instruments for expiry");
-
-        // Build greeks map once
-        Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
-        if (greeks.isEmpty()) return Result.fail("NOT_FOUND", "No greeks returned");
-
-        String side = optTypeCode(type); // "CE" / "PE"
-        double tgt = targetAbsDelta == null ? 0.20 : Math.max(0.0, Math.min(1.0, targetAbsDelta.doubleValue()));
-        final List<Score> scored = new ArrayList<>();
-
-        for (InstrumentData oi : instruments) {
-            if (!sideEquals(oi, side)) continue;
-            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
-            if (g == null) continue;
-            double d = safeDouble(g.getDelta());
-            if (Double.isNaN(d)) continue;
-            double ad = Math.abs(d);
-            double err = Math.abs(ad - tgt);
-            scored.add(new Score(oi, ad, err));
-        }
-
-        if (scored.isEmpty()) return Result.fail("NOT_FOUND", "No contracts with delta");
-
-        // Sort by smallest |delta - target|, then by |delta| descending (tie-breaker), then by strike proximity to ATM
-        Collections.sort(scored, new Comparator<Score>() {
-            public int compare(Score a, Score b) {
-                int cmp = Double.compare(a.err, b.err);
-                if (cmp != 0) return cmp;
-                // Prefer higher absolute delta (more hedge effectiveness) when equally close
-                cmp = Double.compare(b.absDelta, a.absDelta);
-                if (cmp != 0) return cmp;
-                // Final tie-breaker: closer strike to ATM
-                int atm = strikeIntApprox(instruments);
-                return Integer.compare(Math.abs(strikeInt(a.oi) - atm), Math.abs(strikeInt(b.oi) - atm));
-            }
-        });
-
-        int n = Math.max(1, count);
-        List<InstrumentData> out = new ArrayList<InstrumentData>(n);
-        for (int i = 0; i < scored.size() && i < n; i++) {
-            out.add(scored.get(i).oi);
-        }
-        return Result.ok(out);
-    }
-
-    /**
-     * Convenience helper: pick both CE and PE hedge legs around the same target |delta|.
-     * Returns a map with keys OptionType.CALL and OptionType.PUT.
-     */
-    public Result<Map<OptionType, List<InstrumentData>>> pickClosestDeltaPair(String underlyingKey,
-                                                                              LocalDate expiry,
-                                                                              BigDecimal targetAbsDelta,
-                                                                              int countPerSide) {
-        if (!isLoggedIn()) return Result.fail("user-not-logged-in");
-        if (underlyingKey == null || underlyingKey.trim().isEmpty() || expiry == null) {
-            return Result.fail("BAD_REQUEST", "params required");
-        }
-        Map<OptionType, List<InstrumentData>> map = new EnumMap<OptionType, List<InstrumentData>>(OptionType.class);
-
-        Result<List<InstrumentData>> ce = pickClosestDeltaStrikes(underlyingKey, expiry, OptionType.CALL, targetAbsDelta, countPerSide);
-        if (!ce.isOk()) return Result.fail(ce.getErrorCode(), ce.getError());
-        map.put(OptionType.CALL, ce.get());
-
-        Result<List<InstrumentData>> pe = pickClosestDeltaStrikes(underlyingKey, expiry, OptionType.PUT, targetAbsDelta, countPerSide);
-        if (!pe.isOk()) return Result.fail(pe.getErrorCode(), pe.getError());
-        map.put(OptionType.PUT, pe.get());
-
-        return Result.ok(map);
-    }
-
     // =================================================================================
     // Auth guard
     // =================================================================================
     private boolean isLoggedIn() {
         try {
-            return AuthCodeHolder.getInstance().isLoggedIn();
+            return AuthCodeHolder.getInstance().isLoggedIn(); // ✓ Remove negation
         } catch (Throwable t) {
-            return false;
+            return false; // ✓ Return false on auth error
         }
-    }
-
-    // ===== Step-10 additions: helpers (closest-|Δ|, JSON, publish) =====
-    public DeltaPick pickClosestDeltaStrikesFromRows(List<BasicOptionRow> rows, double targetAbsDelta) {
-        if (rows == null || rows.isEmpty()) {
-            return new DeltaPick(Double.NaN, Double.NaN, Double.NaN, Double.NaN);
-        }
-        BasicOptionRow bestCe = null;
-        BasicOptionRow bestPe = null;
-        double ceGap = Double.MAX_VALUE;
-        double peGap = Double.MAX_VALUE;
-        for (BasicOptionRow r : rows) {
-            if (r == null || Double.isNaN(r.delta)) continue;
-            final double gap = Math.abs(Math.abs(r.delta) - targetAbsDelta);
-            if ("CE".equalsIgnoreCase(r.type)) {
-                if (gap < ceGap) {
-                    ceGap = gap;
-                    bestCe = r;
-                }
-            } else if ("PE".equalsIgnoreCase(r.type)) {
-                if (gap < peGap) {
-                    peGap = gap;
-                    bestPe = r;
-                }
-            }
-        }
-        final double ceStrike = bestCe != null ? bestCe.strike : Double.NaN;
-        final double peStrike = bestPe != null ? bestPe.strike : Double.NaN;
-        final double ceDelta = bestCe != null ? bestCe.delta : Double.NaN;
-        final double peDelta = bestPe != null ? bestPe.delta : Double.NaN;
-        return new DeltaPick(ceStrike, peStrike, ceDelta, peDelta);
-    }
-
-    public String buildDeltaPickJsonString(String symbol,
-                                           String expiry,
-                                           double targetAbsDelta,
-                                           DeltaPick pick,
-                                           String rationale) {
-        final JsonObject payload = new JsonObject();
-        payload.addProperty("type", "delta_pick");
-        payload.addProperty("symbol", nullSafe(symbol));
-        payload.addProperty("expiry", nullSafe(expiry));
-        payload.addProperty("targetAbsDelta", targetAbsDelta);
-        payload.addProperty("ts", Instant.now().toEpochMilli());
-        payload.addProperty("rationale", nullSafe(rationale));
-
-        final JsonObject ce = new JsonObject();
-        ce.addProperty("strike", pick != null ? pick.ceStrike() : Double.NaN);
-        ce.addProperty("delta", pick != null ? pick.ceDelta() : Double.NaN);
-
-        final JsonObject pe = new JsonObject();
-        pe.addProperty("strike", pick != null ? pick.peStrike() : Double.NaN);
-        pe.addProperty("delta", pick != null ? pick.peDelta() : Double.NaN);
-
-        payload.add("ce", ce);
-        payload.add("pe", pe);
-        return payload.toString();
-    }
-
-    public void publishDeltaPick(String symbol,
-                                 String expiry,
-                                 double targetAbsDelta,
-                                 DeltaPick pick,
-                                 String rationale) {
-        try {
-            final String lpKey = key(symbol, expiry);
-            final DeltaPick prev = lastPickByKey.get(lpKey);
-            final DeltaPick cur = pick;
-            boolean changed = false;
-            if (prev == null && cur != null) changed = true;
-            else if (prev != null && cur != null) {
-                // significant change if strike changed OR |delta diff| > 0.05 on either leg
-                boolean strikeChanged = (Double.doubleToLongBits(prev.ceStrike()) != Double.doubleToLongBits(cur.ceStrike()))
-                        || (Double.doubleToLongBits(prev.peStrike()) != Double.doubleToLongBits(cur.peStrike()));
-                double dCe = Math.abs((Double.isNaN(prev.ceDelta()) ? 0 : prev.ceDelta()) - (Double.isNaN(cur.ceDelta()) ? 0 : cur.ceDelta()));
-                double dPe = Math.abs((Double.isNaN(prev.peDelta()) ? 0 : prev.peDelta()) - (Double.isNaN(cur.peDelta()) ? 0 : cur.peDelta()));
-                boolean deltaMoved = (dCe > 0.05d) || (dPe > 0.05d);
-                changed = strikeChanged || deltaMoved;
-            }
-
-            if (this.eventPublisher == null) return;
-            final String key = key(symbol, expiry);
-            final String json = buildDeltaPickJsonString(symbol, expiry, targetAbsDelta, pick, rationale);
-            lastPickByKey.put(lpKey, cur);
-            if (changed) {
-                com.google.gson.JsonObject d = new com.google.gson.JsonObject();
-                d.addProperty("symbol", symbol);
-                d.addProperty("expiry", expiry);
-                d.addProperty("targetAbsDelta", targetAbsDelta);
-                if (cur != null) {
-                    com.google.gson.JsonObject ce = new com.google.gson.JsonObject();
-                    ce.addProperty("strike", cur.ceStrike());
-                    ce.addProperty("delta", cur.ceDelta());
-                    com.google.gson.JsonObject pe = new com.google.gson.JsonObject();
-                    pe.addProperty("strike", cur.peStrike());
-                    pe.addProperty("delta", cur.peDelta());
-                    d.add("ce", ce);
-                    d.add("pe", pe);
-                }
-                if (rationale != null) d.addProperty("rationale", rationale);
-                audit("option_chain.pick_changed", d);
-            }
-        } catch (Throwable t) {
-            // non-fatal to keep existing behavior
-        }
-    }
-
-    public String buildOptionChainLightJsonString(String symbol,
-                                                  String expiry,
-                                                  Collection<BasicOptionRow> rows) {
-        final JsonObject payload = new JsonObject();
-        payload.addProperty("type", "chain_light");
-        payload.addProperty("symbol", nullSafe(symbol));
-        payload.addProperty("expiry", nullSafe(expiry));
-        payload.addProperty("ts", Instant.now().toEpochMilli());
-
-        final JsonArray arr = new JsonArray();
-        if (rows != null) {
-            for (BasicOptionRow r : rows) {
-                if (r == null) continue;
-                arr.add(toJson(r));
-            }
-        }
-        payload.add("rows", arr);
-        return payload.toString();
-    }
-
-    public void publishOptionChainLight(String symbol, String expiry, Collection<BasicOptionRow> rows) {
-        try {
-            if (this.eventPublisher == null) return;
-            final String key = key(symbol, expiry);
-            final String json = buildOptionChainLightJsonString(symbol, expiry, rows);
-            this.eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, key, json);
-        } catch (Throwable t) {
-            // non-fatal
-        }
-    }
-
-    private JsonObject toJson(BasicOptionRow r) {
-        final JsonObject o = new JsonObject();
-        o.addProperty("strike", r.strike);
-        o.addProperty("type", r.type);
-        if (!Double.isNaN(r.ltp)) o.addProperty("ltp", r.ltp);
-        if (!Double.isNaN(r.iv)) o.addProperty("iv", r.iv);
-        if (!Double.isNaN(r.oi)) o.addProperty("oi", r.oi);
-        if (!Double.isNaN(r.delta)) o.addProperty("delta", r.delta);
-        if (!Double.isNaN(r.gamma)) o.addProperty("gamma", r.gamma);
-        if (!Double.isNaN(r.theta)) o.addProperty("theta", r.theta);
-        if (!Double.isNaN(r.vega)) o.addProperty("vega", r.vega);
-        if (r.instrumentKey != null) o.addProperty("instrumentKey", r.instrumentKey);
-        return o;
-    }
-
-    private String key(String symbol, String expiry) {
-        return nullSafe(symbol) + "|" + nullSafe(expiry);
-    }
-
-    private String nullSafe(String s) {
-        return s == null ? "" : s;
     }
 
     /**
      * Returns a snapshot of options flow (CE/PE volumes, OI change) for the instrument and expiry.
      */
     public Optional<OptionsFlowBias> analyzeOptionsFlow(String underlyingKey, LocalDate expiry) {
-        if (!isLoggedIn() || underlyingKey == null || expiry == null) return Optional.empty();
+        if (isLoggedIn() || underlyingKey == null || expiry == null) return Optional.empty();
         try {
             // CE/PE volumes and OI from current expiry greeks data
-            List instruments = fetchInstruments(underlyingKey, expiry);
+            List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
             Map<String, MarketQuoteOptionGreekV3> greeks = fetchGreeksMap(instruments);
 
             double ceVolume = 0, peVolume = 0;
             double ceOiChange = 0, peOiChange = 0;
 
-            for (Object oiObj : instruments) {
-                InstrumentData oi = (InstrumentData) oiObj;
+            for (InstrumentData oi : instruments) {
                 MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
                 if (g == null) continue;
                 long vol = safeLong(g.getVolume());
@@ -925,115 +820,8 @@ public class OptionChainService {
     public record OiSnapshot(BigDecimal totalCeOi, BigDecimal totalPeOi, Instant asOf) {
     }
 
-    // Local score struct (Java 8-friendly, no Lombok needed here)
-    private record Score(InstrumentData oi, double absDelta, double err) {
-    }
-
-    // ===== Step-10 additions: lightweight DTOs (kept inside service to avoid coupling) =====
-    public static final class BasicOptionRow {
-        public final double strike;
-        public final String type; // "CE" or "PE"
-        public final double ltp;   // optional
-        public final double iv;    // optional
-        public final double oi;    // optional
-        public final double delta; // optional
-        public final double gamma; // optional
-        public final double theta; // optional
-        public final double vega;  // optional
-        public final String instrumentKey; // optional
-
-        private BasicOptionRow(Builder b) {
-            this.strike = b.strike;
-            this.type = b.type;
-            this.ltp = b.ltp;
-            this.iv = b.iv;
-            this.oi = b.oi;
-            this.delta = b.delta;
-            this.gamma = b.gamma;
-            this.theta = b.theta;
-            this.vega = b.vega;
-            this.instrumentKey = b.instrumentKey;
-        }
-
-        public static Builder builder(double strike, String type) {
-            return new Builder(strike, type);
-        }
-
-        public static final class Builder {
-            private final double strike;
-            private final String type;
-            private double ltp = Double.NaN;
-            private double iv = Double.NaN;
-            private double oi = Double.NaN;
-            private double delta = Double.NaN;
-            private double gamma = Double.NaN;
-            private double theta = Double.NaN;
-            private double vega = Double.NaN;
-            private String instrumentKey;
-
-            public Builder(double strike, String type) {
-                this.strike = strike;
-                this.type = type;
-            }
-
-            public Builder ltp(double v) {
-                this.ltp = v;
-                return this;
-            }
-
-            public Builder iv(double v) {
-                this.iv = v;
-                return this;
-            }
-
-            public Builder oi(double v) {
-                this.oi = v;
-                return this;
-            }
-
-            public Builder delta(double v) {
-                this.delta = v;
-                return this;
-            }
-
-            public Builder gamma(double v) {
-                this.gamma = v;
-                return this;
-            }
-
-            public Builder theta(double v) {
-                this.theta = v;
-                return this;
-            }
-
-            public Builder vega(double v) {
-                this.vega = v;
-                return this;
-            }
-
-            public Builder instrumentKey(String v) {
-                this.instrumentKey = v;
-                return this;
-            }
-
-            public BasicOptionRow build() {
-                return new BasicOptionRow(this);
-            }
-        }
-    }
-
-    public record DeltaPick(double ceStrike, double peStrike, double ceDelta, double peDelta) {
-
-        @Override
-        public String toString() {
-            return "DeltaPick{ceStrike=" + ceStrike + ", peStrike=" + peStrike +
-                    ", ceDelta=" + ceDelta + ", peDelta=" + peDelta + "}";
-        }
-    }
-
-
     // ===== Kafkaesque audit helper (optional; uses same EventPublisher) =====
-    private void audit(String event, com.google.gson.JsonObject data) {
+    private void audit(String event, JsonObject data) {
         try {
             if (this.eventPublisher == null) return;
             java.time.Instant now = java.time.Instant.now();
@@ -1043,41 +831,16 @@ public class OptionChainService {
             o.addProperty("event", event);
             o.addProperty("source", "option_chain");
             if (data != null) o.add("data", data);
-            this.eventPublisher.publish(EventBusConfig.TOPIC_AUDIT, "option_chain", o.toString());
+            this.eventPublisher.publish(EventBusConfig.TOPIC_AUDIT, event, o.toString());
         } catch (Throwable ignore) { /* best-effort */ }
     }
 
 
-    /**
-     * Publish a compact greeks snapshot for the current chain.
-     * Emits to TOPIC_OPTION_CHAIN with event="option_chain.greeks_snapshot".
-     * Backward compatible: does not alter existing publishers.
-     */
-    public void publishGreeksSnapshot(String symbol, String expiry, java.util.Collection<BasicOptionRow> rows) {
-        try {
-            if (this.eventPublisher == null) return;
-            final String k = key(symbol, expiry);
-            java.time.Instant now = java.time.Instant.now();
-            com.google.gson.JsonObject payload = new com.google.gson.JsonObject();
-            payload.addProperty("type", "greeks_snapshot");
-            payload.addProperty("event", "option_chain.greeks_snapshot");
-            payload.addProperty("source", "option_chain");
-            payload.addProperty("symbol", nullSafe(symbol));
-            payload.addProperty("expiry", nullSafe(expiry));
-            payload.addProperty("ts", now.toEpochMilli());
-            payload.addProperty("ts_iso", now.toString());
-            com.google.gson.JsonArray arr = new com.google.gson.JsonArray();
-            if (rows != null) {
-                for (BasicOptionRow r : rows) {
-                    if (r == null) continue;
-                    arr.add(toJson(r));
-                }
-            }
-            payload.add("rows", arr);
-            this.eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, k, payload.toString());
-        } catch (Throwable t) {
-            // non-fatal
+    private JsonObject createAuditData(String... keyValuePairs) {
+        JsonObject data = new JsonObject();
+        for (int i = 0; i < keyValuePairs.length - 1; i += 2) {
+            data.addProperty(keyValuePairs[i], keyValuePairs[i + 1]);
         }
+        return data;
     }
-
 }
