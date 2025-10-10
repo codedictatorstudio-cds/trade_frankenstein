@@ -316,7 +316,7 @@ public class MetricsCollector {
      */
     @Scheduled(fixedRate = 600000) // Every 10 minutes
     public void cleanupOldMetrics() {
-        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(METRICS_RETENTION_MINUTES);
+        LocalDateTime cutoff = LocalDateTime.now().minus(METRICS_RETENTION_MINUTES, ChronoUnit.MINUTES);
 
         // Remove old timestamp entries and associated data
         timestamps.entrySet().removeIf(entry -> {

@@ -39,5 +39,5 @@ public final class Http {
     /**
      * Simple error response structure that will be returned to clients
      */
-    private record ErrorResponse(String code, String message, java.time.Instant timestamp) {}
+    private static record ErrorResponse(String code, String message, java.time.Instant timestamp) {}
 }

@@ -1046,4 +1046,38 @@ public class OptionChainService {
             this.eventPublisher.publish(EventBusConfig.TOPIC_AUDIT, "option_chain", o.toString());
         } catch (Throwable ignore) { /* best-effort */ }
     }
+
+
+    /**
+     * Publish a compact greeks snapshot for the current chain.
+     * Emits to TOPIC_OPTION_CHAIN with event="option_chain.greeks_snapshot".
+     * Backward compatible: does not alter existing publishers.
+     */
+    public void publishGreeksSnapshot(String symbol, String expiry, java.util.Collection<BasicOptionRow> rows) {
+        try {
+            if (this.eventPublisher == null) return;
+            final String k = key(symbol, expiry);
+            java.time.Instant now = java.time.Instant.now();
+            com.google.gson.JsonObject payload = new com.google.gson.JsonObject();
+            payload.addProperty("type", "greeks_snapshot");
+            payload.addProperty("event", "option_chain.greeks_snapshot");
+            payload.addProperty("source", "option_chain");
+            payload.addProperty("symbol", nullSafe(symbol));
+            payload.addProperty("expiry", nullSafe(expiry));
+            payload.addProperty("ts", now.toEpochMilli());
+            payload.addProperty("ts_iso", now.toString());
+            com.google.gson.JsonArray arr = new com.google.gson.JsonArray();
+            if (rows != null) {
+                for (BasicOptionRow r : rows) {
+                    if (r == null) continue;
+                    arr.add(toJson(r));
+                }
+            }
+            payload.add("rows", arr);
+            this.eventPublisher.publish(EventBusConfig.TOPIC_OPTION_CHAIN, k, payload.toString());
+        } catch (Throwable t) {
+            // non-fatal
+        }
+    }
+
 }
