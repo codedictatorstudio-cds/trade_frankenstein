@@ -7,7 +7,7 @@ import lombok.Data;
 @Builder
 public class PredictiveComponents {
     private DirectionPrediction shortTermDirection;
-    private VolatilityPrediction volatilityForecast;
+    private VolatilityDecisionPrediction volatilityForecast;
     private OptionsFlowBias optionsFlowBias;
     private MicrostructureSignals microstructureSignals;
     private double predictionConfidence; // 0..1

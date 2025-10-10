@@ -18,7 +18,7 @@ import com.trade.frankenstein.trader.model.documents.Candle;
 import com.trade.frankenstein.trader.model.documents.Tick;
 import com.trade.frankenstein.trader.repo.documents.CandleRepo;
 import com.trade.frankenstein.trader.repo.documents.TickRepo;
-import com.trade.frankenstein.trader.service.StrategyService;
+import com.trade.frankenstein.trader.service.strategy.StrategyService;
 import com.trade.frankenstein.trader.service.StreamGateway;
 import com.trade.frankenstein.trader.service.UpstoxService;
 import com.upstox.api.*;

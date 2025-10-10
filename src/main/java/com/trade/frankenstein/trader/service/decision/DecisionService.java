@@ -233,7 +233,7 @@ public class DecisionService {
     /**
      * Calculates overall prediction confidence from direction and volatility predictions.
      */
-    private double calculatePredictionConfidence(DirectionPrediction dir, VolatilityPrediction vol) {
+    private double calculatePredictionConfidence(DirectionPrediction dir, VolatilityDecisionPrediction vol) {
         double c1 = dir != null ? dir.getConfidence() : 0.0;
         double c2 = vol != null ? vol.getConfidence() : 0.0;
         int count = 0;

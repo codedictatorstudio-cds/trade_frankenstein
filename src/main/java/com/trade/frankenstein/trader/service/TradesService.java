@@ -12,6 +12,7 @@ import com.trade.frankenstein.trader.enums.TradeStatus;
 import com.trade.frankenstein.trader.model.documents.Trade;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
 import com.trade.frankenstein.trader.service.risk.RiskService;
+import com.trade.frankenstein.trader.service.strategy.StrategyService;
 import com.upstox.api.GetTradeResponse;
 import com.upstox.api.TradeData;
 import lombok.extern.slf4j.Slf4j;

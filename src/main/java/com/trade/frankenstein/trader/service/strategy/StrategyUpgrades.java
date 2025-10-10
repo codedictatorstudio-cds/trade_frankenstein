@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.strategy;
 
 import com.google.gson.JsonObject;
 

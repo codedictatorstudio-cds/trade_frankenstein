@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.service.risk;
 
 import com.trade.frankenstein.trader.dto.DirectionPrediction;
-import com.trade.frankenstein.trader.dto.VolatilityPrediction;
+import com.trade.frankenstein.trader.dto.VolatilityDecisionPrediction;
 
 import java.util.Optional;
 
@@ -26,7 +26,7 @@ public interface PredictionService {
      * @param horizonMinutes Prediction horizon in minutes
      * @return Optional volatility prediction
      */
-    Optional<VolatilityPrediction> predictVolatility(String instrumentKey, int horizonMinutes);
+    Optional<VolatilityDecisionPrediction> predictVolatility(String instrumentKey, int horizonMinutes);
 
     /**
      * Estimates overall prediction confidence based on combined models.
@@ -36,7 +36,7 @@ public interface PredictionService {
      * @return Combined confidence score (0..1)
      */
     default double calculateOverallPredictionConfidence(DirectionPrediction directionPred,
-                                                        VolatilityPrediction volatilityPred) {
+                                                        VolatilityDecisionPrediction volatilityPred) {
         double c1 = directionPred != null ? directionPred.getConfidence() : 0;
         double c2 = volatilityPred != null ? volatilityPred.getConfidence() : 0;
         return (c1 + c2) / (c1>0 && c2>0 ? 2 : 1);

@@ -1,7 +1,7 @@
 package com.trade.frankenstein.trader.service.risk;
 
 import com.trade.frankenstein.trader.dto.DirectionPrediction;
-import com.trade.frankenstein.trader.dto.VolatilityPrediction;
+import com.trade.frankenstein.trader.dto.VolatilityDecisionPrediction;
 import com.trade.frankenstein.trader.service.OptionChainService;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -59,7 +59,7 @@ public class PredictionServiceImpl implements PredictionService {
     }
 
     @Override
-    public Optional<VolatilityPrediction> predictVolatility(String instrumentKey, int horizonMinutes) {
+    public Optional<VolatilityDecisionPrediction> predictVolatility(String instrumentKey, int horizonMinutes) {
         try {
             // Use current ATR% as proxy for volatility trend
             BigDecimal atrPct = BigDecimal.valueOf(marketDataService.getAtrJump5mPct(instrumentKey).get());
@@ -82,7 +82,7 @@ public class PredictionServiceImpl implements PredictionService {
             expectedChange += (random.nextDouble() - 0.5) * 0.05;
             conf = Math.max(0, Math.min(1, conf + (random.nextDouble() - 0.5) * 0.1));
 
-            return Optional.of(new VolatilityPrediction(expectedChange, conf, Instant.now()));
+            return Optional.of(new VolatilityDecisionPrediction(expectedChange, conf, Instant.now()));
         } catch (Exception e) {
             return Optional.empty();
         }

@@ -10,7 +10,7 @@ import java.time.Instant;
  */
 @Data
 @AllArgsConstructor
-public class VolatilityPrediction {
+public class VolatilityDecisionPrediction {
     private double expectedChange;    // e.g. +0.25 = +25%
     private double confidence;        // 0..1
     private Instant asOf;             // timestamp of forecast

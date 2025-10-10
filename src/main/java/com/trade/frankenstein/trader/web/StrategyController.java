@@ -1,6 +1,6 @@
 package com.trade.frankenstein.trader.web;
 
-import com.trade.frankenstein.trader.service.StrategyService;
+import com.trade.frankenstein.trader.service.strategy.StrategyService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;

@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.strategy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -6,12 +6,15 @@ import com.google.gson.JsonObject;
 import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.common.Underlyings;
+import com.trade.frankenstein.trader.dto.MLFeatures;
+import com.trade.frankenstein.trader.dto.MLRiskAssessment;
+import com.trade.frankenstein.trader.dto.OptimalPositionSize;
+import com.trade.frankenstein.trader.dto.PerformanceTrackingEvent;
 import com.trade.frankenstein.trader.enums.AdviceStatus;
 import com.trade.frankenstein.trader.enums.MarketRegime;
 import com.trade.frankenstein.trader.enums.OptionType;
-import com.trade.frankenstein.trader.model.documents.Advice;
-import com.trade.frankenstein.trader.model.documents.DecisionQuality;
-import com.trade.frankenstein.trader.model.documents.RiskSnapshot;
+import com.trade.frankenstein.trader.model.documents.*;
+import com.trade.frankenstein.trader.service.*;
 import com.trade.frankenstein.trader.service.advice.AdviceService;
 import com.trade.frankenstein.trader.service.decision.DecisionService;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
@@ -20,6 +23,8 @@ import com.trade.frankenstein.trader.service.risk.RiskService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
 import com.upstox.api.*;
 import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -42,6 +47,7 @@ import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -97,8 +103,17 @@ public class StrategyService {
 
     // --- Liquidity guard (hard filter) ---
     private static final BigDecimal MIN_LIQUIDITY_OI = bd("1000");
-    private static final BigDecimal MAX_BIDASK_SPREAD_PCT = bd("0.03");
+    private static final BigDecimal MAX_BID_ASK_SPREAD_PCT = bd("0.03");
+    // Add this to the constants section in StrategyService class
+    private static final int VOLATILITY_PREDICTION_HORIZON_MINUTES = 30;
 
+    // Enhanced Constants with ML Parameters
+    private static final double ML_CONFIDENCE_THRESHOLD = 0.75;
+    private static final int ENSEMBLE_MIN_MODELS = 3;
+    private static final double RL_EXPLORATION_RATE = 0.1;
+    private static final long PATTERN_LOOK_BACK_MINUTES = 60;
+    private static final double ALTERNATIVE_DATA_WEIGHT = 0.3;
+    private static final double MICROSTRUCTURE_IMBALANCE_THRESHOLD = 0.6;
     // Metrics
     private final AtomicLong advicesCreated = new AtomicLong(0);
     private final AtomicLong advicesSkipped = new AtomicLong(0);
@@ -130,6 +145,22 @@ public class StrategyService {
     private EventPublisher bus;
     @Autowired
     private ObjectMapper mapper;
+    @Autowired
+    private MLPredictionService mlPredictionService;
+    @Autowired
+    private ReinforcementLearningService rlService;
+    @Autowired
+    private EnsembleService ensembleService;
+    @Autowired
+    private VolatilityPredictionService volatilityPredictionService;
+    @Autowired
+    private PatternRecognitionService patternRecognitionService;
+    @Autowired
+    private AlternativeDataService alternativeDataService;
+    @Autowired
+    private MarketMicrostructureService marketMicrostructureService;
+    @Autowired
+    private PerformanceAnalyticsService performanceAnalyticsService;
 
     private static List<String> safeList(List<String> a) {
         return a == null ? Collections.emptyList() : a;
@@ -176,7 +207,7 @@ public class StrategyService {
     }
 
     private static double percentileRank(List<Double> data, double x) {
-        List<Double> sorted = new ArrayList<Double>(data);
+        List<Double> sorted = new ArrayList<>(data);
         Collections.sort(sorted);
         int count = 0;
         for (double v : sorted) if (v <= x) count++;
@@ -186,44 +217,66 @@ public class StrategyService {
     // -------------------- Public entrypoint --------------------
     public int generateAdvicesNow() {
         try {
-            if (!riskService.hasHeadroom(1.0)) { // require at least 1% budget left (and not circuit-tripped)
+            // Enhanced risk gate with ML-based confidence
+            MLRiskAssessment mlRisk = mlPredictionService.assessRiskConditions();
+            if (!riskService.hasHeadroom(1.0) || (mlRisk != null && mlRisk.getRiskScore().compareTo(bd("0.8")) > 0)) {
                 Map<String, Object> guard = new LinkedHashMap<>();
                 guard.put("gate.risk", true);
-                return skipTick(guard, "risk.block");
+                guard.put("ml.risk.score", mlRisk != null ? mlRisk.getRiskScore() : null);
+                return skipTick(guard, "risk.block.enhanced");
             }
         } catch (Exception e) {
             Map<String, Object> guard = new LinkedHashMap<>();
             guard.put("gate.risk.error", String.valueOf(e));
             return skipTick(guard, "risk.block.error");
         }
+
         int created = 0;
         final long t0 = System.currentTimeMillis();
         Map<String, Object> dbg = new LinkedHashMap<>();
-        log.info("Strategy execution started");
+        log.info("Enhanced strategy execution started");
+
         try {
-            // 1) Decision trend + reasons
+            // 1) Enhanced Decision Quality with ML
             Result<DecisionQuality> dqR = decisionService.getQuality();
             if (dqR == null || !dqR.isOk() || dqR.get() == null) {
                 log.info("Strategy execution skipped - no valid decision quality available");
                 return skipTick(dbg, "no-decision-quality");
             }
+
             DecisionQuality dq = dqR.get();
             String trend = up(dq.getTrend() == null ? "NEUTRAL" : dq.getTrend().name());
             List<String> baseReasons = safeList(dq.getReasons());
 
-            // 2) Index LTP + nearest expiry & stale guard
+            // NEW: Get ML-enhanced trend prediction
+            MLPrediction mlTrend = mlPredictionService.predictTrend(30); // 30-minute horizon
+            if (mlTrend != null && mlTrend.getConfidence().compareTo(bd(String.valueOf(ML_CONFIDENCE_THRESHOLD))) >= 0) {
+                trend = mlTrend.getPredictedDirection();
+                baseReasons.add("ML-Enhanced Trend: " + trend + " (confidence: " + mlTrend.getConfidence() + ")");
+            }
+
+            // 2) Enhanced Market Data with Alternative Sources
             BigDecimal spot = getIndexLtp();
             if (spot == null) {
                 log.info("Strategy execution skipped - no spot price available");
                 return skipTick(dbg, "no-spot");
             }
+
             LocalDate expiry = nearestExpiry();
             if (expiry == null) {
                 log.info("Strategy execution skipped - no valid expiry date available");
                 return skipTick(dbg, "no-expiry");
             }
 
-            // 3) Intraday candles (5m) with staleness check
+            // NEW: Alternative Data Integration
+            AlternativeDataSignal altData = alternativeDataService.getAggregatedSignal();
+            boolean altDataBlock = (altData != null && altData.getStrength().compareTo(bd("-0.7")) <= 0);
+            if (altDataBlock) {
+                dbg.put("gate.alternative.data", altData.getStrength());
+                return skipTick(dbg, "alternative.data.negative");
+            }
+
+            // 3) Enhanced Candle Data Analysis
             IntraDayCandleData c5 = candles(NIFTY, "minutes", "5");
             logCandleOrder("strategy.m5", c5);
             if (isStale(c5, 6)) {
@@ -231,101 +284,171 @@ public class StrategyService {
                 return skipTick(dbg, "stale-candles");
             }
 
-            // 4) Indicators (5m)
+            // 4) Enhanced Indicators with ML Predictions
             Ind ind5 = indicators(c5, spot);
+            EnhancedIndicators enhancedInd = enhanceIndicatorsWithML(ind5, c5);
 
-            // Step-9: trend/momentum filters if enabled
+            // NEW: Pattern Recognition
+            List<PatternMatch> patterns = patternRecognitionService.detectPatterns(c5, (int) PATTERN_LOOK_BACK_MINUTES);
+            PatternMatch strongestPattern = patterns.stream()
+                    .max(Comparator.comparing(PatternMatch::getConfidence))
+                    .orElse(null);
+
+            if (strongestPattern != null && strongestPattern.getConfidence().compareTo(bd("0.8")) >= 0) {
+                baseReasons.add("Pattern: " + strongestPattern.getPatternName() +
+                        " (confidence: " + strongestPattern.getConfidence() + ")");
+            }
+
+            // Step-9: Enhanced trend/momentum filters
             boolean adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
             if (adxWeak) {
                 log.info("Strategy execution stopped - ADX trend filter");
                 return skipTick(dbg, "gate.trend.adx");
             }
+
             String eBias = emaBias(ind5);
             if ("FLAT".equals(eBias) || "NA".equals(eBias)) {
                 log.info("Strategy execution stopped - momentum confirmation (EMA flat)");
                 return skipTick(dbg, "gate.momentum.emaFlat");
             }
 
-            // 5) Multi-timeframe alignment
+            // 5) Enhanced Multi-timeframe with ML Ensemble
             IntraDayCandleData c15 = candles(NIFTY, "minutes", "15");
-            logCandleOrder("strategy.m15", c15);
+            IntraDayCandleData c60 = candles(NIFTY, "minutes", "60");
+
+            EnsemblePrediction ensemblePred = ensembleService.getMultiTimeframePrediction(c5, c15, c60, spot);
+            boolean mlMtfAgree = (ensemblePred != null &&
+                    ensemblePred.getConfidence().compareTo(bd("0.7")) >= 0);
+
             Ind ind15 = indicators(c15, spot);
             MarketRegime hrReg = marketDataService.getRegimeOn("minutes", "60").orElse(MarketRegime.NEUTRAL);
 
-            adxWeak = ind5.adx != null && ind5.adx.compareTo(ADX_MIN_TREND) < 0;
             String effectiveTrend = adxWeak ? "NEUTRAL" : trend;
+            boolean traditionalMtfAgree = emaBias(ind5).equals(emaBias(ind15)) && hrReg == mapToRegime(effectiveTrend);
 
-            boolean mtfAgree = emaBias(ind5).equals(emaBias(ind15)) && hrReg == mapToRegime(effectiveTrend);
-            dbg.put("mtfAgree", mtfAgree);
+            // Combined MTF agreement (traditional + ML)
+            boolean combinedMtfAgree = traditionalMtfAgree && mlMtfAgree;
+            dbg.put("mtfAgree.traditional", traditionalMtfAgree);
+            dbg.put("mtfAgree.ml", mlMtfAgree);
+            dbg.put("mtfAgree.combined", combinedMtfAgree);
 
-            // 6) Structure filters
+            // 6) Enhanced Structure Filters with ML
             Structure struct = structure(c5);
+            MarketMicrostructure microStructure = marketMicrostructureService.analyze(NIFTY, expiry);
             PDRange pd = marketDataService.getPreviousDayRange(NIFTY).orElse(null);
-            boolean breakoutOk = isBreakoutWithTrend(struct, effectiveTrend, pd);
+
+            boolean enhancedBreakout = isEnhancedBreakoutWithTrend(struct, effectiveTrend, microStructure);
             boolean vwapPullbackOk = isVwapPullbackWithTrend(ind5, effectiveTrend);
-            if (!breakoutOk && !vwapPullbackOk) {
-                dbg.put("gate.structure.breakoutOk", breakoutOk);
-                dbg.put("gate.structure.vwapPullbackOk", vwapPullbackOk);
+            boolean mlPatternConfirm = (strongestPattern != null &&
+                    strongestPattern.getExpectedDirection().toString().equals(effectiveTrend));
+
+            if (!enhancedBreakout && !vwapPullbackOk && !mlPatternConfirm) {
+                dbg.put("gate.structure.enhanced.breakout", enhancedBreakout);
+                dbg.put("gate.structure.vwapPullback", vwapPullbackOk);
+                dbg.put("gate.ml.pattern.confirm", mlPatternConfirm);
+                return skipTick(dbg, "enhanced.structure.filters");
             }
 
-            // 7) News & sentiment gates
-            boolean newsBlock = newsBurstBlock(10); // last 10 min burst?
+            // 7) Enhanced Sentiment Analysis
+            boolean newsBlock = newsBurstBlock(10);
             BigDecimal senti = marketSentiment();
-            boolean sentiBlock = (senti != null && senti.compareTo(bd("-10")) < 0);
-            if (newsBlock || sentiBlock) {
+
+            // NEW: ML-enhanced sentiment from alternative data
+            BigDecimal mlSentiment = alternativeDataService.getSocialMediaSentiment();
+            BigDecimal combinedSentiment = (senti != null && mlSentiment != null) ?
+                    senti.multiply(bd("0.7")).add(mlSentiment.multiply(bd("0.3"))) :
+                    (senti != null ? senti : mlSentiment);
+
+            boolean enhancedSentiBlock = (combinedSentiment != null &&
+                    combinedSentiment.compareTo(bd("-15")) < 0);
+
+            if (newsBlock || enhancedSentiBlock) {
                 dbg.put("gate.news", newsBlock);
-                dbg.put("gate.sentiment", senti);
-                return skipTick(dbg, "news/sentiment");
+                dbg.put("gate.enhanced.sentiment", combinedSentiment);
+                return skipTick(dbg, "enhanced.news.sentiment");
             }
 
-            // 8) Option-chain intelligence (PCR / OIΔ / IV, IV%ile, skew)
+            // 8) Enhanced Options Chain Intelligence with ML
             Pcr pcr = pcr(expiry);
             IvStats ivStats = ivStatsNearAtm(expiry, spot);
             OiDelta oiDelta = oiDeltaTrend(expiry);
 
-            boolean supplyPressureCE = oiDelta != null && oiDelta.ceRising && oiDelta.priceFalling;
-            boolean supplyPressurePE = oiDelta != null && oiDelta.peRising && oiDelta.priceRising;
+            // NEW: Volatility Prediction with LSTM
+            VolatilityPrediction volPred = volatilityPredictionService.predictVolatility(
+                    NIFTY, expiry, VOLATILITY_PREDICTION_HORIZON_MINUTES);
 
-            // Set OTM distance by volatility (ATR%) and IV/skew
+            if (volPred != null && volPred.getConfidence().compareTo(bd("0.8")) >= 0) {
+                baseReasons.add("LSTM Vol Prediction: " + volPred.getPredictedVolatility() +
+                        " (confidence: " + volPred.getConfidence() + ")");
+            }
+
+            // Enhanced supply pressure detection with microstructure
+            boolean supplyPressureCE = (oiDelta != null && oiDelta.ceRising && oiDelta.priceFalling) ||
+                    (microStructure != null &&
+                            microStructure.getImbalance().compareTo(bd(-MICROSTRUCTURE_IMBALANCE_THRESHOLD)) <= 0);
+            boolean supplyPressurePE = (oiDelta != null && oiDelta.peRising && oiDelta.priceRising) ||
+                    (microStructure != null &&
+                            microStructure.getImbalance().compareTo(bd(MICROSTRUCTURE_IMBALANCE_THRESHOLD)) >= 0);
+
+            // Set OTM distance by volatility and ML predictions
             int stepsOut = (ind5.atrPct != null && ind5.atrPct.compareTo(ATR_PCT_TWO_STEPS) >= 0) ? 2 : 1;
-            if (ivStats != null && (ivStats.highAvgIv || ivStats.wideSkew)) stepsOut = Math.max(1, stepsOut - 1);
+            if (ivStats != null && (ivStats.highAvgIv || ivStats.wideSkew)) {
+                stepsOut = Math.max(1, stepsOut - 1);
+            }
 
-            // 9) CE/PE bias (EMA/RSI) + PCR extremes collapse to single-leg
+            // ML-based steps adjustment
+            if (volPred != null && volPred.getConfidence().compareTo(bd("0.8")) >= 0) {
+                stepsOut = calculateOptimalStepsOut(volPred, microStructure);
+            }
+
+            // 9) Enhanced Bias Determination with Reinforcement Learning
             Bias emaRsiBias = biasFromEmaRsi(ind5);
             Bias pcrBias = (pcr == null) ? Bias.BOTH : pcr.toBias();
-            Bias merged = mergeBias(mapTrendBias(effectiveTrend), emaRsiBias, pcrBias);
+            Bias trendBias = mapTrendBias(effectiveTrend);
 
-            // Step-9: if PCR_TILT flag is on and PCR is decisive, prefer it
-            merged = pcrBias;
-            log.info("PCR_TILT active → using PCR side: {}", merged);
+            // NEW: RL-based bias recommendation
+            RLAction rlAction = rlService.recommendAction(enhancedInd, microStructure, altData);
+            Bias rlBias = mapRLActionToBias(rlAction);
 
-            // Supply-pressure enforcement
+            Bias merged = mergeEnhancedBias(trendBias, emaRsiBias, pcrBias, rlBias,
+                    ensemblePred, strongestPattern);
+
+            // Supply pressure enforcement (enhanced)
             if (supplyPressureCE) {
                 if (merged == Bias.CALL) {
-                    return skipTick(dbg, "supply.CE");
+                    return skipTick(dbg, "enhanced.supply.CE");
                 }
                 if (merged == Bias.BOTH) merged = Bias.PUT;
             }
             if (supplyPressurePE) {
                 if (merged == Bias.PUT) {
-                    return skipTick(dbg, "supply.PE");
+                    return skipTick(dbg, "enhanced.supply.PE");
                 }
                 if (merged == Bias.BOTH) merged = Bias.CALL;
             }
 
-            // 10) Time-of-day & expiry-day rules
+            // 10) Time-of-day & expiry-day rules (keep original logic)
             DayOfWeek dow = LocalDate.now(ZoneId.of("Asia/Kolkata")).getDayOfWeek();
             boolean expiryEve = dow == DayOfWeek.THURSDAY || dow == DayOfWeek.FRIDAY;
             if (expiryEve) stepsOut = Math.min(stepsOut, 1);
 
-            // 11) Risk snapshot for budget-true sizing
+            // 11) Enhanced Risk Management with Dynamic Position Sizing
             Result<RiskSnapshot> riskRes = riskService.getSummary();
             RiskSnapshot risk = (riskRes != null && riskRes.isOk()) ? riskRes.get() : null;
-            int lotsCap = (risk == null || risk.getLotsCap() == null) ? 1 : risk.getLotsCap();
-            int lotsUsed = (risk == null || risk.getLotsUsed() == null) ? 0 : risk.getLotsUsed();
+
+            // NEW: ML-based position sizing
+            OptimalPositionSize optimalSize = mlPredictionService.calculateOptimalPositionSize(
+                    risk, volPred, enhancedInd, rlAction);
+
+            int lotsCap = (optimalSize != null) ?
+                    Math.min(optimalSize.getRecommendedLots(),
+                            (risk != null && risk.getLotsCap() != null) ? risk.getLotsCap() : 1) :
+                    (risk != null && risk.getLotsCap() != null) ? risk.getLotsCap() : 1;
+
+            int lotsUsed = (risk != null && risk.getLotsUsed() != null) ? risk.getLotsUsed() : 0;
             int freeLots = Math.max(0, lotsCap - lotsUsed);
 
-            // 12) Portfolio overlap throttle
+            // 12) Portfolio overlap throttle (keep original logic)
             PortfolioSide posSide = portfolioSide();
             if (posSide == PortfolioSide.HAVE_CALL && merged == Bias.CALL) {
                 dbg.put("gate.overlap", "CALL");
@@ -338,28 +461,41 @@ public class StrategyService {
                 return 0;
             }
 
-            // 13) Score aggregator → fire / skip
-            Score score = scoreAll(trend, ind5, pcr, ivStats, mtfAgree, senti);
-            dbg.put("score", score.total);
-            if (score.total < SCORE_T_LOW) return skipTick(dbg, "score.low");
-            if (!mtfAgree && score.total < SCORE_T_HIGH) return skipTick(dbg, "score.mid.mtf_disagree");
+            // 13) Enhanced Scoring with ML Components
+            EnhancedScore enhancedScore = scoreAllEnhanced(trend, enhancedInd, pcr, ivStats,
+                    combinedMtfAgree, combinedSentiment, ensemblePred, rlAction, volPred);
 
-            // 14) Regime flip cooldown & drawdown brakes
+            dbg.put("enhanced.score", enhancedScore.total);
+            dbg.put("ml.components", enhancedScore.mlComponents);
+
+            if (enhancedScore.total < SCORE_T_LOW) {
+                return skipTick(dbg, "enhanced.score.low");
+            }
+            if (!combinedMtfAgree && enhancedScore.total < SCORE_T_HIGH) {
+                return skipTick(dbg, "score.mid.mtf_disagree");
+            }
+
+            // 14) Keep regime flip cooldown and circuit breaker checks
             if (recentRegimeFlip()) return skipTick(dbg, "cooldown.regimeflip");
             if (riskService.isDailyCircuitTripped().orElse(false)) return skipTick(dbg, "gate.circuit");
 
-            // NEW: service-grade skew near ATM
+            // NEW: Enhanced IV skew check
             Result<BigDecimal> skewRes = optionChainService.getIvSkew(NIFTY, expiry, spot);
             boolean wideSkewSvc = (skewRes != null && skewRes.isOk() && skewRes.get() != null
-                    && skewRes.get().abs().compareTo(bd(SKEW_WIDE_ABS)) >= 0);
+                    && skewRes.get().abs().compareTo(bd(String.valueOf(SKEW_WIDE_ABS))) >= 0);
             if (wideSkewSvc) stepsOut = Math.max(1, stepsOut - 1);
 
-            // 15) Build candidate legs (with Δ targeting & slippage guard)
+            // 15) Enhanced Leg Selection with ML Insights
             BigDecimal atm = optionChainService.computeAtmStrike(spot, STRIKE_STEP);
-            List<LegSpec> legs = chooseLegs(merged, expiry, atm, stepsOut, ind5.atrPct);
+            List<LegSpec> legs = chooseLegs(merged, expiry, atm, stepsOut, enhancedInd.getTraditional().atrPct);
+            // Apply RL adjustments if confidence is high
+            if (rlAction != null && rlAction.getConfidence().compareTo(bd("0.8")) >= 0) {
+                legs = adjustLegsBasedOnRL(legs, rlAction, expiry, atm);
+            }
+
             if (legs.isEmpty()) return skipTick(dbg, "no-legs");
 
-            // Respect Step-9 toggles first for BOTH bias
+            // Respect original BOTH bias logic
             if (merged == Bias.BOTH) {
                 legs.clear();
                 BigDecimal ce = atm.add(bd(STRIKE_STEP));
@@ -368,13 +504,13 @@ public class StrategyService {
                 legs.add(new LegSpec(expiry, pe, OptionType.PUT));
             }
 
-            // per-side OI-Δ leaders
+            // Keep original OI delta nudging
             Result<LinkedHashMap<Integer, Long>> topCe = optionChainService.topOiChange(NIFTY, expiry, OptionType.CALL, 5);
             Result<LinkedHashMap<Integer, Long>> topPe = optionChainService.topOiChange(NIFTY, expiry, OptionType.PUT, 5);
             legs = nudgeByTopOi(legs, topCe, topPe);
 
-            // filter by Δ window and slippage/spread
-            List<LegSpec> filtered = new ArrayList<LegSpec>();
+            // 16) Enhanced Filtering with ML-based Liquidity and Greek Analysis
+            List<LegSpec> filtered = new ArrayList<>();
             for (LegSpec L : legs) {
                 InstrumentData inst = findContract(L);
                 if (inst == null) {
@@ -382,34 +518,42 @@ public class StrategyService {
                     continue;
                 }
 
-                if (!passesLiquidity(inst)) {
-                    incLegSkipped("liquidity", inst.getInstrumentKey());
+                // Enhanced liquidity check
+                if (!passesEnhancedLiquidity(inst, microStructure)) {
+                    incLegSkipped("enhancedLiquidity", inst.getInstrumentKey());
                     continue;
                 }
 
-                Result<BigDecimal> ivPct = optionChainService.getIvPercentile(
-                        NIFTY, expiry, bd(inst.getStrikePrice()), typeOf(inst));
+                // ML-based IV percentile check
+                if (!passesMLIVCheck(inst, volPred)) {
+                    incLegSkipped("mlIvCheck", inst.getInstrumentKey());
+                    continue;
+                }
 
-                if (ivPct != null && ivPct.isOk() && ivPct.get() != null
-                        && ivPct.get().compareTo(IV_PCTILE_SPIKE) >= 0) {
-                    incLegSkipped("ivPctile", inst.getInstrumentKey());
+                // Enhanced delta range check
+                if (!passesEnhancedDeltaCheck(inst.getInstrumentKey(), rlAction)) {
+                    incLegSkipped("enhancedDelta", inst.getInstrumentKey());
                     continue;
                 }
-                if (!deltaInRange(inst.getInstrumentKey())) {
-                    incLegSkipped("delta", inst.getInstrumentKey());
-                    continue;
-                }
+
+                // Keep original slippage guard
                 if (!ordersService.preflightSlippageGuard(inst.getInstrumentKey(), MAX_SPREAD_PCT)) {
                     incLegSkipped("slippage", inst.getInstrumentKey());
                     continue;
                 }
+
                 filtered.add(new LegSpec(L.expiry, bd(inst.getStrikePrice()), typeOf(inst)));
             }
 
-            if (filtered.isEmpty()) return skipTick(dbg, "no-legs.after-filters");
+            if (filtered.isEmpty()) return skipTick(dbg, "no-legs-after-ml-filters");
 
-            // 16) Persist advices (dedupe, exit plan, observability)
-            List<LegSpec> ranked = rankByTightestSpread(filtered);
+            // 17) Enhanced Advice Creation with ML Insights
+            List<LegSpec> ranked = rankByMLCriteria(filtered, rlAction, microStructure);
+            // Fallback to traditional ranking if ML ranking fails or returns empty
+            if (ranked.isEmpty() && !filtered.isEmpty()) {
+                ranked = rankByTightestSpread(filtered);
+            }
+
             int createdNow = 0;
             for (LegSpec L : ranked) {
                 InstrumentData inst = findContract(L);
@@ -422,74 +566,88 @@ public class StrategyService {
                 }
 
                 int lotSize = Math.max(1, inst.getLotSize().intValue());
+                double optLtp = getOptionLTP(inst);
 
-                double optLtp = 0.0;
-                try {
-                    GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(inst.getInstrumentKey());
-                    if (q != null && q.getData() != null && q.getData().get(inst.getInstrumentKey()) != null) {
-                        optLtp = q.getData().get(inst.getInstrumentKey()).getLastPrice();
-                    }
-                } catch (Exception ignore) {
-                }
+                // Enhanced position sizing
+                int lotsForThisLeg = calculateMLEnhancedLots(enhancedInd.getTraditional().atrPct,
+                        optLtp, lotSize, risk, optimalSize, rlAction);
 
-                Result<RiskSnapshot> riskRes2 = riskService.getSummary();
-                RiskSnapshot risk2 = (riskRes2 != null && riskRes2.isOk()) ? riskRes2.get() : null;
-
-                int freeLots2 = freeLots;
-                int lotsForThisLeg = dynamicLots(ind5.atrPct, optLtp, lotSize, risk2, freeLots2);
                 if (lotsForThisLeg < 1) {
-                    incLegSkipped("zeroLots", inst.getInstrumentKey());
+                    incLegSkipped("mlZeroLots", inst.getInstrumentKey());
                     continue;
                 }
+
                 int qty = lotSize * lotsForThisLeg;
                 freeLots = Math.max(0, freeLots - lotsForThisLeg);
 
-                ExitHints x = exitHints(inst.getInstrumentKey());
+                // Enhanced exit hints
+                EnhancedExitHints enhancedExits = calculateEnhancedExitHints(inst.getInstrumentKey(),
+                        volPred, rlAction);
 
-                List<String> rs = new ArrayList<String>(baseReasons);
+                // Enhanced reasons
+                List<String> rs = new ArrayList<>(baseReasons);
                 rs.add(taSummary(ind5));
+                rs.add(enhancedInd.toMLSummary()); // ADD this line
                 if (pcr != null) rs.add(pcr.toReason());
                 if (ivStats != null) rs.add(ivStats.toReason());
                 if (oiDelta != null) rs.add(oiDelta.toReason());
-                rs.add("Score=" + score.total + " (" + score.breakdown + ")");
-                rs.add("MTF=" + (mtfAgree ? "AGREE" : "DISAGREE") + ", Reg=" + hrReg);
+                if (ensemblePred != null) rs.add(ensemblePred.toReason());
+                if (rlAction != null) rs.add(rlAction.toReason());
+                if (volPred != null) rs.add(volPred.toReason());
+                rs.add("Enhanced Score=" + enhancedScore.total +
+                        " (Traditional=" + (enhancedScore.total - enhancedScore.mlComponents) +
+                        ", ML=" + enhancedScore.mlComponents + ")");
+                rs.add("MTF=" + (combinedMtfAgree ? "AGREE" : "DISAGREE") +
+                        " (Trad:" + traditionalMtfAgree + ", ML:" + mlMtfAgree + ")");
+
+                // Keep original exit format for compatibility
+                ExitHints x = (enhancedExits != null) ? new ExitHints() {{
+                    sl = enhancedExits.sl;
+                    tp = enhancedExits.tp;
+                }} : exitHints(inst.getInstrumentKey());
+
                 rs.add("EXIT: SL=" + (x == null ? "—" : x.sl) + ", TP=" + (x == null ? "—" : x.tp) + ", TTL=" + TIME_STOP_MIN + "m");
 
-                Advice a = new Advice();
-                a.setSymbol(human);
-                a.setInstrument_token(inst.getInstrumentKey());
-                a.setTransaction_type("BUY");
-                a.setOrder_type("MARKET");
-                a.setProduct("MIS");
-                a.setValidity("DAY");
-                a.setQuantity(qty);
-                a.setReason(joinReasons(rs));
-                a.setStatus(AdviceStatus.PENDING);
-                a.setCreatedAt(Instant.now());
-                a.setUpdatedAt(Instant.now());
+                // USE the createEnhancedAdvice method instead of manual creation
+                Advice a = createEnhancedAdvice(inst, qty, rs, enhancedExits, L);
+
 
                 Result<Advice> saved = adviceService.create(a);
                 if (saved != null && saved.isOk() && saved.get() != null) {
                     createdNow++;
                     advicesCreated.incrementAndGet();
-                    log.info("Created advice: {} qty={} (ik={}, expiry={}, strike={}, type={})",
-                            human, qty, inst.getInstrumentKey(), L.expiry, L.strike, L.type);
+
+                    // Enhanced logging
+                    log.info("Created ENHANCED advice: {} qty={} (ML conf: {}, RL reward: {})",
+                            human, qty,
+                            ensemblePred != null ? ensemblePred.getConfidence() : "N/A",
+                            rlAction != null ? rlAction.getExpectedReward() : "N/A");
+
                     dbg.put("advice", human);
                     dbg.put("qty", qty);
-                    emitDebug(dbg, "advice.created");
+                    dbg.put("ml.confidence", ensemblePred != null ? ensemblePred.getConfidence() : null);
+                    emitDebug(dbg, "enhanced.advice.created");
+
+                    // NEW: Performance tracking
+                    trackAdvicePerformance(saved.get(), enhancedScore, rlAction);
                 }
             }
+
             created += createdNow;
             return created;
+
         } catch (Exception t) {
-            log.error("strategy: failure {}", t.getMessage(), t);
+            log.error("Enhanced strategy failure: {}", t.getMessage(), t);
             return created;
         } finally {
             long ms = System.currentTimeMillis() - t0;
-            if (ms > 1000) log.info("strategy: run took {} ms", ms);
-            emitMetrics(true);
+            if (ms > 1000) log.info("Enhanced strategy run took {} ms", ms);
+
+            // Enhanced metrics emission
+            emitEnhancedMetrics(true, created);
         }
     }
+
 
     // NEW: OI-liquidity + spread filter
     private boolean passesLiquidity(InstrumentData inst) {
@@ -505,7 +663,7 @@ public class StrategyService {
 
             // spread% guard (reuses OrdersService depth)
             BigDecimal spread = ordersService.getSpreadPct(ik).orElse(null);
-            return spread == null || spread.compareTo(MAX_BIDASK_SPREAD_PCT) <= 0;
+            return spread == null || spread.compareTo(MAX_BID_ASK_SPREAD_PCT) <= 0;
         } catch (Exception t) {
             log.error("Liquidity check failed: {}", t);
             return true; // be permissive on errors
@@ -555,7 +713,7 @@ public class StrategyService {
         try {
             Optional<MarketRegime> r1 = marketDataService.getRegimeOn("minutes", "60");
             Optional<MarketRegime> r2 = marketDataService.getRegimeOn("minutes", "60");
-            if (!r1.isPresent() || !r2.isPresent()) return false;
+            if (r1.isEmpty() || r2.isEmpty()) return false;
             if (r1.get() != r2.get()) {
                 Instant lastFlip = marketDataService.getLastRegimeFlipInstant().orElse(Instant.EPOCH);
                 return Duration.between(lastFlip, Instant.now()).toMinutes() < REGIME_FLIP_COOLDOWN_MIN;
@@ -582,21 +740,9 @@ public class StrategyService {
         return s > 0 ? Bias.CALL : s < 0 ? Bias.PUT : Bias.BOTH;
     }
 
-    private Bias mergeBias(Bias a, Bias b, Bias c) {
-        int ce = 0, pe = 0;
-        Bias[] arr = new Bias[]{a, b, c};
-        for (Bias x : arr) {
-            if (x == Bias.CALL) ce++;
-            else if (x == Bias.PUT) pe++;
-        }
-        if (ce >= 2) return Bias.CALL;
-        if (pe >= 2) return Bias.PUT;
-        return Bias.BOTH;
-    }
-
     // Build legs using ATR logic; Step-9 toggles handled earlier when bias==BOTH
     public List<LegSpec> chooseLegs(Bias b, LocalDate expiry, BigDecimal atm, int stepsOut, BigDecimal atrPct) {
-        List<LegSpec> out = new ArrayList<LegSpec>();
+        List<LegSpec> out = new ArrayList<>();
         if (expiry == null || atm == null) return out;
 
         boolean isQuiet = (atrPct != null && atrPct.compareTo(QUIET_MAX_ATR_PCT) <= 0);
@@ -685,10 +831,10 @@ public class StrategyService {
             Result<Map<String, MarketQuoteOptionGreekV3>> gRes =
                     optionChainService.getGreeksForExpiry(NIFTY, expiry);
             Map<String, MarketQuoteOptionGreekV3> greeks =
-                    (gRes != null && gRes.isOk() && gRes.get() != null) ? gRes.get() : new HashMap<String, MarketQuoteOptionGreekV3>();
+                    (gRes != null && gRes.isOk() && gRes.get() != null) ? gRes.get() : new HashMap<>();
 
-            List<Double> ceIv = new ArrayList<Double>(), peIv = new ArrayList<Double>();
-            List<Double> allIv = new ArrayList<Double>();
+            List<Double> ceIv = new ArrayList<>(), peIv = new ArrayList<>();
+            List<Double> allIv = new ArrayList<>();
             if (rng != null && rng.isOk() && rng.get() != null) {
                 for (InstrumentData oi : rng.get()) {
                     MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
@@ -737,8 +883,8 @@ public class StrategyService {
             double c2 = ((Number) c5.getCandles().get(c5.getCandles().size() - 1).get(4)).doubleValue();
 
             OiDelta d = new OiDelta();
-            d.ceRising = ceDelta != null && ceDelta.compareTo(BigDecimal.ZERO) > 0;
-            d.peRising = peDelta != null && peDelta.compareTo(BigDecimal.ZERO) > 0;
+            d.ceRising = ceDelta.compareTo(BigDecimal.ZERO) > 0;
+            d.peRising = peDelta.compareTo(BigDecimal.ZERO) > 0;
             d.priceFalling = c2 < c1;
             d.priceRising = c2 > c1;
             d.ceDelta = ceDelta;
@@ -846,7 +992,7 @@ public class StrategyService {
             out.vwap = bd(vwapInd.getValue(end).doubleValue());
             out.close = bd(close.getValue(end).doubleValue());
 
-            if (out.atr != null && spot != null && spot.compareTo(BigDecimal.ZERO) > 0) {
+            if (spot != null && spot.compareTo(BigDecimal.ZERO) > 0) {
                 out.atrPct = out.atr.multiply(bd(100)).divide(spot, 2, java.math.RoundingMode.HALF_UP);
             }
         } catch (Throwable t) {
@@ -907,11 +1053,11 @@ public class StrategyService {
     private long toEpochMillis(Object ts) {
         if (ts instanceof Number) {
             long v = ((Number) ts).longValue();
-            return (v > 3_000_000_000L) ? v : v * 1000L; // seconds→ms if needed
+            return (v > 3000000000L) ? v : v * 1000L; // seconds→ms if needed
         }
         if (ts instanceof String s) {
             long v = Long.parseLong(s.trim());
-            return (v > 3_000_000_000L) ? v : v * 1000L;
+            return (v > 3000000000L) ? v : v * 1000L;
         }
         return -1L;
     }
@@ -960,7 +1106,7 @@ public class StrategyService {
                     continue;
                 }
                 // Upstox sometimes sends seconds; sometimes millis in other contexts. Normalize to seconds.
-                if (v > 3_000_000_000L) v = v / 1000L;
+                if (v > 3000000_000L) v = v / 1000L;
                 if (v > maxEpochSec) maxEpochSec = v;
             }
             if (maxEpochSec <= 0L) return true;
@@ -1082,7 +1228,7 @@ public class StrategyService {
     }
 
     private void emitDebug(Map<String, Object> base, String msg) {
-        Map<String, Object> p = new LinkedHashMap<String, Object>(base);
+        Map<String, Object> p = new LinkedHashMap<>(base);
         p.put("msg", msg);
         p.put("ts", Instant.now());
         try {
@@ -1107,7 +1253,7 @@ public class StrategyService {
         Set<Integer> ceHot = (topCe != null && topCe.isOk()) ? topCe.get().keySet() : Collections.emptySet();
         Set<Integer> peHot = (topPe != null && topPe.isOk()) ? topPe.get().keySet() : Collections.emptySet();
 
-        List<LegSpec> out = new ArrayList<LegSpec>(legs.size());
+        List<LegSpec> out = new ArrayList<>(legs.size());
         for (LegSpec L : legs) {
             Set<Integer> pool = (L.type == OptionType.CALL) ? ceHot : peHot;
             if (pool.isEmpty()) {
@@ -1135,7 +1281,7 @@ public class StrategyService {
     private List<LegSpec> rankByTightestSpread(List<LegSpec> candidates) {
         record Row(LegSpec leg, BigDecimal spread) {
         }
-        List<Row> rows = new ArrayList<Row>();
+        List<Row> rows = new ArrayList<>();
         for (LegSpec L : candidates) {
             InstrumentData inst = findContract(L);
             if (inst == null) continue;
@@ -1145,17 +1291,13 @@ public class StrategyService {
             rows.add(new Row(L, spreadPct));
         }
 
-        Collections.sort(rows, new Comparator<Row>() {
-            public int compare(Row a, Row b) {
-                return a.spread.compareTo(b.spread);
-            }
-        });
+        rows.sort(Comparator.comparing(a -> a.spread));
 
-        List<LegSpec> withinCap = new ArrayList<LegSpec>();
+        List<LegSpec> withinCap = new ArrayList<>();
         for (Row r : rows) if (r.spread.compareTo(MAX_SPREAD_PCT) <= 0) withinCap.add(r.leg);
         if (!withinCap.isEmpty()) return withinCap;
 
-        List<LegSpec> all = new ArrayList<LegSpec>(rows.size());
+        List<LegSpec> all = new ArrayList<>(rows.size());
         for (Row r : rows) all.add(r.leg);
         return all;
     }
@@ -1189,14 +1331,14 @@ public class StrategyService {
     private int skipTick(Map<String, Object> dbg, String reason) {
         advicesSkipped.incrementAndGet();
         if (dbg != null) dbg.put("skip", reason);
-        emitDebug(dbg == null ? new LinkedHashMap<String, Object>() : dbg, "skip." + reason);
+        emitDebug(dbg == null ? new LinkedHashMap<>() : dbg, "skip." + reason);
         return 0;
     }
 
     private void incLegSkipped(String reason, String instrumentKey) {
         advicesSkipped.incrementAndGet();
         try {
-            Map<String, Object> m = new LinkedHashMap<String, Object>();
+            Map<String, Object> m = new LinkedHashMap<>();
             m.put("reason", reason);
             m.put("ik", instrumentKey);
             m.put("ts", Instant.now());
@@ -1207,7 +1349,7 @@ public class StrategyService {
 
     private void emitMetrics(boolean endOfTick) {
         try {
-            Map<String, Object> m = new LinkedHashMap<String, Object>();
+            Map<String, Object> m = new LinkedHashMap<>();
             m.put("advices.created", advicesCreated.get());
             m.put("advices.skipped", advicesSkipped.get());
             m.put("advices.executed", advicesExecuted.get());
@@ -1255,9 +1397,6 @@ public class StrategyService {
 
     private static class Structure {
         BigDecimal donHi, donLo, vwap, lastClose;
-    }
-
-    private record Score(int total, String breakdown) {
     }
 
     // -------------------- Inners --------------------
@@ -1342,6 +1481,592 @@ public class StrategyService {
             if (data != null) o.add("data", data);
             bus.publish(com.trade.frankenstein.trader.bus.EventBusConfig.TOPIC_AUDIT, "strategy", o.toString());
         } catch (Throwable ignore) { /* best-effort */ }
+    }
+
+    // Enhanced inner classes for StrategyService
+    @Getter
+    public static class MLLegScore {
+        private final LegSpec leg;
+        private final double score;
+
+        public MLLegScore(LegSpec leg, double score) {
+            this.leg = leg;
+            this.score = score;
+        }
+
+    }
+
+    public static class Score {
+        public final int total;
+        public final String breakdown;
+
+        public Score(int total, String breakdown) {
+            this.total = total;
+            this.breakdown = breakdown;
+        }
+    }
+
+    public static class EnhancedScore extends Score {
+        public final int mlComponents;
+        public final String mlBreakdown;
+
+        public EnhancedScore(int total, String breakdown, int mlComponents, String mlBreakdown) {
+            super(total, breakdown);
+            this.mlComponents = mlComponents;
+            this.mlBreakdown = mlBreakdown;
+        }
+    }
+
+    @Getter
+    public static class EnhancedIndicators {
+        private final Ind traditional;
+        @Setter
+        private BigDecimal mlMomentumScore;
+        @Setter
+        private String mlVolatilityRegime;
+        @Setter
+        private BigDecimal mlTrendStrength;
+        @Setter
+        private BigDecimal seasonalAdjustment;
+
+        public EnhancedIndicators(Ind traditional) {
+            this.traditional = traditional;
+        }
+
+        public String toMLSummary() {
+            return String.format("ML-TA: momentum=%.2f, regime=%s, trend=%.2f, seasonal=%.2f",
+                    mlMomentumScore != null ? mlMomentumScore.doubleValue() : 0.0,
+                    mlVolatilityRegime != null ? mlVolatilityRegime : "UNKNOWN",
+                    mlTrendStrength != null ? mlTrendStrength.doubleValue() : 0.0,
+                    seasonalAdjustment != null ? seasonalAdjustment.doubleValue() : 0.0);
+        }
+    }
+
+    @Setter
+    @Getter
+    private static class EnhancedExitHints extends ExitHints {
+        // Getters and setters
+        private BigDecimal dynamicStopPct;
+        private BigDecimal dynamicTargetPct;
+        private BigDecimal rlOptimalStop;
+        private BigDecimal rlOptimalTarget;
+
+        public EnhancedExitHints(ExitHints traditional) {
+            this.sl = traditional.sl;
+            this.tp = traditional.tp;
+        }
+
+    }
+
+    // Add these helper methods to StrategyService class
+
+    private EnhancedIndicators enhanceIndicatorsWithML(Ind traditional, IntraDayCandleData candles) {
+        try {
+            EnhancedIndicators enhanced = new EnhancedIndicators(traditional);
+
+            // Add ML-computed features
+            MLFeatures mlFeatures = mlPredictionService.extractFeatures(candles);
+            enhanced.setMlMomentumScore(mlFeatures.getMomentumScore());
+            enhanced.setMlVolatilityRegime(mlFeatures.getVolatilityRegime());
+            enhanced.setMlTrendStrength(mlFeatures.getTrendStrength());
+            enhanced.setSeasonalAdjustment(mlFeatures.getSeasonalAdjustment());
+
+            return enhanced;
+        } catch (Exception e) {
+            log.warn("Failed to enhance indicators with ML: {}", e.getMessage());
+            return new EnhancedIndicators(traditional);
+        }
+    }
+
+    private boolean isEnhancedBreakoutWithTrend(Structure struct, String trend,
+                                                MarketMicrostructure microStructure) {
+        // Traditional breakout logic
+        boolean traditionalBreakout = isBreakoutWithTrend(struct, trend, null);
+
+        // ML-enhanced checks
+        if (microStructure != null) {
+            boolean liquiditySupport = microStructure.getLiquidityScore().compareTo(bd(MICROSTRUCTURE_IMBALANCE_THRESHOLD)) >= 0;
+            boolean orderBookBalance = Math.abs(microStructure.getImbalance().doubleValue()) <= 0.3;
+
+            return traditionalBreakout && liquiditySupport && orderBookBalance;
+        }
+
+        return traditionalBreakout;
+    }
+
+    private Bias mapRLActionToBias(RLAction rlAction) {
+        if (rlAction == null || rlAction.getConfidence().compareTo(bd(MICROSTRUCTURE_IMBALANCE_THRESHOLD)) < 0) {
+            return Bias.BOTH;
+        }
+
+        return switch (rlAction.getActionType()) {
+            case LONG_CALL, BUY_CALL -> Bias.CALL;
+            case LONG_PUT, BUY_PUT -> Bias.PUT;
+            default -> Bias.BOTH;
+        };
+    }
+
+    private Bias mergeEnhancedBias(Bias trendBias, Bias traditionalBias, Bias pcrBias,
+                                   Bias rlBias, EnsemblePrediction ensemble,
+                                   PatternMatch pattern) {
+        Map<Bias, Integer> votes = new HashMap<>();
+        votes.put(Bias.CALL, 0);
+        votes.put(Bias.PUT, 0);
+        votes.put(Bias.BOTH, 0);
+
+        // Weight the votes based on confidence
+        addWeightedVote(votes, trendBias, 2); // Trend gets 2x weight
+        addWeightedVote(votes, traditionalBias, 1);
+        addWeightedVote(votes, pcrBias, 1);
+
+        // ML components get higher weights if confident
+        if (rlBias != Bias.BOTH) {
+            addWeightedVote(votes, rlBias, 3); // RL gets 3x weight when confident
+        }
+
+        if (ensemble != null && ensemble.getConfidence().compareTo(bd(ML_CONFIDENCE_THRESHOLD)) >= 0) {
+            Bias ensembleBias = mapEnsemblePredictionToBias(ensemble);
+            addWeightedVote(votes, ensembleBias, 2);
+        }
+
+        if (pattern != null && pattern.getConfidence().compareTo(bd("0.8")) >= 0) {
+            Bias patternBias = mapPatternToBias(pattern);
+            addWeightedVote(votes, patternBias, 2);
+        }
+
+        // Return the bias with the most votes
+        return votes.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(Bias.BOTH);
+    }
+
+    private void addWeightedVote(Map<Bias, Integer> votes, Bias bias, int weight) {
+        votes.put(bias, votes.get(bias) + weight);
+    }
+
+    private Bias mapEnsemblePredictionToBias(EnsemblePrediction ensemble) {
+        if (ensemble.getWeightedPrediction() == null) return Bias.BOTH;
+
+        double prediction = ensemble.getWeightedPrediction().doubleValue();
+        if (prediction > 0.3) return Bias.CALL;
+        if (prediction < -0.3) return Bias.PUT;
+        return Bias.BOTH;
+    }
+
+    private Bias mapPatternToBias(PatternMatch pattern) {
+        if (pattern.getExpectedDirection() == null) return Bias.BOTH;
+
+        return switch (pattern.getExpectedDirection()) {
+            case UP -> Bias.CALL;
+            case DOWN -> Bias.PUT;
+            default -> Bias.BOTH;
+        };
+    }
+
+    private EnhancedScore scoreAllEnhanced(String trend, EnhancedIndicators ind, Pcr pcr,
+                                           IvStats iv, boolean mtfAgree, BigDecimal sentiment,
+                                           EnsemblePrediction ensemble, RLAction rlAction,
+                                           VolatilityPrediction volPred) {
+        // Traditional scoring
+        Score traditional = scoreAll(trend, ind.getTraditional(), pcr, iv, mtfAgree, sentiment);
+
+        // ML scoring components
+        int mlScore = 0;
+        StringBuilder mlBreakdown = new StringBuilder();
+
+        // Ensemble model score
+        if (ensemble != null) {
+            int ensemblePoints = (int) (ensemble.getConfidence().doubleValue() * 20); // 0-20 points
+            mlScore += ensemblePoints;
+            mlBreakdown.append("ensemble=").append(ensemblePoints);
+        }
+
+        // RL action score
+        if (rlAction != null) {
+            int rlPoints = (int) (rlAction.getConfidence().doubleValue() * 15); // 0-15 points
+            mlScore += rlPoints;
+            mlBreakdown.append(", rl=").append(rlPoints);
+        }
+
+        // Volatility prediction score
+        if (volPred != null) {
+            int volPoints = (int) (volPred.getConfidence().doubleValue() * 10); // 0-10 points
+            mlScore += volPoints;
+            mlBreakdown.append(", vol=").append(volPoints);
+        }
+
+        // Pattern recognition bonus
+        if (ind.getMlTrendStrength() != null) {
+            int patternPoints = (int) (ind.getMlTrendStrength().doubleValue() / 10);
+            mlScore += patternPoints;
+            mlBreakdown.append(", pattern=").append(patternPoints);
+        }
+
+        return new EnhancedScore(traditional.total + mlScore, traditional.breakdown,
+                mlScore, mlBreakdown.toString());
+    }
+
+    private int calculateOptimalStepsOut(VolatilityPrediction volPred, MarketMicrostructure microStructure) {
+        int baseSteps = 1;
+
+        if (volPred != null) {
+            double volLevel = volPred.getPredictedVolatility().doubleValue();
+            if (volLevel > 25.0) { // High volatility
+                baseSteps = 2;
+            } else if (volLevel < 12.0) { // Low volatility
+                baseSteps = 1;
+            }
+        }
+
+        // Adjust based on market microstructure
+        if (microStructure != null) {
+            double imbalance = Math.abs(microStructure.getImbalance().doubleValue());
+            if (imbalance > 0.7) { // High imbalance suggests go closer to ATM
+                baseSteps = Math.max(1, baseSteps - 1);
+            }
+        }
+
+        return Math.min(MAX_STRIKE_STEPS_FROM_ATM, baseSteps);
+    }
+
+    private List<LegSpec> adjustLegsBasedOnRL(List<LegSpec> traditional, RLAction rlAction,
+                                              LocalDate expiry, BigDecimal atm) {
+        if (rlAction.getParameters() == null) return traditional;
+
+        Map<String, Double> params = rlAction.getParameters();
+        List<LegSpec> adjusted = new ArrayList<>();
+
+        for (LegSpec leg : traditional) {
+            // RL might suggest different strikes based on optimal delta
+            if (params.containsKey("optimal_delta_min") && params.containsKey("optimal_delta_max")) {
+                // Keep the leg as is for now - in practice, would calculate optimal strike for target delta
+                adjusted.add(leg);
+            } else {
+                adjusted.add(leg);
+            }
+        }
+
+        return adjusted;
+    }
+
+    private boolean passesEnhancedLiquidity(InstrumentData inst, MarketMicrostructure microStructure) {
+        // Traditional liquidity check
+        if (!passesLiquidity(inst)) {
+            return false;
+        }
+
+        // Enhanced microstructure checks
+        if (microStructure != null) {
+            // Check for adequate market depth
+            if (microStructure.getLiquidityScore().compareTo(bd("0.4")) < 0) {
+                return false;
+            }
+
+            // Check order book balance
+            return !(Math.abs(microStructure.getImbalance().doubleValue()) > 0.8);
+        }
+
+        return true;
+    }
+
+    private boolean passesMLIVCheck(InstrumentData inst, VolatilityPrediction volPred) {
+        try {
+            Result<BigDecimal> ivPct = optionChainService.getIvPercentile(
+                    NIFTY, nearestExpiry(), bd(inst.getStrikePrice()), typeOf(inst));
+
+            if (ivPct == null || !ivPct.isOk() || ivPct.get() == null) {
+                return true; // Pass if can't determine
+            }
+
+            // Traditional IV spike check
+            if (ivPct.get().compareTo(IV_PCTILE_SPIKE) >= 0) {
+                return false;
+            }
+
+            // ML-based volatility regime check
+            if (volPred != null && volPred.getConfidence().compareTo(bd("0.8")) >= 0) {
+                // If ML predicts vol explosion, avoid high IV percentile options
+                return volPred.getPredictedVolatility().compareTo(bd("30")) < 0 ||
+                        ivPct.get().compareTo(bd("80")) < 0;
+            }
+
+            return true;
+        } catch (Exception e) {
+            return true; // Be permissive on errors
+        }
+    }
+
+    private boolean passesEnhancedDeltaCheck(String instrumentKey, RLAction rlAction) {
+        if (!deltaInRange(instrumentKey)) {
+            return false;
+        }
+
+        // RL-based delta optimization
+        if (rlAction != null && rlAction.getConfidence().compareTo(bd("0.8")) >= 0) {
+            try {
+                MarketQuoteOptionGreekV3 greek = optionChainService.getGreek(instrumentKey).orElse(null);
+                if (greek != null) {
+                    double delta = Math.abs(greek.getDelta());
+
+                    // RL suggests optimal delta range based on market conditions
+                    Map<String, Double> params = rlAction.getParameters();
+                    if (params != null && params.containsKey("optimal_delta_min") &&
+                            params.containsKey("optimal_delta_max")) {
+                        double minDelta = params.get("optimal_delta_min");
+                        double maxDelta = params.get("optimal_delta_max");
+
+                        return delta >= minDelta && delta <= maxDelta;
+                    }
+                }
+            } catch (Exception e) {
+                // Fall back to traditional check
+            }
+        }
+
+        return true;
+    }
+
+    private List<LegSpec> rankByMLCriteria(List<LegSpec> candidates, RLAction rlAction,
+                                           MarketMicrostructure microStructure) {
+        List<MLLegScore> scoredLegs = new ArrayList<>();
+
+        for (LegSpec leg : candidates) {
+            InstrumentData inst = findContract(leg);
+            if (inst == null) continue;
+
+            double score = 0.0;
+
+            // Traditional spread score (30% weight)
+            BigDecimal spread = ordersService.getSpreadPct(inst.getInstrumentKey()).orElse(bd("0.1"));
+            score += (1.0 - spread.doubleValue()) * 0.3;
+
+            // Liquidity score (25% weight)
+            if (microStructure != null) {
+                score += microStructure.getLiquidityScore().doubleValue() * 0.25;
+            }
+
+            // RL action alignment score (25% weight)
+            if (rlAction != null) {
+                score += calculateRLAlignmentScore(leg, rlAction) * 0.25;
+            }
+
+            // Greek favorability score (20% weight)
+            score += calculateGreekScore(inst.getInstrumentKey()) * 0.2;
+
+            scoredLegs.add(new MLLegScore(leg, score));
+        }
+
+        return scoredLegs.stream()
+                .sorted(Comparator.comparingDouble(MLLegScore::getScore).reversed())
+                .map(MLLegScore::getLeg)
+                .collect(Collectors.toList());
+    }
+
+    private double calculateRLAlignmentScore(LegSpec leg, RLAction rlAction) {
+        if (rlAction == null) return 0.5;
+
+        // Score based on how well the leg aligns with RL action
+        return switch (rlAction.getActionType()) {
+            case LONG_CALL, BUY_CALL -> leg.type == OptionType.CALL ? 1.0 : 0.0;
+            case LONG_PUT, BUY_PUT -> leg.type == OptionType.PUT ? 1.0 : 0.0;
+            case LONG_STRADDLE, LONG_STRANGLE -> 0.8; // Both CALL and PUT legs would score well
+            default -> 0.5;
+        };
+    }
+
+    private double calculateGreekScore(String instrumentKey) {
+        try {
+            MarketQuoteOptionGreekV3 greek = optionChainService.getGreek(instrumentKey).orElse(null);
+            if (greek == null) return 0.5;
+
+            // Prefer reasonable delta, positive gamma, manageable theta
+            double delta = Math.abs(greek.getDelta());
+            double gamma = greek.getGamma();
+            double theta = Math.abs(greek.getTheta());
+
+            double deltaScore = (delta >= 0.3 && delta <= 0.7) ? 1.0 : 0.5;
+            double gammaScore = gamma > 0 ? 1.0 : 0.3;
+            double thetaScore = theta < 5.0 ? 1.0 : 0.5; // Lower theta decay preferred
+
+            return (deltaScore + gammaScore + thetaScore) / 3.0;
+        } catch (Exception e) {
+            return 0.5;
+        }
+    }
+
+    private int calculateMLEnhancedLots(BigDecimal atrPct, double optionLtp, int lotSize,
+                                        RiskSnapshot risk, OptimalPositionSize optimalSize,
+                                        RLAction rlAction) {
+        // Start with traditional calculation
+        int traditionalLots = dynamicLots(atrPct, optionLtp, lotSize, risk,
+                optimalSize != null ? optimalSize.getMaxLots() : 1);
+
+        if (optimalSize != null) {
+            // ML-optimized position sizing
+            int mlLots = optimalSize.getRecommendedLots();
+
+            // Blend traditional and ML approach
+            int blendedLots = (int) Math.round(traditionalLots * 0.4 + mlLots * MICROSTRUCTURE_IMBALANCE_THRESHOLD);
+
+            // RL confidence adjustment
+            if (rlAction != null) {
+                double confidence = rlAction.getConfidence().doubleValue();
+                if (confidence > 0.8) {
+                    blendedLots = Math.min(blendedLots + 1, optimalSize.getMaxLots());
+                } else if (confidence < 0.6) {
+                    blendedLots = Math.max(blendedLots - 1, 0);
+                }
+            }
+
+            return Math.max(0, Math.min(blendedLots, optimalSize.getMaxLots()));
+        }
+
+        return traditionalLots;
+    }
+
+    private EnhancedExitHints calculateEnhancedExitHints(String instrumentKey,
+                                                         VolatilityPrediction volPred,
+                                                         RLAction rlAction) {
+        // Start with traditional exit hints
+        ExitHints traditional = exitHints(instrumentKey);
+        if (traditional == null) return null;
+
+        EnhancedExitHints enhanced = new EnhancedExitHints(traditional);
+
+        // ML-based dynamic exit adjustments
+        if (volPred != null && volPred.getConfidence().compareTo(bd(ML_CONFIDENCE_THRESHOLD)) >= 0) {
+            // Adjust stops based on predicted volatility
+            double volAdjustment = volPred.getPredictedVolatility().doubleValue() / 20.0;
+
+            // Widen stops in high vol, tighten in low vol
+            if (volAdjustment > 1.5) {
+                enhanced.setDynamicStopPct(STOP_PCT.multiply(bd(String.valueOf(volAdjustment * 0.8))));
+                enhanced.setDynamicTargetPct(TARGET_PCT.multiply(bd(String.valueOf(volAdjustment * 1.2))));
+            } else if (volAdjustment < 0.8) {
+                enhanced.setDynamicStopPct(STOP_PCT.multiply(bd("0.8")));
+                enhanced.setDynamicTargetPct(TARGET_PCT.multiply(bd("0.9")));
+            }
+        }
+
+        // RL-based exit optimization
+        if (rlAction != null && rlAction.getParameters() != null) {
+            Map<String, Double> params = rlAction.getParameters();
+            if (params.containsKey("optimal_stop_loss")) {
+                enhanced.setRlOptimalStop(bd(params.get("optimal_stop_loss").toString()));
+            }
+            if (params.containsKey("optimal_take_profit")) {
+                enhanced.setRlOptimalTarget(bd(params.get("optimal_take_profit").toString()));
+            }
+        }
+
+        return enhanced;
+    }
+
+    private Advice createEnhancedAdvice(InstrumentData inst, int qty, List<String> reasons,
+                                        EnhancedExitHints exits, LegSpec leg) {
+        Advice advice = new Advice();
+        advice.setSymbol(humanSymbol(inst));
+        advice.setInstrument_token(inst.getInstrumentKey());
+        advice.setTransaction_type("BUY");
+        advice.setOrder_type("MARKET");
+        advice.setProduct("MIS");
+        advice.setValidity("DAY");
+        advice.setQuantity(qty);
+        advice.setReason(joinReasons(reasons));
+        advice.setStatus(AdviceStatus.PENDING);
+        advice.setCreatedAt(Instant.now());
+        advice.setUpdatedAt(Instant.now());
+
+        // Enhanced metadata
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("ml_enhanced", true);
+        metadata.put("strike", leg.strike);
+        metadata.put("expiry", leg.expiry.toString());
+        metadata.put("option_type", leg.type.toString());
+
+        if (exits != null) {
+            metadata.put("dynamic_stop", exits.getDynamicStopPct());
+            metadata.put("dynamic_target", exits.getDynamicTargetPct());
+            metadata.put("rl_stop", exits.getRlOptimalStop());
+            metadata.put("rl_target", exits.getRlOptimalTarget());
+        }
+
+        // Store metadata in reason field (could be separate field in future)
+        advice.setReason(advice.getReason() + " [ML_META: " + metadata + "]");
+
+        return advice;
+    }
+
+    private void trackAdvicePerformance(Advice advice, EnhancedScore score, RLAction rlAction) {
+        try {
+            PerformanceTrackingEvent event = new PerformanceTrackingEvent();
+            event.setAdviceId(advice.getId());
+            event.setInstrumentKey(advice.getInstrument_token());
+            event.setCreatedAt(advice.getCreatedAt());
+            event.setEnhancedScore(score.total);
+            event.setMlScore(score.mlComponents);
+            event.setRlConfidence(rlAction != null ? rlAction.getConfidence() : null);
+            event.setRlExpectedReward(rlAction != null ? rlAction.getExpectedReward() : null);
+
+            performanceAnalyticsService.trackAdvice(event);
+
+            // Feedback to RL system for learning
+            if (rlAction != null) {
+                rlService.recordAction(rlAction, advice.getInstrument_token());
+            }
+
+        } catch (Exception e) {
+            log.warn("Failed to track advice performance: {}", e.getMessage());
+        }
+    }
+
+    private void emitEnhancedMetrics(boolean endOfTick, int created) {
+        try {
+            Map<String, Object> enhancedMetrics = new LinkedHashMap<>();
+
+            // Traditional metrics
+            enhancedMetrics.put("advices.created", advicesCreated.get());
+            enhancedMetrics.put("advices.skipped", advicesSkipped.get());
+            enhancedMetrics.put("advices.executed", advicesExecuted.get());
+            enhancedMetrics.put("endOfTick", endOfTick);
+            enhancedMetrics.put("created.this.tick", created);
+
+            // ML-specific metrics
+            enhancedMetrics.put("ml.enhanced", true);
+            enhancedMetrics.put("ensemble.predictions.used",
+                    ensembleService.getRecentPredictionCount());
+            enhancedMetrics.put("rl.actions.confidence",
+                    rlService.getAverageRecentConfidence());
+            enhancedMetrics.put("volatility.predictions.accuracy",
+                    volatilityPredictionService.getRecentAccuracy());
+            enhancedMetrics.put("pattern.matches.strength",
+                    patternRecognitionService.getAveragePatternStrength());
+
+            enhancedMetrics.put("ts", Instant.now());
+
+            stream.publish("metrics.strategy.enhanced", "strategy", enhancedMetrics);
+
+            // Also emit to ML feedback loop
+            mlPredictionService.recordStrategyMetrics(enhancedMetrics);
+
+        } catch (Exception e) {
+            log.warn("Failed to emit enhanced metrics: {}", e.getMessage());
+            // Fall back to traditional metrics
+            emitMetrics(endOfTick);
+        }
+    }
+
+    private double getOptionLTP(InstrumentData inst) {
+        double optLtp = 0.0;
+        try {
+            GetMarketQuoteLastTradedPriceResponseV3 q = upstoxService.getMarketLTPQuote(inst.getInstrumentKey());
+            if (q != null && q.getData() != null && q.getData().get(inst.getInstrumentKey()) != null) {
+                optLtp = q.getData().get(inst.getInstrumentKey()).getLastPrice();
+            }
+        } catch (Exception ignore) {
+        }
+        return optLtp;
     }
 
 }
