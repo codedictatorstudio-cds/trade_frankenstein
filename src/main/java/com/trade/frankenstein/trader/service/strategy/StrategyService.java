@@ -1730,25 +1730,91 @@ public class StrategyService {
         return Math.min(MAX_STRIKE_STEPS_FROM_ATM, baseSteps);
     }
 
-    private List<LegSpec> adjustLegsBasedOnRL(List<LegSpec> traditional, RLAction rlAction,
-                                              LocalDate expiry, BigDecimal atm) {
-        if (rlAction.getParameters() == null) return traditional;
+    // In StrategyService.java
 
+    /**
+     * Adjusts the provided legs based on RL-recommended delta range.
+     * Replaces each leg with the contract whose delta is closest to the RL midpoint.
+     */
+    private List<LegSpec> adjustLegsBasedOnRL(List<LegSpec> traditional,
+                                              RLAction rlAction,
+                                              LocalDate expiry,
+                                              BigDecimal atm) {
+        if (rlAction == null || rlAction.getParameters() == null) {
+            return traditional;
+        }
         Map<String, Double> params = rlAction.getParameters();
-        List<LegSpec> adjusted = new ArrayList<>();
+        if (!params.containsKey("optimal_delta_min") || !params.containsKey("optimal_delta_max")) {
+            return traditional;
+        }
+        // Calculate target delta (midpoint)
+        double minDelta = params.get("optimal_delta_min");
+        double maxDelta = params.get("optimal_delta_max");
+        double targetDelta = (minDelta + maxDelta) / 2.0;
 
+        // Fetch Greeks for all contracts of this expiry
+        Map<String, MarketQuoteOptionGreekV3> greeksMap = Collections.emptyMap();
+        try {
+            Result<Map<String, MarketQuoteOptionGreekV3>> greeksRes =
+                    optionChainService.getGreeksForExpiry(NIFTY, expiry);
+            if (greeksRes != null && greeksRes.isOk() && greeksRes.get() != null) {
+                greeksMap = greeksRes.get();
+            }
+        } catch (Exception e) {
+            log.warn("Failed to fetch Greeks for RL adjustment: {}", e.getMessage());
+            return traditional;
+        }
+
+        // List to hold adjusted legs
+        List<LegSpec> adjusted = new ArrayList<>();
+        BigDecimal step = bd(STRIKE_STEP);
+        BigDecimal lowStrike = atm.subtract(step.multiply(bd(3)));
+        BigDecimal highStrike = atm.add(step.multiply(bd(3)));
+
+        // Preload nearby contracts once
+        List<InstrumentData> nearbyContracts = Collections.emptyList();
+        try {
+            Result<List<InstrumentData>> rngRes =
+                    optionChainService.listContractsByStrikeRange(NIFTY, expiry, lowStrike, highStrike);
+            if (rngRes != null && rngRes.isOk() && rngRes.get() != null) {
+                nearbyContracts = rngRes.get();
+            }
+        } catch (Exception e) {
+            log.warn("Failed to list contracts for RL adjustment: {}", e.getMessage());
+            // Fallback: return original legs
+            return traditional;
+        }
+
+        // For each original leg, find the best match by delta
         for (LegSpec leg : traditional) {
-            // RL might suggest different strikes based on optimal delta
-            if (params.containsKey("optimal_delta_min") && params.containsKey("optimal_delta_max")) {
-                // Keep the leg as is for now - in practice, would calculate optimal strike for target delta
-                adjusted.add(leg);
+            InstrumentData best = null;
+            double bestDiff = Double.MAX_VALUE;
+            for (InstrumentData inst : nearbyContracts) {
+                // Only consider same option type
+                if (typeOf(inst) != leg.type) {
+                    continue;
+                }
+                MarketQuoteOptionGreekV3 greek = greeksMap.get(inst.getInstrumentKey());
+                if (greek == null || greek.getDelta() == null) {
+                    continue;
+                }
+                double diff = Math.abs(Math.abs(greek.getDelta()) - targetDelta);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    best = inst;
+                }
+            }
+            if (best != null) {
+                adjusted.add(new LegSpec(expiry, bd(best.getStrikePrice()), leg.type));
+                log.debug("RL adjusted leg from strike {} to {}",
+                        leg.strike, best.getStrikePrice());
             } else {
                 adjusted.add(leg);
             }
         }
-
         return adjusted;
     }
+
 
     private boolean passesEnhancedLiquidity(InstrumentData inst, MarketMicrostructure microStructure) {
         // Traditional liquidity check
