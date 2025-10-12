@@ -1,5 +1,7 @@
 package com.trade.frankenstein.trader.service.options;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.dto.OptionChainAnalyticsDTO;
 import com.trade.frankenstein.trader.model.documents.OptionChainAnalytics;
@@ -17,6 +19,7 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
@@ -38,103 +41,152 @@ public class OptionChainAnalyticsServiceImpl implements OptionChainAnalyticsServ
     private VolatilitySurfaceRepo volatilitySurfaceRepo;
     @Autowired
     private FastStateStore fastStateStore;
+    @Autowired
+    private ObjectMapper objectMapper;
 
     private static final int CACHE_SECONDS = 30;
 
     @Override
-    public OptionChainAnalyticsDTO calculateAnalytics(String underlyingKey, LocalDate expiry)
+    public OptionChainAnalyticsDTO calculateAnalytics(String underlyingKey, LocalDate expiry) {
+        String cacheKey = "analytics:" + underlyingKey + ":" + expiry;
+        Optional<String> cachedJson = fastStateStore.get(cacheKey);
+        if (cachedJson.isPresent()) {
+            try {
+                OptionChainAnalyticsDTO dto = objectMapper.readValue(cachedJson.get(), OptionChainAnalyticsDTO.class);
+                if (dto.getCalculatedAt() != null &&
+                        !dto.getCalculatedAt().isBefore(Instant.now().minusSeconds(CACHE_SECONDS))) {
+                    return dto;
+                }
+            } catch (JsonProcessingException e) {
+                log.warn("Failed to parse cached analytics JSON", e);
+            }
+        }
+
+        List<OptionInstrument> instruments = optionInstrumentRepo
+                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry.toString());
+        if (instruments.isEmpty()) {
+            OptionChainAnalyticsDTO empty = createEmptyAnalytics(underlyingKey, expiry);
+            cacheAnalytics(cacheKey, empty);
+            return empty;
+        }
+
+        List<String> instrumentKeys = instruments.stream()
+                .map(OptionInstrument::getInstrument_key)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        Map<String, MarketQuoteOptionGreekV3> greeks =
+                greeksCalculationService.calculateGreeksBulk(instrumentKeys);
+
+        OptionChainAnalyticsDTO dto = OptionChainAnalyticsDTO.builder()
+                .underlyingKey(underlyingKey)
+                .expiry(expiry)
+                .calculatedAt(Instant.now())
+                .maxPain(computeMaxPain(instruments, greeks))
+                .oiPcr(computeOiPcr(instruments, greeks))
+                .volumePcr(computeVolumePcr(instruments, greeks))
+                .ivSkew(computeIvSkew(instruments, greeks))
+                .gammaExposure(computeGammaExposure(instruments, greeks))
+                .deltaNeutralLevel(computeDeltaNeutralLevel(instruments, greeks))
+                .topOiIncreases(getTopOiChanges(instruments, greeks, true, 5))
+                .topOiDecreases(getTopOiChanges(instruments, greeks, false, 5))
+                .greeksSummary(computeGreeksSummary(instruments, greeks))
+                .volatilityMetrics(computeVolatilityMetrics(instruments, greeks))
+                .liquidityMetrics(computeLiquidityMetrics(instruments, greeks))
+                .build();
+
+        cacheAnalytics(cacheKey, dto);
+        analyticsRepo.save(toEntity(dto));
+        return dto;
+    }
 
     @Override
     public VolatilitySurface buildVolatilitySurface(String underlyingKey, LocalDate expiry) {
-        List<OptionInstrument> instr = optionInstrumentRepo
-                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry);
-        if (instr.isEmpty()) return null;
+        List<OptionInstrument> instruments = optionInstrumentRepo
+                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry.toString());
+        if (instruments.isEmpty()) return null;
 
-        List<String> keys = instr.stream()
-                .map(OptionInstrument::getInstrumentKey)
+        List<String> instrumentKeys = instruments.stream()
+                .map(OptionInstrument::getInstrument_key)
                 .collect(Collectors.toList());
-        Map<String, MarketQuoteOptionGreekV3> greeks = greeksCalculationService.calculateGreeksBulk(keys);
+        Map<String, MarketQuoteOptionGreekV3> greeks =
+                greeksCalculationService.calculateGreeksBulk(instrumentKeys);
 
-        Map<BigDecimal, BigDecimal> calls = new TreeMap<>();
-        Map<BigDecimal, BigDecimal> puts = new TreeMap<>();
-        for (OptionInstrument oi : instr) {
-            MarketQuoteOptionGreekV3 g = greeks.get(oi.getInstrumentKey());
+        Map<BigDecimal, BigDecimal> callVols = new TreeMap<>();
+        Map<BigDecimal, BigDecimal> putVols = new TreeMap<>();
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
             if (g == null || g.getIv() == null) continue;
+
             BigDecimal iv = BigDecimal.valueOf(g.getIv());
-            BigDecimal strike = new BigDecimal(oi.getStrike());
-            if ("CE".equals(oi.getOptionType())) calls.put(strike, iv);
-            else if ("PE".equals(oi.getOptionType())) puts.put(strike, iv);
+            BigDecimal strike = new BigDecimal(inst.getStrike_price());
+
+            // Determine if CE or PE based on instrument_type
+            if ("CE".equals(inst.getInstrument_type())) {
+                callVols.put(strike, iv);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                putVols.put(strike, iv);
+            }
         }
 
-        BigDecimal atm = Stream.concat(calls.values().stream(), puts.values().stream())
+        if (callVols.isEmpty() && putVols.isEmpty()) return null;
+
+        BigDecimal atm = Stream.concat(callVols.values().stream(), putVols.values().stream())
                 .reduce(BigDecimal.ZERO, BigDecimal::add)
-                .divide(new BigDecimal(calls.size() + puts.size()), 4, RoundingMode.HALF_UP);
+                .divide(new BigDecimal(callVols.size() + putVols.size()), 4, RoundingMode.HALF_UP);
 
         VolatilitySurface vs = VolatilitySurface.builder()
                 .underlyingKey(underlyingKey)
                 .expiry(expiry)
                 .timestamp(Instant.now())
-                .callVolatilities(calls)
-                .putVolatilities(puts)
+                .callVolatilities(callVols)
+                .putVolatilities(putVols)
                 .atmVolatility(atm)
                 .build();
+
         return volatilitySurfaceRepo.save(vs);
     }
 
     @Override
     public BigDecimal calculateMaxPain(String underlyingKey, LocalDate expiry) {
-        List<OptionInstrument> inst = optionInstrumentRepo
-                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry);
-        return computeMaxPain(inst);
+        List<OptionInstrument> instruments = optionInstrumentRepo
+                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry.toString());
+        List<String> keys = instruments.stream()
+                .map(OptionInstrument::getInstrument_key)
+                .collect(Collectors.toList());
+        Map<String, MarketQuoteOptionGreekV3> greeks =
+                greeksCalculationService.calculateGreeksBulk(keys);
+        return computeMaxPain(instruments, greeks);
     }
 
     @Override
     public BigDecimal calculateGammaExposure(String underlyingKey, LocalDate expiry) {
-        List<OptionInstrument> inst = optionInstrumentRepo
-                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry);
-        Map<String, MarketQuoteOptionGreekV3> greeks = greeksCalculationService
-                .calculateGreeksBulk(inst.stream()
-                        .map(OptionInstrument::getInstrumentKey)
-                        .collect(Collectors.toList()));
-        return computeGammaExposure(inst, greeks);
+        List<OptionInstrument> instruments = optionInstrumentRepo
+                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry.toString());
+        List<String> keys = instruments.stream()
+                .map(OptionInstrument::getInstrument_key)
+                .collect(Collectors.toList());
+        Map<String, MarketQuoteOptionGreekV3> greeks =
+                greeksCalculationService.calculateGreeksBulk(keys);
+        return computeGammaExposure(instruments, greeks);
     }
 
     @Override
-    public List<OptionChainAnalyticsDTO.OiChangeDTO> getTopOiChanges(String underlyingKey, LocalDate expiry, int limit) {
-        List<OptionInstrument> inst = optionInstrumentRepo
-                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry);
-        return inst.stream()
-                .filter(i -> i.getOi() != null && i.getOi() > 0)
-                .sorted(Comparator.comparingLong(OptionInstrument::getOi).reversed())
-                .limit(limit)
-                .map(i -> OptionChainAnalyticsDTO.OiChangeDTO.builder()
-                        .strike(new BigDecimal(i.getStrike()))
-                        .optionType(i.getOptionType())
-                        .currentOi(i.getOi())
-                        .oiChange(i.getOi()) // placeholder
-                        .build())
+    public List<OptionChainAnalyticsDTO.OiChangeDTO> getTopOiChanges(
+            String underlyingKey, LocalDate expiry, int limit) {
+        List<OptionInstrument> instruments = optionInstrumentRepo
+                .findByUnderlyingKeyAndExpiry(underlyingKey, expiry.toString());
+        List<String> keys = instruments.stream()
+                .map(OptionInstrument::getInstrument_key)
                 .collect(Collectors.toList());
+        Map<String, MarketQuoteOptionGreekV3> greeks =
+                greeksCalculationService.calculateGreeksBulk(keys);
+        return getTopOiChanges(instruments, greeks, true, limit);
     }
 
     @Override
     public OptionChainAnalytics saveAnalyticsSnapshot(OptionChainAnalyticsDTO dto) {
-        try {
-            OptionChainAnalytics entity = OptionChainAnalytics.builder()
-                    .underlyingKey(dto.getUnderlyingKey())
-                    .expiry(dto.getExpiry())
-                    .calculatedAt(dto.getCalculatedAt())
-                    .maxPain(dto.getMaxPain())
-                    .oiPcr(dto.getOiPcr())
-                    .volumePcr(dto.getVolumePcr())
-                    .ivSkew(dto.getIvSkew())
-                    .gammaExposure(dto.getGammaExposure())
-                    .deltaNeutralLevel(dto.getDeltaNeutralLevel())
-                    .build();
-            return analyticsRepo.save(entity);
-        } catch (Exception e) {
-            log.warn("Failed to save analytics snapshot", e);
-            return null;
-        }
+        return analyticsRepo.save(toEntity(dto));
     }
 
     @Override
@@ -149,39 +201,20 @@ public class OptionChainAnalyticsServiceImpl implements OptionChainAnalyticsServ
         analyticsRepo.deleteByCalculatedAtBefore(cutoff);
     }
 
-    // ─── Helpers ───────────────────────────────────────────
+    // Helper methods
 
-    private OptionChainAnalyticsDTO buildDTO(String key, LocalDate expiry,
-                                             List<OptionInstrument> inst, Map<String, MarketQuoteOptionGreekV3> greeks) {
-
-        BigDecimal maxPain = computeMaxPain(inst);
-        BigDecimal oiPcr = computeOiPcr(inst);
-        BigDecimal volumePcr = computeVolumePcr(inst);
-        BigDecimal ivSkew = computeIvSkew(inst, greeks);
-        BigDecimal gammaExp = computeGammaExposure(inst, greeks);
-        BigDecimal deltaNeutral = computeDeltaNeutral(inst, greeks);
-
-        return OptionChainAnalyticsDTO.builder()
-                .underlyingKey(key)
-                .expiry(expiry)
-                .calculatedAt(Instant.now())
-                .maxPain(maxPain)
-                .oiPcr(oiPcr)
-                .volumePcr(volumePcr)
-                .ivSkew(ivSkew)
-                .gammaExposure(gammaExp)
-                .deltaNeutralLevel(deltaNeutral)
-                .topOiIncreases(getTopOiChanges(key, expiry, 5))
-                .build();
+    private void cacheAnalytics(String key, OptionChainAnalyticsDTO dto) {
+        try {
+            String json = objectMapper.writeValueAsString(dto);
+            fastStateStore.put(key, json, Duration.ofSeconds(CACHE_SECONDS));
+        } catch (JsonProcessingException e) {
+            log.warn("Failed to serialize analytics DTO for caching", e);
+        }
     }
 
-    private boolean isStale(Instant t) {
-        return t == null || t.isBefore(Instant.now().minus(CACHE_SECONDS, ChronoUnit.SECONDS));
-    }
-
-    private OptionChainAnalyticsDTO emptyDTO(String key, LocalDate expiry) {
+    private OptionChainAnalyticsDTO createEmptyAnalytics(String underlyingKey, LocalDate expiry) {
         return OptionChainAnalyticsDTO.builder()
-                .underlyingKey(key)
+                .underlyingKey(underlyingKey)
                 .expiry(expiry)
                 .calculatedAt(Instant.now())
                 .maxPain(BigDecimal.ZERO)
@@ -193,107 +226,259 @@ public class OptionChainAnalyticsServiceImpl implements OptionChainAnalyticsServ
                 .build();
     }
 
-    private BigDecimal computeMaxPain(List<OptionInstrument> inst) {
+    private BigDecimal computeMaxPain(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
         Map<BigDecimal, BigDecimal> painMap = new HashMap<>();
-        Set<BigDecimal> strikes = inst.stream()
-                .map(i -> new BigDecimal(i.getStrike()))
+        Set<BigDecimal> strikes = instruments.stream()
+                .map(i -> new BigDecimal(i.getStrike_price()))
                 .collect(Collectors.toSet());
 
-        for (BigDecimal test : strikes) {
-            BigDecimal pain = BigDecimal.ZERO;
-            for (OptionInstrument i : inst) {
-                BigDecimal s = new BigDecimal(i.getStrike());
-                Long oi = i.getOi() == null ? 0L : i.getOi();
-                BigDecimal bdOi = new BigDecimal(oi);
-                if ("CE".equals(i.getOptionType()) && test.compareTo(s) > 0) {
-                    pain = pain.add(bdOi.multiply(test.subtract(s)));
-                } else if ("PE".equals(i.getOptionType()) && s.compareTo(test) > 0) {
-                    pain = pain.add(bdOi.multiply(s.subtract(test)));
+        for (BigDecimal testStrike : strikes) {
+            BigDecimal totalPain = BigDecimal.ZERO;
+            for (OptionInstrument inst : instruments) {
+                MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+                if (g == null || g.getOi() == null) continue;
+
+                BigDecimal strike = new BigDecimal(inst.getStrike_price());
+                BigDecimal oi = BigDecimal.valueOf(g.getOi());
+
+                if ("CE".equals(inst.getInstrument_type()) && testStrike.compareTo(strike) > 0) {
+                    totalPain = totalPain.add(oi.multiply(testStrike.subtract(strike)));
+                } else if ("PE".equals(inst.getInstrument_type()) && strike.compareTo(testStrike) > 0) {
+                    totalPain = totalPain.add(oi.multiply(strike.subtract(testStrike)));
                 }
             }
-            painMap.put(test, pain);
+            painMap.put(testStrike, totalPain);
         }
+
         return painMap.entrySet().stream()
                 .min(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey).orElse(BigDecimal.ZERO);
+                .map(Map.Entry::getKey)
+                .orElse(BigDecimal.ZERO);
     }
 
-    private BigDecimal computeOiPcr(List<OptionInstrument> inst) {
-        long ce = 0, pe = 0;
-        for (var i : inst) {
-            Long oi = i.getOi() == null ? 0L : i.getOi();
-            if ("CE".equals(i.getOptionType())) ce += oi;
-            else if ("PE".equals(i.getOptionType())) pe += oi;
+    private BigDecimal computeOiPcr(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+        BigDecimal ceOi = BigDecimal.ZERO;
+        BigDecimal peOi = BigDecimal.ZERO;
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getOi() == null) continue;
+
+            BigDecimal oi = BigDecimal.valueOf(g.getOi());
+            if ("CE".equals(inst.getInstrument_type())) {
+                ceOi = ceOi.add(oi);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                peOi = peOi.add(oi);
+            }
         }
-        return ce == 0 ? BigDecimal.ZERO :
-                BigDecimal.valueOf(pe).divide(BigDecimal.valueOf(ce), 4, RoundingMode.HALF_UP);
+
+        return ceOi.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO
+                : peOi.divide(ceOi, 4, RoundingMode.HALF_UP);
     }
 
-    private BigDecimal computeVolumePcr(List<OptionInstrument> inst) {
-        long ce = 0, pe = 0;
-        for (var i : inst) {
-            Long v = i.getVolume() == null ? 0L : i.getVolume();
-            if ("CE".equals(i.getOptionType())) ce += v;
-            else if ("PE".equals(i.getOptionType())) pe += v;
+    private BigDecimal computeVolumePcr(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+        BigDecimal ceVol = BigDecimal.ZERO;
+        BigDecimal peVol = BigDecimal.ZERO;
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getVolume() == null) continue;
+
+            BigDecimal vol = BigDecimal.valueOf(g.getVolume());
+            if ("CE".equals(inst.getInstrument_type())) {
+                ceVol = ceVol.add(vol);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                peVol = peVol.add(vol);
+            }
         }
-        return ce == 0 ? BigDecimal.ZERO :
-                BigDecimal.valueOf(pe).divide(BigDecimal.valueOf(ce), 4, RoundingMode.HALF_UP);
+
+        return ceVol.compareTo(BigDecimal.ZERO) == 0 ? BigDecimal.ZERO
+                : peVol.divide(ceVol, 4, RoundingMode.HALF_UP);
     }
 
-    private BigDecimal computeIvSkew(List<OptionInstrument> inst, Map<String, MarketQuoteOptionGreekV3> g) {
-        List<BigDecimal> ceI = new ArrayList<>(), peI = new ArrayList<>();
-        for (var i : inst) {
-            var mg = g.get(i.getInstrumentKey());
-            if (mg == null || mg.getIv() == null) continue;
-            BigDecimal iv = BigDecimal.valueOf(mg.getIv());
-            if ("CE".equals(i.getOptionType())) ceI.add(iv);
-            else peI.add(iv);
+    private BigDecimal computeIvSkew(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+        List<BigDecimal> ceIvs = new ArrayList<>();
+        List<BigDecimal> peIvs = new ArrayList<>();
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getIv() == null) continue;
+
+            BigDecimal iv = BigDecimal.valueOf(g.getIv());
+            if ("CE".equals(inst.getInstrument_type())) {
+                ceIvs.add(iv);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                peIvs.add(iv);
+            }
         }
-        if (ceI.isEmpty() || peI.isEmpty()) return BigDecimal.ZERO;
-        BigDecimal ceMean = mean(ceI), peMean = mean(peI);
-        return peMean.subtract(ceMean).setScale(4, RoundingMode.HALF_UP);
+
+        if (ceIvs.isEmpty() || peIvs.isEmpty()) return BigDecimal.ZERO;
+        return mean(peIvs).subtract(mean(ceIvs)).setScale(4, RoundingMode.HALF_UP);
     }
 
-    private BigDecimal computeGammaExposure(List<OptionInstrument> inst, Map<String, MarketQuoteOptionGreekV3> g) {
-        BigDecimal total = BigDecimal.ZERO;
-        for (var i : inst) {
-            var mg = g.get(i.getInstrumentKey());
-            if (mg == null || mg.getGamma() == null) continue;
-            BigDecimal gamma = BigDecimal.valueOf(mg.getGamma());
-            Long oi = i.getOi() == null ? 0L : i.getOi();
-            BigDecimal expo = gamma.multiply(new BigDecimal(oi));
-            total = "CE".equals(i.getOptionType())
-                    ? total.add(expo)
-                    : total.subtract(expo);
+    private BigDecimal computeGammaExposure(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+        BigDecimal totalExposure = BigDecimal.ZERO;
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getGamma() == null || g.getOi() == null) continue;
+
+            BigDecimal gamma = BigDecimal.valueOf(g.getGamma());
+            BigDecimal oi = BigDecimal.valueOf(g.getOi());
+            BigDecimal exposure = gamma.multiply(oi);
+
+            if ("CE".equals(inst.getInstrument_type())) {
+                totalExposure = totalExposure.add(exposure);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                totalExposure = totalExposure.subtract(exposure);
+            }
         }
-        return total.setScale(2, RoundingMode.HALF_UP);
+
+        return totalExposure.setScale(2, RoundingMode.HALF_UP);
     }
 
-    private BigDecimal computeDeltaNeutral(List<OptionInstrument> inst, Map<String, MarketQuoteOptionGreekV3> g) {
-        BigDecimal net = BigDecimal.ZERO;
-        for (var i : inst) {
-            var mg = g.get(i.getInstrumentKey());
-            if (mg == null || mg.getDelta() == null) continue;
-            BigDecimal d = BigDecimal.valueOf(mg.getDelta());
-            Long oi = i.getOi() == null ? 0L : i.getOi();
-            net = "CE".equals(i.getOptionType())
-                    ? net.add(d.multiply(new BigDecimal(oi)))
-                    : net.subtract(d.multiply(new BigDecimal(oi)));
+    private BigDecimal computeDeltaNeutralLevel(List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+        BigDecimal netDelta = BigDecimal.ZERO;
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getDelta() == null || g.getOi() == null) continue;
+
+            BigDecimal delta = BigDecimal.valueOf(g.getDelta());
+            BigDecimal oi = BigDecimal.valueOf(g.getOi());
+            BigDecimal weightedDelta = delta.multiply(oi);
+
+            if ("CE".equals(inst.getInstrument_type())) {
+                netDelta = netDelta.add(weightedDelta);
+            } else if ("PE".equals(inst.getInstrument_type())) {
+                netDelta = netDelta.subtract(weightedDelta);
+            }
         }
-        return net.setScale(2, RoundingMode.HALF_UP);
+
+        return netDelta.setScale(2, RoundingMode.HALF_UP);
     }
 
-    private List<List<String>> partitionList(List<String> list, int size) {
-        List<List<String>> parts = new ArrayList<>();
-        for (int i = 0; i < list.size(); i += size) {
-            parts.add(list.subList(i, Math.min(i + size, list.size())));
+    private List<OptionChainAnalyticsDTO.OiChangeDTO> getTopOiChanges(
+            List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks,
+            boolean isIncreasing, int limit) {
+
+        return instruments.stream()
+                .map(inst -> {
+                    MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+                    if (g == null || g.getOi() == null || g.getOi() <= 0) return null;
+
+                    return OptionChainAnalyticsDTO.OiChangeDTO.builder()
+                            .strike(new BigDecimal(inst.getStrike_price()))
+                            .optionType(inst.getInstrument_type())
+                            .currentOi(g.getOi().longValue())
+                            .oiChange(g.getOi().longValue()) // Simplified - should be actual change
+                            .build();
+                })
+                .filter(Objects::nonNull)
+                .sorted((a, b) -> isIncreasing
+                        ? Long.compare(b.getCurrentOi(), a.getCurrentOi())
+                        : Long.compare(a.getCurrentOi(), b.getCurrentOi()))
+                .limit(limit)
+                .collect(Collectors.toList());
+    }
+
+    private OptionChainAnalyticsDTO.GreeksSummaryDTO computeGreeksSummary(
+            List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+
+        BigDecimal totalDelta = BigDecimal.ZERO;
+        BigDecimal totalGamma = BigDecimal.ZERO;
+        BigDecimal totalTheta = BigDecimal.ZERO;
+        BigDecimal totalVega = BigDecimal.ZERO;
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getOi() == null) continue;
+
+            BigDecimal oi = BigDecimal.valueOf(g.getOi());
+
+            if (g.getDelta() != null) {
+                totalDelta = totalDelta.add(BigDecimal.valueOf(g.getDelta()).multiply(oi));
+            }
+            if (g.getGamma() != null) {
+                totalGamma = totalGamma.add(BigDecimal.valueOf(g.getGamma()).multiply(oi));
+            }
+            if (g.getTheta() != null) {
+                totalTheta = totalTheta.add(BigDecimal.valueOf(g.getTheta()).multiply(oi));
+            }
+            if (g.getVega() != null) {
+                totalVega = totalVega.add(BigDecimal.valueOf(g.getVega()).multiply(oi));
+            }
         }
-        return parts;
+
+        return OptionChainAnalyticsDTO.GreeksSummaryDTO.builder()
+                .totalDelta(totalDelta.setScale(2, RoundingMode.HALF_UP))
+                .totalGamma(totalGamma.setScale(2, RoundingMode.HALF_UP))
+                .totalTheta(totalTheta.setScale(2, RoundingMode.HALF_UP))
+                .totalVega(totalVega.setScale(2, RoundingMode.HALF_UP))
+                .netGammaExposure(computeGammaExposure(instruments, greeks))
+                .build();
     }
 
-    private BigDecimal mean(List<BigDecimal> v) {
-        if (v.isEmpty()) return BigDecimal.ZERO;
-        BigDecimal sum = v.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
-        return sum.divide(new BigDecimal(v.size()), 4, RoundingMode.HALF_UP);
+    private OptionChainAnalyticsDTO.VolatilityMetricsDTO computeVolatilityMetrics(
+            List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+
+        List<BigDecimal> allIvs = new ArrayList<>();
+        Map<String, BigDecimal> strikeIvMap = new HashMap<>();
+
+        for (OptionInstrument inst : instruments) {
+            MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+            if (g == null || g.getIv() == null) continue;
+
+            BigDecimal iv = BigDecimal.valueOf(g.getIv());
+            allIvs.add(iv);
+            strikeIvMap.put(String.valueOf(inst.getStrike_price()), iv);
+        }
+
+        BigDecimal atmIv = allIvs.isEmpty() ? BigDecimal.ZERO : mean(allIvs);
+
+        return OptionChainAnalyticsDTO.VolatilityMetricsDTO.builder()
+                .atmIv(atmIv)
+                .strikeIvMap(strikeIvMap)
+                .build();
+    }
+
+    private OptionChainAnalyticsDTO.LiquidityMetricsDTO computeLiquidityMetrics(
+            List<OptionInstrument> instruments, Map<String, MarketQuoteOptionGreekV3> greeks) {
+
+        int activeStrikes = (int) instruments.stream()
+                .filter(inst -> {
+                    MarketQuoteOptionGreekV3 g = greeks.get(inst.getInstrument_key());
+                    return g != null && g.getOi() != null && g.getOi() > 0;
+                })
+                .count();
+
+        BigDecimal liquidityScore = activeStrikes > 10
+                ? new BigDecimal("0.8")
+                : new BigDecimal("0.3");
+
+        return OptionChainAnalyticsDTO.LiquidityMetricsDTO.builder()
+                .activeStrikes(activeStrikes)
+                .liquidityScore(liquidityScore)
+                .build();
+    }
+
+    private OptionChainAnalytics toEntity(OptionChainAnalyticsDTO dto) {
+        return OptionChainAnalytics.builder()
+                .underlyingKey(dto.getUnderlyingKey())
+                .expiry(dto.getExpiry())
+                .calculatedAt(dto.getCalculatedAt())
+                .maxPain(dto.getMaxPain())
+                .oiPcr(dto.getOiPcr())
+                .volumePcr(dto.getVolumePcr())
+                .ivSkew(dto.getIvSkew())
+                .gammaExposure(dto.getGammaExposure())
+                .deltaNeutralLevel(dto.getDeltaNeutralLevel())
+                .build();
+    }
+
+    private BigDecimal mean(List<BigDecimal> values) {
+        if (values.isEmpty()) return BigDecimal.ZERO;
+        BigDecimal sum = values.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+        return sum.divide(new BigDecimal(values.size()), 4, RoundingMode.HALF_UP);
     }
 }
