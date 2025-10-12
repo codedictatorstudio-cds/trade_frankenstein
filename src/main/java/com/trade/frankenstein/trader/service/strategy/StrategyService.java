@@ -316,7 +316,7 @@ public class StrategyService {
             IntraDayCandleData c15 = candles(NIFTY, "minutes", "15");
             IntraDayCandleData c60 = candles(NIFTY, "minutes", "60");
 
-            EnsemblePrediction ensemblePred = ensembleService.getMultiTimeframePrediction(c5, c15, c60, spot);
+            EnsemblePrediction ensemblePred = ensembleService.getMultiTimeframePrediction(c5, c15, c60);
             boolean mlMtfAgree = (ensemblePred != null &&
                     ensemblePred.getConfidence().compareTo(bd("0.7")) >= 0);
 
