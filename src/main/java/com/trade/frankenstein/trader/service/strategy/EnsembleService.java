@@ -5,6 +5,7 @@ import com.trade.frankenstein.trader.model.documents.MLPrediction;
 import com.upstox.api.IntraDayCandleData;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.*;
@@ -18,7 +19,8 @@ public class EnsembleService {
 
     public EnsemblePrediction getMultiTimeframePrediction(IntraDayCandleData c5,
                                                           IntraDayCandleData c15,
-                                                          IntraDayCandleData c60) {
+                                                          IntraDayCandleData c60,
+                                                          BigDecimal spot) {
         try {
             EnsemblePrediction ensemble = new EnsemblePrediction();
             ensemble.setId(UUID.randomUUID().toString());
@@ -64,7 +66,6 @@ public class EnsembleService {
             }
 
             return ensemble;
-
         } catch (Exception e) {
             log.error("Failed to generate ensemble prediction: {}", e.getMessage());
             return null;
@@ -75,8 +76,8 @@ public class EnsembleService {
         return predictionCount.get();
     }
 
-    // FIXED: Removed unused 'weight' parameter and extracted confidence calculation
-    private MLPrediction createTimeframePrediction(IntraDayCandleData candles, String modelType) {
+    private MLPrediction createTimeframePrediction(IntraDayCandleData candles,
+                                                   String modelType, double weight) {
         if (candles == null || candles.getCandles() == null || candles.getCandles().isEmpty()) {
             return null;
         }
@@ -96,14 +97,12 @@ public class EnsembleService {
             double last = ((Number) candleData.get(size - 1).get(4)).doubleValue();
             double change = (last - first) / first;
 
-            // FIXED: Extract confidence calculation to avoid duplication
-            if (Math.abs(change) > 0.002) {
-                String direction = change > 0 ? "BULLISH" : "BEARISH";
-                prediction.setPredictedDirection(direction);
-
-                // Single confidence calculation
-                BigDecimal confidence = bd(String.valueOf(Math.min(0.9, 0.6 + Math.abs(change) * 10)));
-                prediction.setConfidence(confidence);
+            if (change > 0.002) {
+                prediction.setPredictedDirection("BULLISH");
+                prediction.setConfidence(bd(String.valueOf(Math.min(0.9, 0.6 + Math.abs(change) * 10))));
+            } else if (change < -0.002) {
+                prediction.setPredictedDirection("BEARISH");
+                prediction.setConfidence(bd(String.valueOf(Math.min(0.9, 0.6 + Math.abs(change) * 10))));
             } else {
                 prediction.setPredictedDirection("NEUTRAL");
                 prediction.setConfidence(bd("0.5"));
@@ -112,37 +111,6 @@ public class EnsembleService {
 
         return prediction;
     }
-
-    // FIXED: Update method calls to match new signature
-    private MLPrediction createTimeframePrediction(IntraDayCandleData candles, String modelType, double weight) {
-        if (candles == null || candles.getCandles() == null || candles.getCandles().isEmpty()) {
-            return null;
-        }
-        MLPrediction prediction = new MLPrediction();
-        prediction.setId(UUID.randomUUID().toString());
-        prediction.setModelType(modelType);
-        prediction.setCreatedAt(Instant.now());
-
-        List<List<Object>> candleData = candles.getCandles();
-        int size = candleData.size();
-        if (size >= 5) {
-            double first = ((Number) candleData.get(size - 5).get(4)).doubleValue();
-            double last = ((Number) candleData.get(size - 1).get(4)).doubleValue();
-            double change = (last - first) / first;
-            if (Math.abs(change) > 0.002) {
-                String direction = change > 0 ? "BULLISH" : "BEARISH";
-                prediction.setPredictedDirection(direction);
-                // Now include 'weight' in confidence calculation
-                BigDecimal confidence = bd(String.valueOf(Math.min(0.9, (0.6 + Math.abs(change) * 10) * weight)));
-                prediction.setConfidence(confidence);
-            } else {
-                prediction.setPredictedDirection("NEUTRAL");
-                prediction.setConfidence(bd("0.5"));
-            }
-        }
-        return prediction;
-    }
-
 
     private double calculateWeightedPrediction(List<MLPrediction> predictions,
                                                Map<String, Double> weights) {
@@ -185,12 +153,16 @@ public class EnsembleService {
     }
 
     private double mapDirectionToScore(String direction) {
-        return switch (direction) {
-            case "BULLISH" -> 1.0;
-            case "BEARISH" -> -1.0;
-            case "NEUTRAL" -> 0.0;
-            default -> 0.0;
-        };
+        switch (direction) {
+            case "BULLISH":
+                return 1.0;
+            case "BEARISH":
+                return -1.0;
+            case "NEUTRAL":
+                return 0.0;
+            default:
+                return 0.0;
+        }
     }
 
     private static BigDecimal bd(String value) {
