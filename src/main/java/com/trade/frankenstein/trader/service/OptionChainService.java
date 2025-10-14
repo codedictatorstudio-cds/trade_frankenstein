@@ -121,7 +121,7 @@ public class OptionChainService {
     public Result<List<InstrumentData>> listContractsByStrikeRange(
             String underlyingKey, LocalDate expiry, BigDecimal minStrike, BigDecimal maxStrike) {
 
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || minStrike == null || maxStrike == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, minStrike, maxStrike are required");
         }
@@ -143,7 +143,7 @@ public class OptionChainService {
      * We probe upcoming Wed/Thu/Fri and keep the ones for which Upstox actually returns contracts.
      */
     public Result<List<LocalDate>> listNearestExpiries(String underlyingKey, int count) {
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey)) return Result.fail("BAD_REQUEST", "underlyingKey required");
 
         final LocalDate today = LocalDate.now();
@@ -179,7 +179,7 @@ public class OptionChainService {
     public Result<InstrumentData> findContract(
             String underlyingKey, LocalDate expiry, BigDecimal strike, OptionType type) {
 
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || strike == null || type == null) {
             return Result.fail("BAD_REQUEST", "params required");
         }
@@ -285,7 +285,7 @@ public class OptionChainService {
      * Volume Put/Call ratio (PE Vol / CE Vol) for an expiry, from live greeks volume.
      */
     public Result<BigDecimal> getVolumePcr(String underlyingKey, LocalDate expiry) {
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
         List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
@@ -311,7 +311,7 @@ public class OptionChainService {
      * Raw greeks map (keyed by instrument_key) for all contracts of an expiry.
      */
     public Result<Map<String, MarketQuoteOptionGreekV3>> getGreeksForExpiry(String underlyingKey, LocalDate expiry) {
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null) return Result.fail("BAD_REQUEST", "params required");
 
         List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);
@@ -329,7 +329,7 @@ public class OptionChainService {
     public Result<LinkedHashMap<Integer, Long>> topOiChange(
             String underlyingKey, LocalDate expiry, OptionType type, int limit) {
 
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || type == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, type required");
         }
@@ -378,7 +378,7 @@ public class OptionChainService {
     public Result<BigDecimal> getIvPercentile(
             String underlyingKey, LocalDate expiry, BigDecimal strike, OptionType type) {
 
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || strike == null || type == null) {
             return Result.fail("BAD_REQUEST", "params required");
         }
@@ -424,7 +424,7 @@ public class OptionChainService {
             String underlyingKey, LocalDate expiry, BigDecimal underlyingLtp,
             int strikesEachSide, int strikeStep) {
 
-        if (isLoggedIn()) return Result.fail("user-not-logged-in");
+        if (isNotLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(underlyingKey) || expiry == null || underlyingLtp == null) {
             return Result.fail("BAD_REQUEST", "underlyingKey, expiry, underlyingLtp required");
         }
@@ -478,7 +478,7 @@ public class OptionChainService {
      * When offset != 0 we recompute live and do not cache historical points.
      */
     public Optional<OiSnapshot> getLatestOiSnapshot(String underlyingKey, LocalDate expiry, int offset) {
-        if (isLoggedIn()) return Optional.empty();
+        if (isNotLoggedIn()) return Optional.empty();
         if (isBlank(underlyingKey) || expiry == null) return Optional.empty();
 
         final String key = "oi:" + underlyingKey + ":" + expiry.format(DateTimeFormatter.ISO_DATE);
@@ -745,7 +745,7 @@ public class OptionChainService {
     }
 
     public Optional<MarketQuoteOptionGreekV3> getGreek(String instrumentKey) {
-        if (isLoggedIn()) return Optional.empty();
+        if (isNotLoggedIn()) return Optional.empty();
         try {
             Result<List<LocalDate>> expsRes = listNearestExpiries(Underlyings.NIFTY, 3);
             if (expsRes == null || !expsRes.isOk() || expsRes.get() == null) return Optional.empty();
@@ -767,9 +767,9 @@ public class OptionChainService {
     // =================================================================================
     // Auth guard
     // =================================================================================
-    private boolean isLoggedIn() {
+    private boolean isNotLoggedIn() {
         try {
-            return AuthCodeHolder.getInstance().isLoggedIn(); // ✓ Remove negation
+            return !AuthCodeHolder.getInstance().isLoggedIn(); // ✓ Remove negation
         } catch (Throwable t) {
             return false; // ✓ Return false on auth error
         }
@@ -779,7 +779,7 @@ public class OptionChainService {
      * Returns a snapshot of options flow (CE/PE volumes, OI change) for the instrument and expiry.
      */
     public Optional<OptionsFlowBias> analyzeOptionsFlow(String underlyingKey, LocalDate expiry) {
-        if (isLoggedIn() || underlyingKey == null || expiry == null) return Optional.empty();
+        if (isNotLoggedIn() || underlyingKey == null || expiry == null) return Optional.empty();
         try {
             // CE/PE volumes and OI from current expiry greeks data
             List<InstrumentData> instruments = fetchInstruments(underlyingKey, expiry);

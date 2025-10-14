@@ -37,9 +37,9 @@ public class StreamGateway {
     private static final long DEFAULT_EMITTER_TIMEOUT_MS = 0L; // never timeout; we manage it
     private static final long HEARTBEAT_MS = 15000L;           // 15s
 
-    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<String, SseEmitter>();
-    private final Map<String, Set<String>> topicSubs = new ConcurrentHashMap<String, Set<String>>();
-    private final Set<String> csvEmitters = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> topicSubs = new ConcurrentHashMap<>();
+    private final Set<String> csvEmitters = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final AtomicBoolean heartbeatStarted = new AtomicBoolean(false);
 
     // Step-10: Kafka consumer → SSE fan-out (advice, trade, risk)
@@ -80,18 +80,8 @@ public class StreamGateway {
             }
         }
 
-        emitter.onCompletion(new Runnable() {
-            @Override
-            public void run() {
-                removeEmitter(emitterId, "completion");
-            }
-        });
-        emitter.onTimeout(new Runnable() {
-            @Override
-            public void run() {
-                removeEmitter(emitterId, "timeout");
-            }
-        });
+        emitter.onCompletion(() -> removeEmitter(emitterId, "completion"));
+        emitter.onTimeout(() -> removeEmitter(emitterId, "timeout"));
 
         try {
             emitter.send(SseEmitter.event().name("connected").data(emitterId));
@@ -217,7 +207,7 @@ public class StreamGateway {
         if (ids == null || ids.isEmpty()) {
             return;
         }
-        final List<String> toRemove = new ArrayList<String>();
+        final List<String> toRemove = new ArrayList<>();
 
         for (String id : ids) {
             final SseEmitter emitter = emitters.get(id);
@@ -250,12 +240,7 @@ public class StreamGateway {
     public void startKafkaFanout() {
         if (kafkaStarted.compareAndSet(false, true)) {
             kafkaExec = Executors.newSingleThreadExecutor();
-            kafkaExec.submit(new Runnable() {
-                @Override
-                public void run() {
-                    runKafkaLoop();
-                }
-            });
+            kafkaExec.submit(this::runKafkaLoop);
         }
     }
 
@@ -265,13 +250,9 @@ public class StreamGateway {
             // Load defaults from classpath (same file as EventPublisher)
             InputStream in = StreamGateway.class.getResourceAsStream("/event-bus.properties");
             if (in != null) {
-                try {
+                try (in) {
                     p.load(in);
-                } finally {
-                    try {
-                        in.close();
-                    } catch (Exception ignore) {
-                    }
+                } catch (Exception ignore) {
                 }
             }
         } catch (Exception ignore) { /* no-op */ }
@@ -279,7 +260,7 @@ public class StreamGateway {
         // Minimal sane defaults
         if (!p.containsKey("bootstrap.servers")) {
             String brokers = System.getenv("KAFKA_BROKERS");
-            if (brokers != null && brokers.trim().length() > 0) p.put("bootstrap.servers", brokers);
+            if (brokers != null && !brokers.trim().isEmpty()) p.put("bootstrap.servers", brokers);
         }
         p.put("group.id", p.getProperty("group.id", "stream-gateway"));
         p.put("enable.auto.commit", p.getProperty("enable.auto.commit", "true"));
@@ -287,50 +268,46 @@ public class StreamGateway {
         p.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         p.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
 
-        KafkaConsumer<String, String> consumer = null;
-        try {
-            consumer = new KafkaConsumer<String, String>(p);
-
-            // Prefer regex subscription if available
-            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(advice|trade|risk|decision)\\..+?$");
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<String, String>(p)) {
             try {
-                consumer.subscribe(pattern);
-            } catch (Throwable t) {
-                // Fallback to static topic list
-                java.util.List<String> topics = new java.util.ArrayList<String>();
-                topics.add("advice");
-                topics.add("trade");
-                topics.add("risk");
-                topics.add("decision");
-                topics.add("audit");
-                topics.add("ticks");
-                topics.add("option_chain");
-                topics.add("order");
-                consumer.subscribe(topics);
-            }
 
-            while (!Thread.currentThread().isInterrupted()) {
-                ConsumerRecords<String, String> records = consumer.poll(1000);
-                if (records == null) continue;
-                for (ConsumerRecord<String, String> r : records) {
-                    try {
-                        onKafkaMessage(r.topic(), r.key(), r.value());
-                    } catch (Throwable t) {
-                        // swallow to keep loop alive
+                // Prefer regex subscription if available
+                java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(advice|trade|risk|decision)\\..+?$");
+                try {
+                    consumer.subscribe(pattern);
+                } catch (Throwable t) {
+                    // Fallback to static topic list
+                    List<String> topics = new ArrayList<>();
+                    topics.add("advice");
+                    topics.add("trade");
+                    topics.add("risk");
+                    topics.add("decision");
+                    topics.add("audit");
+                    topics.add("ticks");
+                    topics.add("option_chain");
+                    topics.add("order");
+                    consumer.subscribe(topics);
+                }
+
+                while (!Thread.currentThread().isInterrupted()) {
+                    ConsumerRecords<String, String> records = consumer.poll(1000);
+                    if (records == null) continue;
+                    for (ConsumerRecord<String, String> r : records) {
+                        try {
+                            onKafkaMessage(r.topic(), r.key(), r.value());
+                        } catch (Throwable t) {
+                            // swallow to keep loop alive
+                        }
                     }
                 }
+            } catch (Throwable t) {
+                // If broken, log once and stop silently (SSE still works for in-process send(...))
+                try {
+                    log.error("Kafka fan-out loop failed: {}", t.toString());
+                } catch (Throwable ignore) {
+                }
             }
-        } catch (Throwable t) {
-            // If broken, log once and stop silently (SSE still works for in-process send(...))
-            try {
-                log.error("Kafka fan-out loop failed: {}", t.toString());
-            } catch (Throwable ignore) {
-            }
-        } finally {
-            try {
-                if (consumer != null) consumer.close();
-            } catch (Throwable ignore) {
-            }
+        } catch (Throwable ignore) {
         }
     }
 
@@ -352,12 +329,7 @@ public class StreamGateway {
 
     public void addSubscription(String emitterId, String topic) {
         if (!StringUtils.hasText(topic) || !emitters.containsKey(emitterId)) return;
-        topicSubs.computeIfAbsent(topic, new java.util.function.Function<String, Set<String>>() {
-            @Override
-            public Set<String> apply(String k) {
-                return new CopyOnWriteArraySet<String>();
-            }
-        }).add(emitterId);
+        topicSubs.computeIfAbsent(topic, k -> new CopyOnWriteArraySet<String>()).add(emitterId);
     }
 
     public void removeSubscription(String emitterId, String topic) {
@@ -402,20 +374,17 @@ public class StreamGateway {
             return;
         }
         if (heartbeatStarted.compareAndSet(false, true)) {
-            taskScheduler.scheduleAtFixedRate(new Runnable() {
-                @Override
-                public void run() {
-                    final List<String> toRemove = new ArrayList<String>();
-                    for (Map.Entry<String, SseEmitter> e : emitters.entrySet()) {
-                        try {
-                            e.getValue().send(SseEmitter.event().name("heartbeat").data("♥"));
-                        } catch (IOException | IllegalStateException ex) {
-                            toRemove.add(e.getKey());
-                        }
+            taskScheduler.scheduleAtFixedRate(() -> {
+                final List<String> toRemove = new ArrayList<>();
+                for (Map.Entry<String, SseEmitter> e : emitters.entrySet()) {
+                    try {
+                        e.getValue().send(SseEmitter.event().name("heartbeat").data("♥"));
+                    } catch (IOException | IllegalStateException ex) {
+                        toRemove.add(e.getKey());
                     }
-                    for (String id : toRemove) {
-                        removeEmitter(id, "heartbeat-failed");
-                    }
+                }
+                for (String id : toRemove) {
+                    removeEmitter(id, "heartbeat-failed");
                 }
             }, HEARTBEAT_MS);
             log.info("SSE heartbeat scheduled every {} ms", HEARTBEAT_MS);

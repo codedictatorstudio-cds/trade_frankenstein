@@ -7,6 +7,7 @@ import java.util.List;
 
 @Data
 public class OrderBookDepth {
+
     private List<PriceLevel> bids;
     private List<PriceLevel> asks;
     private BigDecimal bidVolume;

@@ -1,7 +1,6 @@
 package com.trade.frankenstein.trader.ui;
 
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
-import com.trade.frankenstein.trader.ui.bridge.EngineApiClient;
 import com.trade.frankenstein.trader.ui.bridge.SseBridge;
 import com.trade.frankenstein.trader.ui.header.AppHeader;
 import com.trade.frankenstein.trader.ui.header.ControlsBar;
@@ -34,7 +33,7 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
         addClassName("view-dashboard");
 
         // ===== 1/21: App Header (sticky via CSS) =====
-        AppHeader header = new AppHeader(new EngineApiClient());
+        AppHeader header = new AppHeader();
         add(header);
 
         // ===== 2/21: Controls bar row (full-bleed) =====
@@ -89,34 +88,6 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
 
     private SseBridge sse;
 
-//    public DashboardView() {
-//        setPadding(true);
-//        setSpacing(true);
-//        setSizeFull();
-//
-//        AppHeader header = new AppHeader();
-//        ControlsBar controls = new ControlsBar();
-//
-//        // Cards (layout preserved)
-//        RegimeDecisionCard decision = new RegimeDecisionCard();
-//        RiskPanelCard risk = new RiskPanelCard();
-//        ExecutionAdvicesCard adv = new ExecutionAdvicesCard();
-//        RecentTradesCard trades = new RecentTradesCard();
-//        MarketSentimentCard sentiment = new MarketSentimentCard();
-//
-//        FlexLayout grid = new FlexLayout(decision, risk, adv, trades, sentiment);
-//        grid.setWidthFull();
-//        grid.getStyle().set("gap", "16px");
-//        grid.setFlexWrap(FlexLayout.FlexWrap.WRAP);
-//        decision.setWidth("100%");
-//        risk.setWidth("100%");
-//        sentiment.setWidth("100%");
-//        adv.setWidth("100%");
-//        trades.setWidth("100%");
-//
-//        add(header, controls, grid);
-//    }
-
     @Override
     protected void onAttach(AttachEvent attachEvent) {
         // Single SSE bridge for the whole UI
@@ -161,7 +132,7 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
 
         // Capture specific parameters (existing functionality)
         String code = queryParameters.getParameters().getOrDefault("code", Collections.singletonList("")).get(0);
-        if (code != null && !code.isEmpty() && !code.isBlank()) {
+        if (code != null && !code.isBlank()) {
             System.out.println("OAuth code received: " + code);
             AuthCodeHolder holder = AuthCodeHolder.getInstance();
             holder.set(code);
