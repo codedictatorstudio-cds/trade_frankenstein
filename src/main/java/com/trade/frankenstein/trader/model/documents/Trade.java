@@ -1,6 +1,7 @@
 package com.trade.frankenstein.trader.model.documents;
 
 import com.trade.frankenstein.trader.enums.OrderSide;
+import com.trade.frankenstein.trader.enums.StrategyName;
 import com.trade.frankenstein.trader.enums.TradeStatus;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -35,6 +36,7 @@ public class Trade {
     private Double pnl;
 
     private TradeStatus status;      // OPEN/CLOSED/PARTIAL/CANCELLED
+    private StrategyName strategy;
 
     private Instant entryTime;
     private Instant exitTime;

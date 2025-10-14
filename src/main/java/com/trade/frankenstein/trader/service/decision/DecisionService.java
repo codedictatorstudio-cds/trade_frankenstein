@@ -23,6 +23,7 @@ import com.trade.frankenstein.trader.service.news.NewsService;
 import com.trade.frankenstein.trader.service.risk.PredictionService;
 import com.trade.frankenstein.trader.service.risk.RiskService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
+import com.trade.frankenstein.trader.service.trade.TradesService;
 import com.upstox.api.GetIntraDayCandleResponse;
 import com.upstox.api.IntraDayCandleData;
 import lombok.extern.slf4j.Slf4j;

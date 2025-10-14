@@ -21,12 +21,14 @@ import com.trade.frankenstein.trader.service.market.MarketDataService;
 import com.trade.frankenstein.trader.service.news.NewsService;
 import com.trade.frankenstein.trader.service.risk.RiskService;
 import com.trade.frankenstein.trader.service.sentiment.SentimentService;
+import com.trade.frankenstein.trader.service.trade.TradesService;
 import com.upstox.api.*;
 import lombok.Data;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.ta4j.core.BarSeries;
@@ -119,8 +121,13 @@ public class StrategyService {
     private final AtomicLong advicesSkipped = new AtomicLong(0);
     private final AtomicLong advicesExecuted = new AtomicLong(0);
 
+    private final DecisionService decisionService;
+
+    // Mark this dependency as lazy to break the cycle
     @Autowired
-    private DecisionService decisionService;
+    public StrategyService(@Lazy DecisionService decisionService) {
+        this.decisionService = decisionService;
+    }
     @Autowired
     private MarketDataService marketDataService;
     @Autowired

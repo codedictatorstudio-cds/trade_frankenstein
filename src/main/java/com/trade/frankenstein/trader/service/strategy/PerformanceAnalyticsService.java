@@ -3,7 +3,7 @@ package com.trade.frankenstein.trader.service.strategy;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.dto.PerformanceTrackingEvent;
 import com.trade.frankenstein.trader.model.documents.Advice;
-import com.trade.frankenstein.trader.service.TradesService;
+import com.trade.frankenstein.trader.service.trade.TradesService;
 import com.trade.frankenstein.trader.service.advice.AdviceService;
 import lombok.Getter;
 import lombok.Setter;

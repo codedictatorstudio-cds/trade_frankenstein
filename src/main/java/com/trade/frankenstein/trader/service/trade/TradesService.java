@@ -1,4 +1,4 @@
-package com.trade.frankenstein.trader.service;
+package com.trade.frankenstein.trader.service.trade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -6,24 +6,34 @@ import com.trade.frankenstein.trader.bus.EventBusConfig;
 import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
 import com.trade.frankenstein.trader.common.Result;
+import com.trade.frankenstein.trader.common.exception.TradeExecutionException;
+import com.trade.frankenstein.trader.common.exception.TradeReconciliationException;
 import com.trade.frankenstein.trader.core.FastStateStore;
 import com.trade.frankenstein.trader.enums.OrderSide;
 import com.trade.frankenstein.trader.enums.TradeStatus;
+import com.trade.frankenstein.trader.model.documents.OutboxEvent;
 import com.trade.frankenstein.trader.model.documents.Trade;
+import com.trade.frankenstein.trader.repo.documents.OutboxEventRepo;
 import com.trade.frankenstein.trader.repo.documents.TradeRepo;
+import com.trade.frankenstein.trader.service.StreamGateway;
+import com.trade.frankenstein.trader.service.UpstoxService;
 import com.trade.frankenstein.trader.service.risk.RiskService;
 import com.trade.frankenstein.trader.service.strategy.StrategyService;
 import com.upstox.api.GetTradeResponse;
 import com.upstox.api.TradeData;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.lang.Nullable;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -59,16 +69,21 @@ public class TradesService {
     @Autowired(required = false)
     private RiskService riskService; // optional wiring to RiskService
 
+    @Autowired
+    private TradeEventPublisher tradeEventPublisher;
+
+    @Autowired
+    private OutboxEventRepo outboxEventRepo;
+
+    @Autowired
+    private IdempotencyKeyService idempotencyKeyService;
+
     private static String formatIst(Instant ts) {
         if (ts == null) return null;
         return DateTimeFormatter.ofPattern("dd MMM HH:mm", Locale.ENGLISH)
                 .withZone(ZoneId.of("Asia/Kolkata"))
                 .format(ts);
     }
-
-    // ----------------------------------------------------------------------------
-    // Why? / Explain (used by RecentTradesCard action)
-    // ----------------------------------------------------------------------------
 
     private static String trimDouble(double d) {
         // simple compact formatting for prices/pnl
@@ -214,7 +229,7 @@ public class TradesService {
                 Sort.Order.desc("updatedAt"),
                 Sort.Order.desc("createdAt"))));
 
-        List<Trade> out = new ArrayList<Trade>(data.getNumberOfElements());
+        List<Trade> out = new ArrayList<>(data.getNumberOfElements());
         for (Trade t : data.getContent()) {
             if (status != null && status != nzs(t.getStatus())) continue;
             if (side != null && side != nzSide(t.getSide())) continue;
@@ -233,12 +248,7 @@ public class TradesService {
         if (isBlank(tradeId)) return Result.fail("BAD_REQUEST", "tradeId is required");
         Optional<Trade> t = tradeRepo.findById(tradeId);
         return t.map(Result::ok)
-                .orElseGet(new java.util.function.Supplier<Result<Trade>>() {
-                    @Override
-                    public Result<Trade> get() {
-                        return Result.fail("NOT_FOUND", "Trade not found: " + tradeId);
-                    }
-                });
+                .orElseGet(() -> Result.fail("NOT_FOUND", "Trade not found: " + tradeId));
     }
 
     @Transactional(readOnly = true)
@@ -246,7 +256,7 @@ public class TradesService {
         if (!isLoggedIn()) return Result.fail("user-not-logged-in");
         if (isBlank(tradeId)) return Result.fail("BAD_REQUEST", "tradeId is required");
         Optional<Trade> tOpt = tradeRepo.findById(tradeId);
-        if (!tOpt.isPresent()) return Result.fail("NOT_FOUND", "Trade not found: " + tradeId);
+        if (tOpt.isEmpty()) return Result.fail("NOT_FOUND", "Trade not found: " + tradeId);
 
         Trade t = tOpt.get();
         if (t.getExplain() != null && !t.getExplain().trim().isEmpty()) {
@@ -430,11 +440,11 @@ public class TradesService {
     private ObjectNode toJsonTrade(Trade t, String event) {
         final ObjectNode b = mapper.createObjectNode();
 
-        java.time.Instant _now = java.time.Instant.now();
+        Instant _now = Instant.now();
         b.put("ts", _now.toEpochMilli());
         b.put("ts_iso", _now.toString());
         b.put("source", "trade");
-// strings & enums
+        // strings & enums
         b.put("event", nz(event));
         b.put("tradeId", nz(t.getId()));
         b.put("brokerTradeId", nz(t.getBrokerTradeId()));
@@ -443,7 +453,7 @@ public class TradesService {
         b.put("side", t.getSide() == null ? "" : t.getSide().name());
 
         // numbers
-        b.put("quantity", t.getQuantity() == null ? 0 : t.getQuantity().intValue());
+        b.put("quantity", t.getQuantity() == null ? 0 : t.getQuantity());
         if (t.getEntryPrice() != null) b.put("entryPrice", t.getEntryPrice());
         else b.putNull("entryPrice");
         if (t.getCurrentPrice() != null) b.put("currentPrice", t.getCurrentPrice());
@@ -640,7 +650,7 @@ public class TradesService {
             while (it.hasNext()) {
                 Map.Entry<String, Long> e = it.next();
                 Long when = e.getValue();
-                if (when == null || when.longValue() < cutoff) {
+                if (when == null || when < cutoff) {
                     it.remove();
                 }
             }
@@ -682,4 +692,579 @@ public class TradesService {
         return active;
     }
 
+    @Transactional
+    @Retry(name = "tradesService")
+    @CircuitBreaker(name = "tradesService")
+    public Result<Trade> placeTrade(Trade trade, String idempotencyKey) {
+        if (!isLoggedIn()) {
+            return Result.fail("user-not-logged-in");
+        }
+
+        if (idempotencyKey != null && !idempotencyKeyService.acquire(idempotencyKey)) {
+            return Result.fail("CONFLICT", "Duplicate idempotency key: " + idempotencyKey);
+        }
+
+        try {
+            // Set timestamps
+            trade.setCreatedAt(Instant.now());
+            trade.setUpdatedAt(Instant.now());
+
+            // Save trade
+            Trade savedTrade = tradeRepo.save(trade);
+
+            // Create outbox event for exactly-once delivery
+            OutboxEvent outboxEvent = new OutboxEvent();
+            outboxEvent.setTopic(EventBusConfig.TOPIC_TRADE);
+            outboxEvent.setKey(savedTrade.getSymbol());
+
+            ObjectNode payload = createTradeJson(savedTrade, "trade.created");
+            outboxEvent.setPayload(payload.toString());
+
+            outboxEventRepo.save(outboxEvent);
+
+            log.info("Trade placed successfully: {}", savedTrade.getId());
+            return Result.ok(savedTrade);
+
+        } catch (Exception e) {
+            log.error("Failed to place trade", e);
+            throw new TradeExecutionException("Failed to place trade: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Enhanced trade reconciliation with actual Upstox API integration
+     */
+    @Retry(name = "tradesService")
+    @CircuitBreaker(name = "tradesService")
+    public Result<Trade> reconcileTrade(String tradeId) {
+        if (!isLoggedIn()) {
+            return Result.fail("user-not-logged-in");
+        }
+
+        try {
+            Optional<Trade> tradeOpt = tradeRepo.findById(tradeId);
+            if (tradeOpt.isEmpty()) {
+                throw new TradeReconciliationException("Trade not found: " + tradeId);
+            }
+
+            Trade localTrade = tradeOpt.get();
+
+            // Get fresh data from Upstox using existing reconciliation logic
+            Trade reconciledTrade = reconcileWithBroker(localTrade);
+
+            if (reconciledTrade != null) {
+                // Update timestamps
+                reconciledTrade.setUpdatedAt(Instant.now());
+
+                // Save reconciled trade
+                Trade savedTrade = tradeRepo.save(reconciledTrade);
+
+                // Publish reconciliation event
+                tradeEventPublisher.publishTradeReconciled(savedTrade);
+
+                log.info("Trade reconciled successfully: {} -> status: {}, pnl: {}",
+                        tradeId, savedTrade.getStatus(), savedTrade.getPnl());
+                return Result.ok(savedTrade);
+            } else {
+                // No updates found from broker
+                log.debug("No updates found for trade: {}", tradeId);
+                return Result.ok(localTrade);
+            }
+
+        } catch (TradeReconciliationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new TradeReconciliationException("Reconciliation failed for trade: " + tradeId, e);
+        }
+    }
+
+    /**
+     * Enhanced reconcile with broker using existing Upstox integration
+     */
+    private Trade reconcileWithBroker(Trade localTrade) {
+        try {
+            // Use existing Upstox service to get today's trades
+            GetTradeResponse response = upstoxService.getTradesForDay();
+
+            if (response == null || response.getData() == null || response.getData().isEmpty()) {
+                log.debug("No trade data received from broker for reconciliation");
+                return null;
+            }
+
+            // Find matching trade by brokerTradeId
+            String localBrokerTradeId = safeNull(localTrade.getBrokerTradeId());
+
+            for (TradeData brokerTrade : response.getData()) {
+                String brokerTradeId = safeNull(brokerTrade.getTradeId());
+
+                if (isBlank(brokerTradeId) || !brokerTradeId.equals(localBrokerTradeId)) {
+                    continue;
+                }
+
+                // Found matching trade - apply updates
+                boolean hasChanges = false;
+
+                // Update quantity if different
+                Integer brokerQty = brokerTrade.getQuantity();
+                if (!Objects.equals(localTrade.getQuantity(), brokerQty)) {
+                    localTrade.setQuantity(brokerQty);
+                    hasChanges = true;
+                }
+
+                // Update price if different
+                Double brokerPrice = brokerTrade.getAveragePrice().doubleValue();
+                if (brokerPrice != null && Double.compare(localTrade.getEntryPrice(), brokerPrice) != 0) {
+                    localTrade.setEntryPrice(brokerPrice);
+                    localTrade.setCurrentPrice(brokerPrice); // Update current price too
+                    hasChanges = true;
+                }
+
+                // Update symbol if needed
+                String brokerSymbol = firstNonBlank(brokerTrade.getTradingsymbol(),
+                        brokerTrade.getInstrumentToken(),
+                        localTrade.getSymbol());
+                if (!safe(brokerSymbol).equals(safe(localTrade.getSymbol()))) {
+                    localTrade.setSymbol(brokerSymbol);
+                    hasChanges = true;
+                }
+
+                // Update order ID if different
+                String brokerOrderId = safeNull(brokerTrade.getOrderId());
+                if (!safeNullEquals(localTrade.getOrder_id(), brokerOrderId)) {
+                    localTrade.setOrder_id(brokerOrderId);
+                    hasChanges = true;
+                }
+
+                // Update side if different
+                String txType = brokerTrade.getTransactionType() != null ?
+                        safeNull(brokerTrade.getTransactionType().getValue()) : null;
+                OrderSide brokerSide = parseSide(txType);
+                if (localTrade.getSide() != brokerSide) {
+                    localTrade.setSide(brokerSide);
+                    hasChanges = true;
+                }
+
+                // Update entry time if different
+                Instant brokerEntryTime = parseInstant(safeNull(brokerTrade.getOrderTimestamp()));
+                if (!Objects.equals(localTrade.getEntryTime(), brokerEntryTime)) {
+                    localTrade.setEntryTime(brokerEntryTime);
+                    hasChanges = true;
+                }
+
+                // Calculate P&L with current price
+                if (localTrade.getCurrentPrice() != null && localTrade.getEntryPrice() != null &&
+                        localTrade.getQuantity() != null) {
+
+                    double pnl = calculatePnl(localTrade.getSide(),
+                            localTrade.getEntryPrice(),
+                            localTrade.getCurrentPrice(),
+                            localTrade.getQuantity());
+
+                    if (Double.compare(localTrade.getPnl(), pnl) != 0) {
+                        localTrade.setPnl(pnl);
+                        hasChanges = true;
+                    }
+                }
+
+                // Set status as reconciled/filled
+                if (localTrade.getStatus() != TradeStatus.FILLED) {
+                    localTrade.setStatus(TradeStatus.FILLED);
+                    hasChanges = true;
+                }
+
+                return hasChanges ? localTrade : null;
+            }
+
+            // Trade not found in broker response - might be older or different day
+            log.debug("Trade not found in broker response: {}", localTrade.getBrokerTradeId());
+            return null;
+
+        } catch (Exception e) {
+            log.error("Failed to reconcile with broker for trade: {}", localTrade.getId(), e);
+            throw new TradeReconciliationException("Broker reconciliation failed", e);
+        }
+    }
+
+    /**
+     * Enhanced bulk reconciliation using existing scheduled logic
+     */
+    @Scheduled(fixedDelayString = "${trade.trades.reconcile-ms:45000}")
+    @Transactional
+    public void reconcileAllPendingEnhanced() {
+        if (!isLoggedIn()) {
+            return;
+        }
+
+        log.debug("Starting enhanced bulk reconciliation");
+
+        try {
+            // Get today's trades from Upstox
+            GetTradeResponse resp;
+            try {
+                resp = upstoxService.getTradesForDay();
+            } catch (Exception t) {
+                log.error("Enhanced reconciliation - getTradesForDay failed: {}", t.toString());
+                return;
+            }
+
+            if (resp == null || resp.getData() == null || resp.getData().isEmpty()) {
+                log.debug("No trades data from broker for reconciliation");
+                return;
+            }
+
+            int updatedCount = 0;
+            int newTradesCount = 0;
+            int errorCount = 0;
+
+            for (TradeData td : resp.getData()) {
+                try {
+                    String brokerTradeId = safeNull(td.getTradeId());
+                    if (isBlank(brokerTradeId)) {
+                        continue;
+                    }
+
+                    // Check if we have this trade
+                    Optional<Trade> existingOpt = findByBrokerTradeId(brokerTradeId);
+
+                    if (existingOpt.isPresent()) {
+                        // Update existing trade
+                        Trade existing = existingOpt.get();
+                        boolean changed = updateTradeFromBrokerData(existing, td);
+
+                        if (changed) {
+                            existing.setUpdatedAt(Instant.now());
+                            Trade saved = tradeRepo.save(existing);
+
+                            // Publish update event
+                            try {
+                                tradeEventPublisher.publishTradeUpdated(saved);
+                            } catch (Exception ignored) {
+                                log.error("Failed to publish trade updated event", ignored);
+                            }
+
+                            updatedCount++;
+                            log.debug("Updated existing trade: {}", brokerTradeId);
+                        }
+                    } else {
+                        // Create new trade with idempotency
+                        if (createNewTradeIfNotExists(td, brokerTradeId)) {
+                            newTradesCount++;
+                        }
+                    }
+
+                } catch (Exception e) {
+                    log.error("Error processing trade data: {}", td, e);
+                    errorCount++;
+                }
+            }
+
+            log.info("Bulk reconciliation completed - Updated: {}, New: {}, Errors: {}",
+                    updatedCount, newTradesCount, errorCount);
+
+        } catch (Exception e) {
+            log.error("Enhanced bulk reconciliation failed", e);
+        }
+    }
+
+    /**
+     * Update trade from broker data (extracted from existing logic)
+     */
+    private boolean updateTradeFromBrokerData(Trade existing, TradeData td) {
+        boolean changed = false;
+
+        // Update quantity
+        Integer newQty = td.getQuantity();
+        if (!Objects.equals(existing.getQuantity(), newQty)) {
+            existing.setQuantity(newQty);
+            changed = true;
+        }
+
+        // Update price
+        Double newPrice = td.getAveragePrice().doubleValue();
+        if (newPrice != null && Double.compare(existing.getEntryPrice(), newPrice) != 0) {
+            existing.setEntryPrice(newPrice);
+            existing.setCurrentPrice(newPrice); // Update current price
+            changed = true;
+        }
+
+        // Update symbol
+        String sym = firstNonBlank(td.getTradingsymbol(), td.getInstrumentToken(), existing.getSymbol());
+        if (!safe(sym).equals(safe(existing.getSymbol()))) {
+            existing.setSymbol(sym);
+            changed = true;
+        }
+
+        // Update order ID
+        String ordId = safeNull(td.getOrderId());
+        if (!safeNullEquals(existing.getOrder_id(), ordId)) {
+            existing.setOrder_id(ordId);
+            changed = true;
+        }
+
+        // Update side
+        String txType = td.getTransactionType() != null ?
+                safeNull(td.getTransactionType().getValue()) : null;
+        OrderSide side = parseSide(txType);
+        if (existing.getSide() != side) {
+            existing.setSide(side);
+            changed = true;
+        }
+
+        // Update entry time
+        Instant entryTs = parseInstant(safeNull(td.getOrderTimestamp()));
+        if (!Objects.equals(existing.getEntryTime(), entryTs)) {
+            existing.setEntryTime(entryTs);
+            changed = true;
+        }
+
+        // Recalculate P&L if price/quantity changed
+        if (changed && existing.getCurrentPrice() != null && existing.getEntryPrice() != null &&
+                existing.getQuantity() != null) {
+
+            double pnl = calculatePnl(existing.getSide(),
+                    existing.getEntryPrice(),
+                    existing.getCurrentPrice(),
+                    existing.getQuantity());
+            existing.setPnl(pnl);
+        }
+
+        // Ensure status is filled for broker trades
+        if (existing.getStatus() != TradeStatus.FILLED) {
+            existing.setStatus(TradeStatus.FILLED);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /**
+     * Create new trade with idempotency (extracted from existing logic)
+     */
+    private boolean createNewTradeIfNotExists(TradeData td, String brokerTradeId) {
+        // Use existing idempotency logic
+        if (fast != null) {
+            String idemKey = "trade-seen-" + brokerTradeId;
+            try {
+                boolean first = fast.setIfAbsent(idemKey, "1", Duration.ofHours(18));
+                if (!first) {
+                    return false; // Already seen recently
+                }
+            } catch (Throwable ignore) {
+                // Non-fatal, continue
+            }
+        }
+
+        try {
+            // Create trade using existing mapping logic
+            Trade newTrade = mapFrom(td);
+            Trade saved = tradeRepo.save(newTrade);
+
+            // Publish creation event
+            try {
+                tradeEventPublisher.publishTradeCreated(saved);
+            } catch (Exception ignored) {
+                log.error("Failed to publish trade created event", ignored);
+            }
+
+            log.info("Created new trade from broker: {}", brokerTradeId);
+            return true;
+
+        } catch (Exception e) {
+            log.error("Failed to create new trade: {}", brokerTradeId, e);
+            return false;
+        }
+    }
+
+    /**
+     * Calculate P&L based on trade direction
+     */
+    private double calculatePnl(OrderSide side, double entryPrice, double currentPrice, int quantity) {
+        if (side == OrderSide.SELL) {
+            return (entryPrice - currentPrice) * quantity;
+        } else {
+            return (currentPrice - entryPrice) * quantity;
+        }
+    }
+
+    /**
+     * Enhanced reconcile all pending with DLQ handling
+     */
+    public void reconcileAllPendingWithDlq() {
+        if (!isLoggedIn()) {
+            return;
+        }
+
+        try {
+            // Get all pending/open trades
+            List<Trade> pendingTrades = tradeRepo.findByStatus(TradeStatus.PENDING);
+            pendingTrades.addAll(tradeRepo.findByStatus(TradeStatus.OPEN));
+
+            for (Trade trade : pendingTrades) {
+                try {
+                    Result<Trade> result = reconcileTrade(trade.getId());
+                    if (!result.isOk()) {
+                        log.warn("Failed to reconcile trade {}: {}", trade.getId(), result.getError());
+                    }
+                } catch (TradeReconciliationException ex) {
+                    log.error("Failed to reconcile trade {}, sending to DLQ", trade.getId(), ex);
+                    tradeEventPublisher.publishTradeToDlq(trade, ex.getMessage());
+                } catch (Exception ex) {
+                    log.error("Unexpected error reconciling trade {}", trade.getId(), ex);
+                    tradeEventPublisher.publishTradeToDlq(trade, "Unexpected error: " + ex.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error in reconcileAllPendingWithDlq", e);
+        }
+    }
+
+
+    /**
+     * Bulk reconciliation with DLQ handling
+     */
+    public void reconcileAllPending() {
+        if (!isLoggedIn()) {
+            return;
+        }
+
+        try {
+            List<Trade> pendingTrades = tradeRepo.findByStatus(TradeStatus.PENDING);
+
+            for (Trade trade : pendingTrades) {
+                try {
+                    reconcileTrade(trade.getId());
+                } catch (TradeReconciliationException ex) {
+                    log.error("Failed to reconcile trade {}, sending to DLQ", trade.getId(), ex);
+                    tradeEventPublisher.publishTradeToDlq(trade, ex.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error in bulk reconciliation", e);
+        }
+    }
+
+    /**
+     * Reactive trade listing with pagination
+     */
+    public Mono<Page<Trade>> getTradesReactive(Pageable pageable) {
+        return Mono.fromCallable(() -> {
+            if (!isLoggedIn()) {
+                return Page.empty(pageable);
+            }
+            return tradeRepo.findAll(pageable);
+        });
+    }
+
+    /**
+     * Enhanced trade listing with filters
+     */
+    @Transactional(readOnly = true)
+    public Result<Page<Trade>> listTradesEnhanced(int page, int size,
+                                                  @Nullable TradeStatus status,
+                                                  @Nullable OrderSide side,
+                                                  @Nullable String symbolContains) {
+        if (!isLoggedIn()) {
+            return Result.fail("user-not-logged-in");
+        }
+
+        int p = Math.max(0, page);
+        int s = Math.min(Math.max(1, size), 200);
+
+        Pageable pageable = PageRequest.of(p, s, Sort.by(
+                Sort.Order.desc("exitTime"),
+                Sort.Order.desc("entryTime"),
+                Sort.Order.desc("updatedAt"),
+                Sort.Order.desc("createdAt")
+        ));
+
+        Page<Trade> data = tradeRepo.findAll(pageable);
+
+        // Apply filters (in a real implementation, these would be database queries)
+        List<Trade> filteredTrades = new ArrayList<>();
+        for (Trade t : data.getContent()) {
+            if (status != null && !status.equals(t.getStatus())) continue;
+            if (side != null && !side.equals(t.getSide())) continue;
+            if (symbolContains != null && !safeString(t.getSymbol())
+                    .toLowerCase(Locale.ROOT)
+                    .contains(symbolContains.toLowerCase(Locale.ROOT))) continue;
+
+            filteredTrades.add(t);
+        }
+
+        return Result.ok(data);
+    }
+
+    /**
+     * Health check method
+     */
+    public boolean isHealthy() {
+        try {
+            long count = tradeRepo.count();
+            return count >= 0;
+        } catch (Exception e) {
+            log.error("Health check failed", e);
+            return false;
+        }
+    }
+
+    private ObjectNode createTradeJson(Trade trade, String event) {
+        final ObjectNode payload = mapper.createObjectNode();
+        Instant now = Instant.now();
+
+        payload.put("ts", now.toEpochMilli());
+        payload.put("tsiso", now.toString());
+        payload.put("source", "trade");
+        payload.put("event", event);
+        payload.put("tradeId", trade.getId());
+        payload.put("brokerTradeId", trade.getBrokerTradeId());
+        payload.put("orderId", trade.getOrder_id());
+        payload.put("symbol", trade.getSymbol());
+        payload.put("side", trade.getSide() != null ? trade.getSide().name() : null);
+        payload.put("quantity", trade.getQuantity() != null ? trade.getQuantity() : 0);
+
+        if (trade.getEntryPrice() != null) {
+            payload.put("entryPrice", trade.getEntryPrice());
+        } else {
+            payload.putNull("entryPrice");
+        }
+
+        if (trade.getCurrentPrice() != null) {
+            payload.put("currentPrice", trade.getCurrentPrice());
+        } else {
+            payload.putNull("currentPrice");
+        }
+
+        if (trade.getPnl() != null) {
+            payload.put("pnl", trade.getPnl());
+        } else {
+            payload.putNull("pnl");
+        }
+
+        payload.put("status", trade.getStatus() != null ? trade.getStatus().name() : null);
+
+        if (trade.getEntryTime() != null) {
+            payload.put("entryTime", trade.getEntryTime().toString());
+        }
+
+        if (trade.getExitTime() != null) {
+            payload.put("exitTime", trade.getExitTime().toString());
+        }
+
+        if (trade.getUpdatedAt() != null) {
+            payload.put("updatedAt", trade.getUpdatedAt().toString());
+        }
+
+        if (trade.getCreatedAt() != null) {
+            payload.put("createdAt", trade.getCreatedAt().toString());
+        }
+
+        return payload;
+    }
+
+    // Keep all existing helper methods...
+    private static String safeString(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        return t.isEmpty() ? "" : t;
+    }
 }

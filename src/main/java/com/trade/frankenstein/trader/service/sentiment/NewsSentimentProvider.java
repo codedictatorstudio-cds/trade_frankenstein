@@ -1,6 +1,7 @@
 package com.trade.frankenstein.trader.service.sentiment;
 
 import com.trade.frankenstein.trader.service.news.NewsService;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -8,20 +9,14 @@ import java.util.Optional;
 
 @Service
 public class NewsSentimentProvider implements SentimentProvider {
-    private final NewsService newsService;
-    private final int windowMin;
-    private final int penaltyPerItem;
-    private final int penaltyCap;
 
-    public NewsSentimentProvider(NewsService newsService,
-                                 int windowMin,
-                                 int penaltyPerItem,
-                                 int penaltyCap) {
-        this.newsService = newsService;
-        this.windowMin = windowMin;
-        this.penaltyPerItem = penaltyPerItem;
-        this.penaltyCap = penaltyCap;
-    }
+    @Autowired
+    private NewsService newsService;
+
+    public int windowMin;
+    public int penaltyPerItem;
+    public int penaltyCap;
+
 
     @Override
     public Optional<BigDecimal> fetchSentiment() {

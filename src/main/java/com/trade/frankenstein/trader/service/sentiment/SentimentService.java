@@ -51,8 +51,12 @@ public class SentimentService {
 
     @Autowired
     public SentimentService(NewsService newsService, SocialMediaApiClient socialClient) {
+        NewsSentimentProvider newsProvider = new NewsSentimentProvider();
+        newsProvider.windowMin = 10;
+        newsProvider.penaltyPerItem = 3;
+        newsProvider.penaltyCap = 15;
         this.providers = Arrays.asList(
-                new NewsSentimentProvider(newsService, 10, 3, 15),
+                newsProvider,
                 new SocialMediaSentimentProvider(socialClient)
         );
     }

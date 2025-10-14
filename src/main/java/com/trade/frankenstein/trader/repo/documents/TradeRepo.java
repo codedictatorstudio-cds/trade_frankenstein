@@ -19,5 +19,6 @@ public interface TradeRepo extends MongoRepository<Trade, String> {
 
     List<Trade> findByStrategyAndStatusAndExitTimeAfter(StrategyName strategy, TradeStatus status, Instant after);
 
+    List<Trade> findByStatus(TradeStatus status);
 }
 
