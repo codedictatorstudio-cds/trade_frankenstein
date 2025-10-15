@@ -52,12 +52,9 @@ public class AppHeader extends Composite<Div> {
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     // Dependency injection
-    @Autowired
-    private ObjectMapper objectMapper;
-    @Autowired
-    private HeaderStatusService statusService;
-    @Autowired
-    private ScheduledExecutorService backgroundExecutor;
+    private final ObjectMapper objectMapper;
+    private final HeaderStatusService statusService;
+    private final ScheduledExecutorService backgroundExecutor;
 
     // UI Components
     private final HorizontalLayout root = new HorizontalLayout();
@@ -91,7 +88,13 @@ public class AppHeader extends Composite<Div> {
      * Constructor with dependency injection
      */
     @Autowired
-    public AppHeader() {
+    public AppHeader(HeaderStatusService statusService,
+                     ObjectMapper objectMapper,
+                     ScheduledExecutorService backgroundExecutor) {
+        this.statusService = statusService;
+        this.objectMapper = objectMapper;
+        this.backgroundExecutor = backgroundExecutor;
+
         initializeComponents();
         setupLayout();
         applyInitialStyles();

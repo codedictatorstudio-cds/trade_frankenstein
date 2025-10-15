@@ -35,7 +35,7 @@ public class SentimentService {
 
     @Autowired
     private MarketDataService marketDataService;
-    @Autowired(required = false)
+    @Autowired
     private NewsService newsService;
     @Autowired
     private MarketSentimentSnapshotRepo sentimentRepo;
@@ -49,12 +49,14 @@ public class SentimentService {
     // Multi-source providers
     private final List<SentimentProvider> providers;
 
+    SentimentProvider newsProvider = new NewsSentimentProvider(
+            newsService,
+            30,    3,   30
+    );
+
     @Autowired
-    public SentimentService(NewsService newsService, SocialMediaApiClient socialClient) {
-        NewsSentimentProvider newsProvider = new NewsSentimentProvider();
-        newsProvider.windowMin = 10;
-        newsProvider.penaltyPerItem = 3;
-        newsProvider.penaltyCap = 15;
+    public SentimentService(SocialMediaApiClient socialClient) {
+
         this.providers = Arrays.asList(
                 newsProvider,
                 new SocialMediaSentimentProvider(socialClient)
