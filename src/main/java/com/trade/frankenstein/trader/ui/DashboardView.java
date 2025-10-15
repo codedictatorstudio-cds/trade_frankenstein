@@ -1,8 +1,7 @@
 package com.trade.frankenstein.trader.ui;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
-import com.trade.frankenstein.trader.service.HeaderStatusService;
+import com.trade.frankenstein.trader.ui.bridge.EngineApiClient;
 import com.trade.frankenstein.trader.ui.bridge.SseBridge;
 import com.trade.frankenstein.trader.ui.header.AppHeader;
 import com.trade.frankenstein.trader.ui.header.ControlsBar;
@@ -14,22 +13,13 @@ import com.vaadin.flow.component.html.Div;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.router.*;
-import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.Collections;
-import java.util.concurrent.ScheduledExecutorService;
 
 @PageTitle("TradeFrankenstein – Dashboard")
 @Route("dashboard")
 @CssImport("./styles/dashboard.css")
 public class DashboardView extends VerticalLayout implements BeforeEnterObserver {
-
-    @Autowired
-    private ObjectMapper objectMapper;
-    @Autowired
-    private HeaderStatusService statusService;
-    @Autowired
-    private ScheduledExecutorService backgroundExecutor;
 
     public DashboardView() {
 
@@ -44,7 +34,7 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
         addClassName("view-dashboard");
 
         // ===== 1/21: App Header (sticky via CSS) =====
-        AppHeader header = new AppHeader(statusService, objectMapper, backgroundExecutor);
+        AppHeader header = new AppHeader(new EngineApiClient());
         add(header);
 
         // ===== 2/21: Controls bar row (full-bleed) =====

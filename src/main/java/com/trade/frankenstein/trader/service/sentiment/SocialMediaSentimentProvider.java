@@ -1,18 +1,17 @@
 package com.trade.frankenstein.trader.service.sentiment;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.util.Optional;
 
-@Service
+@Service("socialMediaSentimentProvider")
 public class SocialMediaSentimentProvider implements SentimentProvider {
 
-    private final SocialMediaApiClient client;
+    @Autowired
+    private SocialMediaApiClient client;
 
-    public SocialMediaSentimentProvider(SocialMediaApiClient client) {
-        this.client = client;
-    }
 
     @Override
     public Optional<BigDecimal> fetchSentiment() {

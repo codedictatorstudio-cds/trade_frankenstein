@@ -2,6 +2,7 @@ package com.trade.frankenstein.trader.ui.bridge;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,7 @@ import java.util.Map;
  * All endpoints are addressed with relative paths so it works both from the
  * Vaadin UI app (via the API gateway) and directly against the service.
  */
+@Component
 public final class EngineApiClient {
 
     private static final String BASE = "/api/engine";

@@ -6,9 +6,9 @@ import com.trade.frankenstein.trader.bus.EventPublisher;
 import com.trade.frankenstein.trader.common.Result;
 import com.trade.frankenstein.trader.model.documents.MarketSentimentSnapshot;
 import com.trade.frankenstein.trader.repo.documents.MarketSentimentSnapshotRepo;
+import com.trade.frankenstein.trader.service.StreamGateway;
 import com.trade.frankenstein.trader.service.market.MarketDataService;
 import com.trade.frankenstein.trader.service.news.NewsService;
-import com.trade.frankenstein.trader.service.StreamGateway;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
@@ -18,6 +18,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.annotation.PostConstruct;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
@@ -45,23 +46,23 @@ public class SentimentService {
     private StreamGateway stream;
     @Autowired
     private EventPublisher bus;
+    @Autowired
+    private SentimentProvider newsSentimentProvider;
+    @Autowired
+    private SentimentProvider socialMediaSentimentProvider;
 
     // Multi-source providers
-    private final List<SentimentProvider> providers;
+    private List<SentimentProvider> providers ;
 
-    SentimentProvider newsProvider = new NewsSentimentProvider(
-            newsService,
-            30,    3,   30
-    );
-
-    @Autowired
-    public SentimentService(SocialMediaApiClient socialClient) {
-
-        this.providers = Arrays.asList(
-                newsProvider,
-                new SocialMediaSentimentProvider(socialClient)
+    @PostConstruct
+    public void initProviders() {
+        providers = Arrays.asList(
+                newsSentimentProvider,
+                socialMediaSentimentProvider
+                // Add more providers here
         );
     }
+
 
     private static BigDecimal clip(BigDecimal v, BigDecimal lo, BigDecimal hi) {
         if (v == null) return null;
