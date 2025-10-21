@@ -1,9 +1,7 @@
 package com.trade.frankenstein.trader.ui;
 
 import com.trade.frankenstein.trader.common.AuthCodeHolder;
-import com.trade.frankenstein.trader.ui.bridge.EngineApiClient;
 import com.trade.frankenstein.trader.ui.bridge.SseBridge;
-import com.trade.frankenstein.trader.ui.header.AppHeader;
 import com.trade.frankenstein.trader.ui.header.ControlsBar;
 import com.trade.frankenstein.trader.ui.sections.*;
 import com.vaadin.flow.component.AttachEvent;
@@ -32,10 +30,6 @@ public class DashboardView extends VerticalLayout implements BeforeEnterObserver
         setSpacing(true);
         setMargin(false);
         addClassName("view-dashboard");
-
-        // ===== 1/21: App Header (sticky via CSS) =====
-        AppHeader header = new AppHeader(new EngineApiClient());
-        add(header);
 
         // ===== 2/21: Controls bar row (full-bleed) =====
         HorizontalLayout controlsRow = new HorizontalLayout();
